@@ -15,6 +15,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memdusa_core::model::{self, ApiKey, CreatedKey, MemoryKind, MemoryQuery, NewMemory, User};
 use memdusa_core::redact::Redactor;
+use memdusa_core::retention::RetentionPolicy;
 use memdusa_core::{Store, brief};
 use rmcp::ServiceExt;
 
@@ -52,6 +53,20 @@ enum Cmd {
         /// Host header values accepted by /mcp (DNS-rebinding protection). Default: localhost only.
         #[arg(long = "allowed-host", env = "MEMDUSA_ALLOWED_HOSTS", value_delimiter = ',')]
         allowed_hosts: Vec<String>,
+        /// Don't prune old data automatically (otherwise once a day, see `memdusa prune`).
+        #[arg(long, env = "MEMDUSA_NO_AUTO_PRUNE")]
+        no_auto_prune: bool,
+    },
+    /// Summarize old hook activity and delete superseded checkpoints and finished runs.
+    Prune {
+        /// Show what would be pruned without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only this project (default: all).
+        #[arg(long = "only-project")]
+        only_project: Option<String>,
+        #[command(flatten)]
+        policy: RetentionArgs,
     },
     /// Print the hand-off brief for the current project.
     Resume {
@@ -137,6 +152,45 @@ enum Cmd {
         #[arg(long)]
         no_mcp: bool,
     },
+}
+
+/// Retention windows in days (0 = keep forever).
+#[derive(clap::Args, Clone, Copy)]
+struct RetentionArgs {
+    /// Days of raw hook activity to keep before summarizing it.
+    #[arg(long, env = "MEMDUSA_RETENTION_ACTIVITY_DAYS", default_value_t = 30)]
+    activity_days: i64,
+    /// Days to keep superseded checkpoints (the latest per task is always kept).
+    #[arg(long, env = "MEMDUSA_RETENTION_CHECKPOINT_DAYS", default_value_t = 90)]
+    checkpoint_days: i64,
+    /// Days to keep finished runs.
+    #[arg(long, env = "MEMDUSA_RETENTION_RUN_DAYS", default_value_t = 90)]
+    run_days: i64,
+}
+
+impl From<RetentionArgs> for RetentionPolicy {
+    fn from(a: RetentionArgs) -> Self {
+        Self { activity_days: a.activity_days, checkpoint_days: a.checkpoint_days, run_days: a.run_days }
+    }
+}
+
+/// Retention policy for automatic pruning (env overrides, else defaults).
+fn retention_from_env() -> RetentionPolicy {
+    let days = |var: &str, default: i64| std::env::var(var).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+    let d = RetentionPolicy::default();
+    RetentionPolicy {
+        activity_days: days("MEMDUSA_RETENTION_ACTIVITY_DAYS", d.activity_days),
+        checkpoint_days: days("MEMDUSA_RETENTION_CHECKPOINT_DAYS", d.checkpoint_days),
+        run_days: days("MEMDUSA_RETENTION_RUN_DAYS", d.run_days),
+    }
+}
+
+fn print_prune(r: &memdusa_core::retention::PruneReport) {
+    let verb = if r.dry_run { "would" } else { "did" };
+    println!(
+        "{verb} summarize {} session(s) ({} activity events), delete {} checkpoint(s), {} run(s) ({} steps)",
+        r.sessions_summarized, r.events_deleted, r.checkpoints_deleted, r.runs_deleted, r.steps_deleted
+    );
 }
 
 #[derive(Subcommand)]
@@ -301,13 +355,12 @@ async fn main() -> anyhow::Result<()> {
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
-        Cmd::Serve { addr, token, allowed_hosts } => {
-            if token.is_none() && !addr.starts_with("127.0.0.1") && !addr.starts_with("localhost") {
-                tracing::warn!(
-                    "serving on a non-loopback address without --token: anyone who can reach it can read your memory"
-                );
-            }
-            http::serve(store, http::HttpOptions { addr, token, allowed_hosts }).await?;
+        Cmd::Serve { addr, token, allowed_hosts, no_auto_prune } => {
+            let auto_prune = (!no_auto_prune).then(retention_from_env);
+            http::serve(store, http::HttpOptions { addr, token, allowed_hosts, auto_prune }).await?;
+        }
+        Cmd::Prune { dry_run, only_project, policy } => {
+            print_prune(&store.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
         }
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
@@ -390,6 +443,9 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
             }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
             println!("offline queue: {} event(s)", spool::Spool::open()?.len());
+        }
+        Cmd::Prune { dry_run, only_project, policy } => {
+            print_prune(&client()?.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
         }
         Cmd::Sync => {
             let spool = spool::Spool::open()?;
@@ -492,7 +548,15 @@ async fn run_hook(
             remote_hook(event, req, &r, deadline).await?
         }
         Mode::Local(url) => {
-            hooks::handle_request(&open_store(&url).await?, event, req, &model::Identity::root()).await?
+            let store = open_store(&url).await?;
+            let resp = hooks::handle_request(&store, event, req, &model::Identity::root()).await?;
+            // Local mode has no server to prune on a schedule: do it at session end, at most daily.
+            if let hooks::HookEvent::SessionEnd = event
+                && let Err(e) = store.maybe_prune(&retention_from_env(), 86_400_000).await
+            {
+                eprintln!("memdusa: pruning failed: {e}");
+            }
+            resp
         }
     };
     Ok(resp.output)

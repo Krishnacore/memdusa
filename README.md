@@ -126,6 +126,22 @@ On resume, the brief compares that with the resuming agent's state, and puts any
 State is only attached when the current directory's repo *is* the project being resumed, so
 `--project other/repo` never compares against an unrelated checkout.
 
+## Retention
+
+History grows with every edit and command. To keep the database and the brief fast:
+
+| What | Default | How |
+|---|---|---|
+| Hook activity (edits, commands, prompts, session start/end) | 30 days | **Summarized, then deleted**: each old session becomes one `session_summary` event ("14 files changed (…), 22 commands, 3 prompts. First request: …") |
+| Superseded checkpoints | 90 days | Deleted. The latest checkpoint of every task is always kept |
+| Finished runs and their steps | 90 days | Deleted |
+| Memories, events logged by agents | forever | Never pruned automatically |
+
+`memdusa serve` prunes once a day (`--no-auto-prune` to turn it off). Local mode prunes at the end of a session, at
+most once a day. To run it by hand: `memdusa prune [--dry-run] [--only-project P] [--activity-days N]
+[--checkpoint-days N] [--run-days N]` (locally, or as an admin against a server). Windows can also be set with
+`MEMDUSA_RETENTION_ACTIVITY_DAYS` / `_CHECKPOINT_DAYS` / `_RUN_DAYS`. `0` means keep forever.
+
 ## Secret redaction
 
 Hooks capture raw prompts and shell commands, and agents paste things into memories, so secrets will show up.
@@ -249,6 +265,7 @@ with `attempt: 2`.
 | GET/POST | `/v1/admin/users` (POST `{name, admin?, key_name?}` returns the user and their first key) |
 | POST | `/v1/admin/users/{name}/disable`, `/enable`, `/keys` `{name}` |
 | GET | `/v1/admin/keys?user=`, DELETE `/v1/admin/keys/{id-or-prefix}` |
+| POST | `/v1/admin/prune` `{policy?, project?, dry_run?}` |
 | POST | `/v1/hooks/{event}` `{project, agent, journal_prompts, stop_guard_mins, input}` |
 | GET | `/v1/resume?project=` |
 | POST/GET | `/v1/memories` (GET: `?query&project&kind&limit`) |

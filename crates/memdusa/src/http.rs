@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use memdusa_core::model::*;
+use memdusa_core::retention::{PruneReport, RetentionPolicy};
 use memdusa_core::{Error, Store, brief};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -49,6 +50,8 @@ pub struct HttpOptions {
     pub addr: String,
     pub token: Option<String>,
     pub allowed_hosts: Vec<String>,
+    /// Prune old data once a day with this policy (`None` = never).
+    pub auto_prune: Option<RetentionPolicy>,
 }
 
 struct ApiError(Error);
@@ -88,6 +91,20 @@ pub async fn serve(store: Store, opts: HttpOptions) -> anyhow::Result<()> {
         (0, Some(_)) => tracing::info!("auth: shared token only"),
         (n, t) => tracing::info!("auth: API keys ({n} users){}", if t.is_some() { " + shared token" } else { "" }),
     }
+    if let Some(policy) = opts.auto_prune {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match store.maybe_prune(&policy, 86_400_000).await {
+                    Ok(Some(r)) => tracing::info!(?r, "pruned old data"),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("auto-prune failed: {e}"),
+                }
+            }
+        });
+    }
     axum::serve(listener, app(store, opts)).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }
@@ -125,6 +142,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/admin/users/{name}/enable", post(admin_user_enable))
         .route("/v1/admin/users/{name}/keys", post(admin_key_create))
         .route("/v1/admin/keys", get(admin_keys))
+        .route("/v1/admin/prune", post(admin_prune))
         .route("/v1/admin/keys/{id}", delete(admin_key_revoke))
         .route("/v1/hooks/batch", post(hook_batch).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/v1/hooks/{event}", post(hook))
@@ -346,6 +364,24 @@ async fn admin_key_create(
 }
 
 #[derive(Deserialize)]
+struct PruneBody {
+    #[serde(default)]
+    policy: RetentionPolicy,
+    project: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn admin_prune(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Json(b): Json<PruneBody>,
+) -> ApiResult<PruneReport> {
+    admin(&id)?;
+    Ok(Json(s.store.prune(&b.policy, b.project.as_deref(), b.dry_run).await?))
+}
+
+#[derive(Deserialize)]
 struct KeysQ {
     user: Option<String>,
 }
@@ -561,7 +597,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("memdusa-http-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::connect(&format!("sqlite://{}", dir.join("t.db").display())).await.unwrap();
-        let opts = HttpOptions { addr: String::new(), token: token.map(String::from), allowed_hosts: vec![] };
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: token.map(String::from),
+            allowed_hosts: vec![],
+            auto_prune: None,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = app(store.clone(), opts);

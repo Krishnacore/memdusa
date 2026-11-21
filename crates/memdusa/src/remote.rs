@@ -105,6 +105,16 @@ impl Client {
         Ok(self.send(self.request(Method::GET, "/v1/memories").query(&Query(q))).await?)
     }
 
+    pub async fn prune(
+        &self,
+        policy: &memdusa_core::retention::RetentionPolicy,
+        project: Option<&str>,
+        dry_run: bool,
+    ) -> anyhow::Result<memdusa_core::retention::PruneReport> {
+        let body = json!({ "policy": policy, "project": project, "dry_run": dry_run });
+        Ok(self.send(self.request(Method::POST, "/v1/admin/prune").json(&body)).await?)
+    }
+
     // ------------------------------------------------------------ users & keys
 
     pub async fn user_list(&self) -> anyhow::Result<Vec<User>> {

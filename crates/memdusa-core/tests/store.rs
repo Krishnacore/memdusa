@@ -326,3 +326,104 @@ async fn brief_warns_when_code_state_drifted() {
         assert!(b.markdown.contains("saved on `laptop`") && b.markdown.contains("you're on `main`"), "{name}");
     }
 }
+
+#[tokio::test]
+async fn retention_summarizes_old_activity_and_keeps_what_matters() {
+    use memdusa_core::retention::RetentionPolicy;
+    for (name, s) in stores().await {
+        let p = project();
+        let day = 86_400_000;
+        let old = now_ms() - 40 * day;
+        let ev = |kind: &str, content: &str, session: &str, at: i64| NewEvent {
+            project: p.clone(),
+            session: Some(session.into()),
+            source: Some("claude-code".into()),
+            kind: kind.into(),
+            content: content.into(),
+            created_at: Some(at),
+            ..Default::default()
+        };
+        for e in [
+            ev("prompt", "add refunds", "old-sess", old),
+            ev("file_change", "src/refund.ts", "old-sess", old + 1),
+            ev("file_change", "src/refund.ts", "old-sess", old + 2),
+            ev("command", "npm test", "old-sess", old + 3),
+            ev("note", "agent-logged insight: keep forever", "old-sess", old + 4),
+            ev("file_change", "src/recent.ts", "new-sess", now_ms()),
+        ] {
+            s.event_append(e).await.unwrap();
+        }
+        // three checkpoints for one task (two old) + one old checkpoint that is the latest of its task
+        let cp = |goal: &str, task: Option<&str>, at: i64| NewCheckpoint {
+            project: p.clone(),
+            goal: goal.into(),
+            task: task.map(String::from),
+            created_at: Some(at),
+            ..Default::default()
+        };
+        let ancient = now_ms() - 100 * day; // beyond the 90-day checkpoint window
+        for c in [
+            cp("v1", None, ancient),
+            cp("v2", None, ancient + 1),
+            cp("v3", None, now_ms()),
+            cp("docs", Some("docs"), ancient),
+        ] {
+            s.checkpoint_save(c).await.unwrap();
+        }
+        let run = s.run_start(NewRun { project: p.clone(), name: "old".into(), ..Default::default() }).await.unwrap();
+        s.step_begin(&run.run.id, "a", None, "anonymous").await.unwrap();
+        s.run_finish(&run.run.id, RunOutcome::Completed, None, None).await.unwrap();
+
+        // runs are aged by updated_at: finished "now", so nothing to delete with 90 days...
+        let policy = RetentionPolicy::default();
+        let dry = s.prune(&policy, Some(&p), true).await.unwrap();
+        assert_eq!(
+            (dry.sessions_summarized, dry.events_deleted, dry.checkpoints_deleted, dry.runs_deleted),
+            (1, 4, 2, 0),
+            "{name}: {dry:?}"
+        );
+        assert_eq!(s.events_recent(&p, None, 100).await.unwrap().len(), 6, "{name}: dry run changes nothing");
+
+        let report = s.prune(&policy, Some(&p), false).await.unwrap();
+        assert_eq!((report.events_deleted, report.checkpoints_deleted), (4, 2), "{name}");
+        let events = s.events_recent(&p, None, 100).await.unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            kinds.contains(&"note") && kinds.contains(&"file_change"),
+            "{name}: agent notes and recent activity stay"
+        );
+        let summary = events.iter().find(|e| e.kind == "session_summary").expect("summary");
+        assert_eq!(summary.created_at, old + 3, "{name}: summary sits where the session ended");
+        assert!(
+            summary.content.contains(
+                "1 file(s) changed (src/refund.ts), 1 command(s), 1 prompt(s). First request: \"add refunds\""
+            ),
+            "{name}: {}",
+            summary.content
+        );
+        let goals: Vec<String> = s.checkpoints_latest(&p, 10).await.unwrap().into_iter().map(|c| c.goal).collect();
+        assert_eq!(goals, vec!["v3", "docs"], "{name}: latest per task kept, even if old");
+
+        // finished runs: aged by when they finished (here: just now), so use an explicit cutoff
+        let runs_only = memdusa_core::retention::Cutoffs { runs: Some(now_ms() + 1), ..Default::default() };
+        let dry = s.prune_older_than(runs_only, Some(&p), true).await.unwrap();
+        assert_eq!((dry.runs_deleted, dry.steps_deleted), (1, 1), "{name}");
+        let gone = s.prune_older_than(runs_only, Some(&p), false).await.unwrap();
+        assert_eq!((gone.runs_deleted, gone.steps_deleted), (1, 1), "{name}");
+        assert!(matches!(s.run_get(&run.run.id).await, Err(memdusa_core::Error::NotFound(_))), "{name}");
+
+        // 0 days means "keep forever"
+        let none = s
+            .prune(&RetentionPolicy { activity_days: 0, checkpoint_days: 0, run_days: 0 }, Some(&p), false)
+            .await
+            .unwrap();
+        assert_eq!(none, PruneReportLike::zero(), "{name}");
+    }
+}
+
+struct PruneReportLike;
+impl PruneReportLike {
+    fn zero() -> memdusa_core::retention::PruneReport {
+        memdusa_core::retention::PruneReport::default()
+    }
+}
