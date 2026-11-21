@@ -1,0 +1,20 @@
+[package]
+name = "memdusa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memdusa-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+clap.workspace = true
+http = "1"
+reqwest.workspace = true
+rmcp.workspace = true
