@@ -232,3 +232,54 @@ async fn brief_contains_everything() {
         }
     }
 }
+
+#[tokio::test]
+async fn secrets_are_redacted_before_storage() {
+    for (name, s) in stores().await {
+        let p = project();
+        let gh = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let m = s
+            .memory_save(NewMemory {
+                project: Some(p.clone()),
+                content: format!("deploy token is {gh}"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(m.content, "deploy token is [REDACTED:github_token]", "{name}");
+
+        let e = s
+            .event_append(NewEvent {
+                project: p.clone(),
+                kind: "command".into(),
+                content: "export STRIPE_SECRET_KEY=sk_live_abcdefghijklmnop1234".into(),
+                data: Some(json!({"password": "hunter2hunter2", "n": 3})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!e.content.contains("sk_live"), "{name}: {}", e.content);
+        assert_eq!(e.data.unwrap()["password"], "[REDACTED:field]", "{name}");
+
+        let cp = s
+            .checkpoint_save(NewCheckpoint {
+                project: p.clone(),
+                goal: "rotate creds".into(),
+                notes: Some("old db url postgres://app:s3cr3tpass@db/prod".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cp.notes.as_deref(), Some("old db url postgres://app:[REDACTED:url_password]@db/prod"), "{name}");
+
+        let run =
+            s.run_start(NewRun { project: p.clone(), name: "issue key".into(), ..Default::default() }).await.unwrap();
+        s.step_begin(&run.run.id, "create", None, "anonymous").await.unwrap();
+        let step = s.step_complete(&run.run.id, "create", Some(json!({"key": format!("new key {gh}")}))).await.unwrap();
+        assert_eq!(step.output.unwrap()["key"], "new key [REDACTED:github_token]", "{name}");
+
+        // and the persisted copy is redacted, not just the returned value
+        let again = s.memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap();
+        assert!(again.iter().all(|m| !m.content.contains("ghp_")), "{name}");
+    }
+}

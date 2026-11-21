@@ -7,11 +7,14 @@
 //! * never bind a NULL where the server must infer its type (Postgres can't);
 //!   optional filters are added to the SQL text instead.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Executor, Row};
 
 use crate::model::*;
+use crate::redact::Redactor;
 use crate::{Error, Result};
 
 const DEFAULT_LEASE_SECS: i64 = 600;
@@ -26,6 +29,8 @@ pub enum Backend {
 pub struct Store {
     pub(crate) pool: AnyPool,
     backend: Backend,
+    /// Applied to every piece of user/agent text before it is written.
+    redactor: Arc<Redactor>,
 }
 
 // ---------------------------------------------------------------- tiny query builder
@@ -212,9 +217,19 @@ impl Store {
             .connect(&url)
             .await?;
 
-        let store = Self { pool, backend };
+        let store = Self { pool, backend, redactor: Arc::new(Redactor::new(&[])?) };
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// Replace the default redaction rules (e.g. add custom patterns, or disable).
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = Arc::new(redactor);
+        self
+    }
+
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     pub fn backend(&self) -> Backend {
@@ -288,8 +303,10 @@ impl Store {
 
     /// Save a memory. Saving identical content (same kind and scope) again
     /// refreshes it and merges tags instead of creating a duplicate.
-    pub async fn memory_save(&self, m: NewMemory) -> Result<Memory> {
-        let content = m.content.trim().to_owned();
+    pub async fn memory_save(&self, mut m: NewMemory) -> Result<Memory> {
+        let red = &self.redactor;
+        m.tags = red.list(m.tags);
+        let content = red.string(m.content.trim().to_owned());
         if content.is_empty() {
             return Err(Error::Invalid("memory content is empty".into()));
         }
@@ -398,8 +415,8 @@ impl Store {
             session: e.session,
             source: e.source,
             kind: e.kind,
-            content: e.content,
-            data: e.data,
+            content: self.redactor.string(e.content),
+            data: self.redactor.opt_json(e.data),
             created_at: now_ms(),
         };
         let mut q =
@@ -456,12 +473,12 @@ impl Store {
             id: new_id(),
             project: c.project,
             task: c.task,
-            goal: c.goal,
-            done: c.done,
-            next: c.next,
-            blockers: c.blockers,
+            goal: self.redactor.string(c.goal),
+            done: self.redactor.list(c.done),
+            next: self.redactor.list(c.next),
+            blockers: self.redactor.list(c.blockers),
             files: c.files,
-            notes: c.notes,
+            notes: self.redactor.opt(c.notes),
             source: c.source,
             created_at: now_ms(),
         };
@@ -591,7 +608,9 @@ impl Store {
     }
 
     /// Start a run, or return the existing one with the same idempotency key.
-    pub async fn run_start(&self, r: NewRun) -> Result<RunWithSteps> {
+    pub async fn run_start(&self, mut r: NewRun) -> Result<RunWithSteps> {
+        r.name = self.redactor.string(r.name);
+        r.input = self.redactor.opt_json(r.input);
         let owner = r.owner.unwrap_or_else(|| "anonymous".into());
         let lease = r.lease_secs.unwrap_or(DEFAULT_LEASE_SECS).max(0);
         if let Some(key) = &r.idempotency_key {
@@ -676,6 +695,7 @@ impl Store {
     /// Enter a step. Completed steps are replayed from the journal; anything
     /// else (new, crashed mid-way, failed) must be executed by the caller.
     pub async fn step_begin(&self, run_id: &str, key: &str, input: Option<Value>, owner: &str) -> Result<StepDecision> {
+        let input = self.redactor.opt_json(input);
         self.run_claim(run_id, owner, None, false).await?;
 
         let mut q = Q::new("SELECT * FROM steps WHERE run_id = ");
@@ -719,7 +739,9 @@ impl Store {
 
     /// Record a step's result. The journal is append-only: completing an
     /// already-completed step keeps the first recorded output.
+    /// Outputs are redacted too: a replayed step returns the redacted output.
     pub async fn step_complete(&self, run_id: &str, key: &str, output: Option<Value>) -> Result<Step> {
+        let output = self.redactor.opt_json(output);
         let mut q = Q::new("UPDATE steps SET ");
         let (s, o, n, r, k, done) = (
             q.text(StepStatus::Completed.as_str()),
@@ -737,6 +759,8 @@ impl Store {
     }
 
     pub async fn step_fail(&self, run_id: &str, key: &str, error: &str) -> Result<Step> {
+        let error = self.redactor.text(error).into_owned();
+        let error = error.as_str();
         let mut q = Q::new("UPDATE steps SET ");
         let (s, e, r, k, done) = (
             q.text(StepStatus::Failed.as_str()),
@@ -769,6 +793,7 @@ impl Store {
         output: Option<Value>,
         error: Option<String>,
     ) -> Result<RunWithSteps> {
+        let (output, error) = (self.redactor.opt_json(output), self.redactor.opt(error));
         let mut q = Q::new("UPDATE runs SET ");
         let (s, o, e, n, i, running) = (
             q.text(RunStatus::from(outcome).as_str()),

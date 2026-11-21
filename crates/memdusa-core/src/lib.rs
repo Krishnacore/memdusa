@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod brief;
 pub mod model;
+pub mod redact;
 pub mod store;
 
 pub use brief::Brief;

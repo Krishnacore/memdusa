@@ -103,6 +103,30 @@ harnesses that ignore MCP server instructions, put one line in your `CLAUDE.md` 
 
 > At the start of every session call the memdusa `resume` tool; save a `checkpoint` before you stop.
 
+## Secret redaction
+
+Hooks capture raw prompts and shell commands, and agents paste things into memories, so secrets will show up.
+Everything is redacted **before it is stored**: in the store layer, which every write path goes through, and again on
+the client before a remote hook sends anything. Secrets become `[REDACTED:<kind>]` and the surrounding text is kept:
+
+```
+PGPASSWORD=[REDACTED:assignment] psql postgres://app:[REDACTED:url_password]@db/prod
+```
+
+| Detected | Examples |
+|---|---|
+| Provider tokens | AWS, GitHub, GitLab, Anthropic, OpenAI, Stripe, Slack, Google, npm, JWTs, memdusa `mdk_` keys |
+| Structure | private key blocks, `user:password@` in URLs, `Bearer …` |
+| Assignments and flags | `*_TOKEN=…`, `password: …`, `"api_key": "…"`, `--password …`, `--api-key=…` |
+
+Not redacted on purpose: variable references (`TOKEN=$GH_TOKEN`), numbers (`max_tokens=1000`), paths
+(`--token-file ~/.config/token`), and ordinary words ("rotate tokens monthly").
+
+- Extra patterns: one regex per line in `MEMDUSA_REDACT_PATTERNS` or `~/.memdusa/redact-patterns.txt` (`#` comments).
+  Matches become `[REDACTED:custom]`.
+- `MEMDUSA_REDACT=off` stores everything verbatim.
+- Step outputs are redacted too, so a replayed step returns the redacted output. Don't pass secrets through runs.
+
 ## Hosted mode (any machine, cloud agents)
 
 **On the server**

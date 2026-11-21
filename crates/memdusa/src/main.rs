@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memdusa_core::model::{self, ApiKey, CreatedKey, MemoryKind, MemoryQuery, NewMemory, User};
+use memdusa_core::redact::Redactor;
 use memdusa_core::{Store, brief};
 use rmcp::ServiceExt;
 
@@ -261,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let store = match &mode {
         Mode::Remote(r) => return run_remote(cli.cmd, r, project).await,
-        Mode::Local(url) => Store::connect(url).await.with_context(|| format!("connecting to {url}"))?,
+        Mode::Local(url) => open_store(url).await.with_context(|| format!("connecting to {url}"))?,
     };
 
     match cli.cmd {
@@ -460,15 +461,40 @@ async fn run_hook(
         .or_else(|| cwd.as_deref().map(|d| project::detect(std::path::Path::new(d))))
         .or_else(project::detect_cwd)
         .context("could not determine project")?;
-    let req = hooks::HookRequest { project, config, input };
+    let mut req = hooks::HookRequest { project, config, input };
 
     let resp = match Mode::detect(database_url)? {
-        Mode::Remote(r) => remote::Client::new(r, deadline)?.hook(event, &req).await?,
+        Mode::Remote(r) => {
+            // Redact on this machine too, so secrets never leave it (the server redacts again).
+            req.input = redactor_from_env()?.json(req.input);
+            remote::Client::new(r, deadline)?.hook(event, &req).await?
+        }
         Mode::Local(url) => {
-            hooks::handle_request(&Store::connect(&url).await?, event, req, &model::Identity::root()).await?
+            hooks::handle_request(&open_store(&url).await?, event, req, &model::Identity::root()).await?
         }
     };
     Ok(resp.output)
+}
+
+/// Redaction settings: `MEMDUSA_REDACT=off` disables it; extra regexes come
+/// from `MEMDUSA_REDACT_PATTERNS` (one per line) and `<MEMDUSA_HOME>/redact-patterns.txt`.
+fn redactor_from_env() -> anyhow::Result<Redactor> {
+    if let Ok(v) = std::env::var("MEMDUSA_REDACT")
+        && matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")
+    {
+        return Ok(Redactor::disabled());
+    }
+    let mut patterns: Vec<String> =
+        std::env::var("MEMDUSA_REDACT_PATTERNS").map(|v| v.lines().map(String::from).collect()).unwrap_or_default();
+    let file = config::dir()?.join("redact-patterns.txt");
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        patterns.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from));
+    }
+    Redactor::new(&patterns).with_context(|| format!("loading redaction patterns (env or {})", file.display()))
+}
+
+async fn open_store(url: &str) -> anyhow::Result<Store> {
+    Ok(Store::connect(url).await?.with_redactor(redactor_from_env()?))
 }
 
 fn default_db_url() -> anyhow::Result<String> {
