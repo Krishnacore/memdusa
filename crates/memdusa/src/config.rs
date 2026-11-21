@@ -35,11 +35,20 @@ struct ConfigFile {
     remote: Option<Remote>,
 }
 
+/// The user's home directory (`HOME`, or `USERPROFILE` on Windows).
+pub fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .context("cannot find the home directory (HOME / USERPROFILE not set)")
+}
+
 pub fn dir() -> anyhow::Result<PathBuf> {
     if let Some(d) = std::env::var_os("MEMDUSA_HOME") {
         return Ok(PathBuf::from(d));
     }
-    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".memdusa"))
+    Ok(home_dir()?.join(".memdusa"))
 }
 
 fn path() -> anyhow::Result<PathBuf> {

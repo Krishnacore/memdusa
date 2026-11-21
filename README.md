@@ -29,10 +29,18 @@ session or crash mid-task, and continue where you left off.
 machine and in every harness. Without a remote it falls back to the git root path, then the cwd. Override it with
 `--project` or `MEMDUSA_PROJECT`.
 
+## Install
+
+- **Prebuilt binaries** (Linux x86_64/arm64, macOS Intel/Apple Silicon, Windows): download from the GitHub release
+  for each `v*` tag, unpack, and put `memdusa` on your `PATH`.
+- **Server image**: `docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa` (SQLite in the `/data`
+  volume; set `MEMDUSA_DATABASE_URL=postgres://…` for Postgres, `MEMDUSA_ALLOWED_HOSTS` for your domain).
+  Create the first user with `docker exec <container> memdusa user add <name> --admin`.
+- **From source**: `cargo install --path crates/memdusa`
+
 ## Quick start
 
 ```sh
-cargo install --path crates/memdusa
 
 memdusa project                 # show the detected project key
 memdusa remember "Prefers small PRs" --kind preference --global
@@ -209,6 +217,10 @@ crates/memdusa        binary: CLI, MCP server (rmcp, stdio + streamable HTTP), R
 ```
 
 ## Development
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, the store tests against
+Postgres 15 and 17, and a Docker build. Pushing a `v*` tag runs `release.yml`: binaries for five targets with
+SHA-256 checksums attached to a GitHub release, and a multi-arch image pushed to GHCR.
 
 ```sh
 cargo test                                                      # SQLite
