@@ -190,6 +190,10 @@ pub struct NewEvent {
     pub content: String,
     #[serde(default)]
     pub data: Option<Value>,
+    /// When it happened (defaults to now; future times are clamped to now).
+    /// Lets queued events keep their original time when replayed.
+    #[serde(default)]
+    pub created_at: Option<Millis>,
 }
 
 // ---------------------------------------------------------------- checkpoints
@@ -237,6 +241,9 @@ pub struct NewCheckpoint {
     /// Code state; filled in automatically by hooks, the CLI and the MCP proxy.
     #[serde(default)]
     pub git: Option<GitState>,
+    /// Defaults to now; future times are clamped to now.
+    #[serde(default)]
+    pub created_at: Option<Millis>,
 }
 
 /// Where the code was when something was recorded. Lets a resuming agent

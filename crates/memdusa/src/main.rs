@@ -6,6 +6,7 @@ mod mcp;
 mod project;
 mod proxy;
 mod remote;
+mod spool;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -82,6 +83,8 @@ enum Cmd {
     Logout,
     /// Show whether this machine uses a local database or a remote server, and check it.
     Status,
+    /// Send hook events queued while the server was unreachable.
+    Sync,
     /// Manage users (admin). Acts on the local database, or on the logged-in server.
     User {
         #[command(subcommand)]
@@ -271,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
             println!("mode: local database {url} (schema ok, {} users)", store.user_count().await?);
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
+        Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
         Cmd::User { cmd } => match cmd {
             UserCmd::Add { name, admin, key_name } => {
                 let user = store.user_create(&name, admin).await?;
@@ -371,15 +375,26 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
     let client = || remote::Client::new(r.clone(), Duration::from_secs(15));
     match cmd {
         Cmd::Status => {
-            let info = client()?.whoami().await?;
-            println!(
-                "mode: remote {} (server v{}, {}, reachable)",
-                r.url,
-                info["version"].as_str().unwrap_or("?"),
-                info["backend"].as_str().unwrap_or("?")
-            );
-            println!("identity: {}", describe_identity(&info));
+            // Still useful when the server is down: that's when the queue matters.
+            match client()?.whoami().await {
+                Ok(info) => {
+                    println!(
+                        "mode: remote {} (server v{}, {}, reachable)",
+                        r.url,
+                        info["version"].as_str().unwrap_or("?"),
+                        info["backend"].as_str().unwrap_or("?")
+                    );
+                    println!("identity: {}", describe_identity(&info));
+                }
+                Err(e) => println!("mode: remote {} (NOT reachable: {e})", r.url),
+            }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
+            println!("offline queue: {} event(s)", spool::Spool::open()?.len());
+        }
+        Cmd::Sync => {
+            let spool = spool::Spool::open()?;
+            let n = spool.flush(&client()?, &r.url).await?;
+            println!("synced {n} event(s); {} still queued", spool.len());
         }
         Cmd::User { cmd } => {
             let c = client()?;
@@ -468,19 +483,68 @@ async fn run_hook(
         .map(std::path::Path::new)
         .filter(|d| event.needs_git() && project::detect(d) == project)
         .and_then(project::git_state);
-    let mut req = hooks::HookRequest { project, config, input, git };
+    let mut req = hooks::HookRequest { project, config, input, git, at: Some(model::now_ms()) };
 
     let resp = match Mode::detect(database_url)? {
         Mode::Remote(r) => {
             // Redact on this machine too, so secrets never leave it (the server redacts again).
             req.input = redactor_from_env()?.json(req.input);
-            remote::Client::new(r, deadline)?.hook(event, &req).await?
+            remote_hook(event, req, &r, deadline).await?
         }
         Mode::Local(url) => {
             hooks::handle_request(&open_store(&url).await?, event, req, &model::Identity::root()).await?
         }
     };
     Ok(resp.output)
+}
+
+/// Remote hook with an offline fallback: replay any backlog first, then send
+/// this event. If the server is unreachable, queue write-only events locally
+/// and serve SessionStart from the cached brief.
+async fn remote_hook(
+    event: hooks::HookEvent,
+    req: hooks::HookRequest,
+    r: &config::Remote,
+    deadline: Duration,
+) -> anyhow::Result<hooks::HookResponse> {
+    let spool = spool::Spool::open()?;
+    let mut unreachable = None;
+    if !spool.is_empty() {
+        // a short budget, so a hanging server can't eat this hook's whole deadline
+        let flush_client = remote::Client::new(r.clone(), (deadline / 3).min(Duration::from_secs(2)))?;
+        match spool.flush(&flush_client, &r.url).await {
+            Ok(n) if n > 0 => eprintln!("memdusa: synced {n} queued event(s)"),
+            Ok(_) => {}
+            Err(e) if e.retryable => unreachable = Some(e),
+            Err(e) => eprintln!("memdusa: could not sync the offline queue: {e}"),
+        }
+    }
+    let result = match unreachable {
+        Some(e) => Err(e), // just failed to connect: don't wait for another timeout
+        None => remote::Client::new(r.clone(), deadline)?.hook(event, &req).await,
+    };
+    match result {
+        Ok(resp) => {
+            if let (hooks::HookEvent::SessionStart, Some(out)) = (event, &resp.output)
+                && let Err(e) = spool::cache_brief(&req.project, out)
+            {
+                eprintln!("memdusa: could not cache the brief: {e:#}");
+            }
+            Ok(resp)
+        }
+        Err(e) if e.retryable => {
+            let project = req.project.clone();
+            if event.queueable() {
+                spool.push(&r.url, hooks::HookBatchItem { event: event.arg().into(), request: req })?;
+                eprintln!("memdusa: server unreachable, queued {} for later ({e})", event.arg());
+            }
+            if let hooks::HookEvent::SessionStart = event {
+                return Ok(spool::cached_brief(&project, &e.message).unwrap_or_default());
+            }
+            Ok(hooks::HookResponse::default())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Redaction settings: `MEMDUSA_REDACT=off` disables it; extra regexes come

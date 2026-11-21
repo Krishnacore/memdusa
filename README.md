@@ -175,6 +175,13 @@ After `login`, everything on that machine uses the server:
 | `memdusa mcp` | MCP server on the local DB | stdio→HTTP proxy to `/mcp` (works in every stdio-only harness) |
 | `memdusa resume/remember/recall` | local DB | REST API |
 
+**When the server is unreachable**, nothing is lost:
+- Prompts, tool use, compaction and session end are queued in `~/.memdusa/spool/` and replayed (sorted by when they
+  happened, with their original timestamps) by the next hook that reaches the server, or by `memdusa sync`.
+- SessionStart serves the last cached brief, marked as possibly out of date.
+- `memdusa status` shows whether the server is reachable and how many events are queued.
+- Rejected requests (revoked key, bad input) are not queued, and delivery is at-least-once.
+
 The project key is always detected on the client from git, and sent along with each request. The token stays in
 `~/.memdusa/config.json`, never in a committable file like `.mcp.json`. `MEMDUSA_URL` / `MEMDUSA_TOKEN` override the
 file, `--database-url` forces local mode, and `memdusa logout` switches back to local. If the server is unreachable,
@@ -237,6 +244,7 @@ with `attempt: 2`.
 | Method | Path |
 |---|---|
 | GET | `/v1/whoami`: who am I (user, admin) |
+| POST | `/v1/hooks/batch` `{items: [{event, request}]}`: replay queued hooks (max 1000) |
 | GET/POST | `/v1/me/keys`, DELETE `/v1/me/keys/{id-or-prefix}`: your own keys |
 | GET/POST | `/v1/admin/users` (POST `{name, admin?, key_name?}` returns the user and their first key) |
 | POST | `/v1/admin/users/{name}/disable`, `/enable`, `/keys` `{name}` |

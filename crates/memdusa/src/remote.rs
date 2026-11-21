@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, bail};
 use memdusa_core::model::{ApiKey, CreatedKey, GitState, Memory, MemoryQuery, NewMemory, User};
 use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
@@ -11,7 +10,29 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::config::Remote;
-use crate::hooks::{HookEvent, HookRequest, HookResponse};
+use crate::hooks::{HookBatchItem, HookBatchResponse, HookEvent, HookRequest, HookResponse};
+
+/// A failed call to the server. `retryable` means the server couldn't be
+/// reached or had a transient problem, as opposed to rejecting the request.
+#[derive(Debug)]
+pub struct RemoteError {
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl RemoteError {
+    pub fn unreachable(message: impl Into<String>) -> Self {
+        Self { retryable: true, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemoteError {}
 
 pub struct Client {
     http: reqwest::Client,
@@ -36,23 +57,35 @@ impl Client {
         }
     }
 
-    async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> anyhow::Result<T> {
-        let resp = req.send().await.with_context(|| format!("contacting {}", self.remote.url))?;
+    async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, RemoteError> {
+        let url = &self.remote.url;
+        let resp = req.send().await.map_err(|e| RemoteError::unreachable(format!("contacting {url}: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or_default();
             let msg = body.get("error").and_then(Value::as_str).unwrap_or("no details");
-            bail!("{} returned {status}: {msg}", self.remote.url);
+            return Err(RemoteError {
+                // the server is struggling (or rate limiting): try again later
+                retryable: status.is_server_error() || status.as_u16() == 429,
+                message: format!("{url} returned {status}: {msg}"),
+            });
         }
-        Ok(resp.json().await?)
+        resp.json()
+            .await
+            .map_err(|e| RemoteError { retryable: false, message: format!("bad response from {url}: {e}") })
     }
 
     pub async fn whoami(&self) -> anyhow::Result<Value> {
-        self.send(self.request(Method::GET, "/v1/whoami")).await
+        Ok(self.send(self.request(Method::GET, "/v1/whoami")).await?)
     }
 
-    pub async fn hook(&self, event: HookEvent, req: &HookRequest) -> anyhow::Result<HookResponse> {
+    pub async fn hook(&self, event: HookEvent, req: &HookRequest) -> Result<HookResponse, RemoteError> {
         self.send(self.request(Method::POST, &format!("/v1/hooks/{}", event.arg())).json(req)).await
+    }
+
+    /// Replay queued hooks in one request, in order.
+    pub async fn hook_batch(&self, items: &[HookBatchItem]) -> Result<HookBatchResponse, RemoteError> {
+        self.send(self.request(Method::POST, "/v1/hooks/batch").json(&json!({ "items": items }))).await
     }
 
     /// The brief as JSON (its `markdown` field holds the rendered text).
@@ -61,21 +94,21 @@ impl Client {
         if let Some(g) = git {
             q.push(("git", serde_json::to_string(g)?));
         }
-        self.send(self.request(Method::GET, "/v1/resume").query(&q)).await
+        Ok(self.send(self.request(Method::GET, "/v1/resume").query(&q)).await?)
     }
 
     pub async fn memory_save(&self, m: &NewMemory) -> anyhow::Result<Memory> {
-        self.send(self.request(Method::POST, "/v1/memories").json(m)).await
+        Ok(self.send(self.request(Method::POST, "/v1/memories").json(m)).await?)
     }
 
     pub async fn memory_search(&self, q: &MemoryQuery) -> anyhow::Result<Vec<Memory>> {
-        self.send(self.request(Method::GET, "/v1/memories").query(&Query(q))).await
+        Ok(self.send(self.request(Method::GET, "/v1/memories").query(&Query(q))).await?)
     }
 
     // ------------------------------------------------------------ users & keys
 
     pub async fn user_list(&self) -> anyhow::Result<Vec<User>> {
-        self.send(self.request(Method::GET, "/v1/admin/users")).await
+        Ok(self.send(self.request(Method::GET, "/v1/admin/users")).await?)
     }
 
     pub async fn user_add(
@@ -85,19 +118,19 @@ impl Client {
         key_name: &str,
     ) -> anyhow::Result<crate::http::NewUserResponse> {
         let body = json!({ "name": name, "admin": admin, "key_name": key_name });
-        self.send(self.request(Method::POST, "/v1/admin/users").json(&body)).await
+        Ok(self.send(self.request(Method::POST, "/v1/admin/users").json(&body)).await?)
     }
 
     pub async fn user_set_disabled(&self, name: &str, disabled: bool) -> anyhow::Result<User> {
         let action = if disabled { "disable" } else { "enable" };
-        self.send(self.request(Method::POST, &format!("/v1/admin/users/{name}/{action}"))).await
+        Ok(self.send(self.request(Method::POST, &format!("/v1/admin/users/{name}/{action}"))).await?)
     }
 
     /// `user: None` = the caller's own keys.
     pub async fn key_list(&self, user: Option<&str>) -> anyhow::Result<Vec<ApiKey>> {
         match user {
-            None => self.send(self.request(Method::GET, "/v1/me/keys")).await,
-            Some(u) => self.send(self.request(Method::GET, "/v1/admin/keys").query(&[("user", u)])).await,
+            None => Ok(self.send(self.request(Method::GET, "/v1/me/keys")).await?),
+            Some(u) => Ok(self.send(self.request(Method::GET, "/v1/admin/keys").query(&[("user", u)])).await?),
         }
     }
 
@@ -106,14 +139,14 @@ impl Client {
             None => "/v1/me/keys".to_string(),
             Some(u) => format!("/v1/admin/users/{u}/keys"),
         };
-        self.send(self.request(Method::POST, &path).json(&json!({ "name": name }))).await
+        Ok(self.send(self.request(Method::POST, &path).json(&json!({ "name": name }))).await?)
     }
 
     /// Admins can revoke anyone's key; others only their own.
     pub async fn key_revoke(&self, key: &str) -> anyhow::Result<ApiKey> {
         let admin = self.whoami().await?["admin"].as_bool().unwrap_or(false);
         let path = if admin { format!("/v1/admin/keys/{key}") } else { format!("/v1/me/keys/{key}") };
-        self.send(self.request(Method::DELETE, &path)).await
+        Ok(self.send(self.request(Method::DELETE, &path)).await?)
     }
 }
 

@@ -78,6 +78,12 @@ impl Q {
     }
 }
 
+/// A caller-supplied timestamp, never later than now.
+fn past_or_now(t: Option<Millis>) -> Millis {
+    let now = now_ms();
+    t.map_or(now, |t| t.min(now))
+}
+
 fn to_json(v: &Option<Value>) -> Option<String> {
     v.as_ref().map(|v| v.to_string())
 }
@@ -419,7 +425,7 @@ impl Store {
             kind: e.kind,
             content: self.redactor.string(e.content),
             data: self.redactor.opt_json(e.data),
-            created_at: now_ms(),
+            created_at: past_or_now(e.created_at),
         };
         let mut q =
             Q::new("INSERT INTO events (id, project, session, source, kind, content, data, created_at) VALUES (");
@@ -483,7 +489,7 @@ impl Store {
             notes: self.redactor.opt(c.notes),
             source: c.source,
             git: c.git,
-            created_at: now_ms(),
+            created_at: past_or_now(c.created_at),
         };
         let mut q = Q::new(
             "INSERT INTO checkpoints (id, project, task, goal, done, next, blockers, files, notes, source, git, created_at) VALUES (",

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +18,7 @@ use rmcp::transport::streamable_http_server::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::hooks::{self, HookEvent, HookRequest, HookResponse};
+use crate::hooks::{self, HookBatchItem, HookBatchResponse, HookEvent, HookRequest, HookResponse};
 use crate::mcp::{Defaults, MemdusaMcp};
 
 #[derive(Clone)]
@@ -126,6 +126,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/admin/users/{name}/keys", post(admin_key_create))
         .route("/v1/admin/keys", get(admin_keys))
         .route("/v1/admin/keys/{id}", delete(admin_key_revoke))
+        .route("/v1/hooks/batch", post(hook_batch).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/v1/hooks/{event}", post(hook))
         .route("/v1/resume", get(resume))
         .route("/v1/memories", post(memory_save).get(memory_search))
@@ -209,6 +210,41 @@ async fn hook(
 ) -> ApiResult<HookResponse> {
     let event: HookEvent = event.parse().map_err(|e: String| Error::Invalid(format!("unknown hook event: {e}")))?;
     Ok(Json(hooks::handle_request(&s.store, event, req, &id).await?))
+}
+
+#[derive(Deserialize)]
+struct BatchBody {
+    items: Vec<HookBatchItem>,
+}
+
+/// Replay of hooks queued on a client while the server was unreachable.
+/// Items are applied in order; invalid ones are reported and skipped (so one
+/// bad entry can't block a queue forever), database errors abort the batch
+/// so the client retries it.
+async fn hook_batch(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Json(b): Json<BatchBody>,
+) -> ApiResult<HookBatchResponse> {
+    if b.items.len() > 1000 {
+        return Err(Error::Invalid("at most 1000 items per batch".into()).into());
+    }
+    let mut resp = HookBatchResponse::default();
+    for (i, item) in b.items.into_iter().enumerate() {
+        let event: HookEvent = match item.event.parse() {
+            Ok(e) => e,
+            Err(e) => {
+                resp.rejected.push(format!("#{i}: unknown event {e}"));
+                continue;
+            }
+        };
+        match hooks::handle_request(&s.store, event, item.request, &id).await {
+            Ok(_) => resp.processed += 1,
+            Err(Error::Invalid(m)) => resp.rejected.push(format!("#{i}: {m}")),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Json(resp))
 }
 
 // ---------------------------------------------------------------- keys & users
@@ -549,6 +585,7 @@ mod tests {
             config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
             input,
             git: None,
+            at: None,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -698,5 +735,60 @@ mod tests {
         assert_eq!(call(reqwest::Method::GET, &format!("{url}/v1/whoami"), None, None).await.0, 200, "open");
         store.user_create("carol", true).await.unwrap(); // e.g. CLI on the server, while it runs
         assert_eq!(call(reqwest::Method::GET, &format!("{url}/v1/whoami"), None, None).await.0, 401, "now locked");
+    }
+
+    #[tokio::test]
+    async fn offline_queue_replays_in_order_once_server_is_back() {
+        use crate::hooks::HookBatchItem;
+        use crate::spool::Spool;
+
+        let dir = std::env::temp_dir().join(format!("memdusa-spool-{}", new_id()));
+        let spool = Spool::at(dir.clone()).unwrap();
+        let req = |input: Value, at: i64| HookRequest {
+            project: "shop".into(),
+            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            input,
+            git: None,
+            at: Some(at),
+        };
+        let item = |event: &str, input: Value, at: i64| HookBatchItem { event: event.into(), request: req(input, at) };
+        let t0 = now_ms() - 60_000;
+        // queued out of order on purpose: replay must sort by fire time
+        let edit = json!({"session_id": "A", "cwd": "/r", "tool_name": "Edit", "tool_input": {"file_path": "/r/a.rs"}});
+        spool
+            .push("http://dead", item("session-end", json!({"session_id": "A", "reason": "logout"}), t0 + 2000))
+            .unwrap();
+        spool.push("http://dead", item("post-tool-use", edit, t0 + 1000)).unwrap();
+        spool
+            .push("http://dead", item("user-prompt-submit", json!({"session_id": "A", "prompt": "fix a.rs"}), t0))
+            .unwrap();
+        assert_eq!(spool.len(), 3);
+
+        // server down: retryable error, nothing lost
+        let dead = Client::new(Remote::new("http://127.0.0.1:9", None).unwrap(), Duration::from_secs(1)).unwrap();
+        let err = spool.flush(&dead, "http://dead").await.unwrap_err();
+        assert!(err.retryable, "{err}");
+        assert_eq!(spool.len(), 3, "entries survive a failed flush");
+
+        // server up (entries were queued for "http://dead": re-address them via a fresh spool line check)
+        let (url, store) = spawn(None).await;
+        assert_eq!(spool.flush(&client(&url, None), &url).await.unwrap(), 0, "entries for another server aren't sent");
+        assert_eq!(spool.len(), 3);
+        let text: String = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .collect::<String>()
+            .replace("http://dead", &url);
+        for f in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        std::fs::write(dir.join("queue.jsonl"), text).unwrap();
+        assert_eq!(spool.flush(&client(&url, None), &url).await.unwrap(), 3);
+        assert_eq!(spool.len(), 0, "delivered entries are removed");
+
+        // sorted replay => the session-end saw the prompt and the edit
+        let cp = &store.checkpoints_latest("shop", 1).await.unwrap()[0];
+        assert_eq!((cp.goal.as_str(), cp.files.clone()), ("fix a.rs", vec!["a.rs".to_string()]));
+        assert_eq!(cp.created_at, t0 + 2000, "original fire time kept");
     }
 }

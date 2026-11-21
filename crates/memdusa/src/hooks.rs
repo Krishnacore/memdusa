@@ -134,6 +134,35 @@ pub struct HookRequest {
     /// Code state of the client's repo (for events that save or compare it).
     #[serde(default)]
     pub git: Option<GitState>,
+    /// When the hook fired on the client. Queued hooks replayed later keep
+    /// their original time.
+    #[serde(default)]
+    pub at: Option<Millis>,
+}
+
+/// One queued hook, replayed through `POST /v1/hooks/batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookBatchItem {
+    /// Event name as used on the command line (`post-tool-use`).
+    pub event: String,
+    pub request: HookRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookBatchResponse {
+    pub processed: usize,
+    /// Items the server rejected as invalid (they are not retried).
+    #[serde(default)]
+    pub rejected: Vec<String>,
+}
+
+impl HookEvent {
+    /// Write-only events whose effect can be applied later if the server is
+    /// unreachable now. SessionStart and Stop produce output that is only
+    /// useful in the moment, so they aren't queued.
+    pub fn queueable(self) -> bool {
+        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -168,6 +197,7 @@ pub async fn handle_request(
         cwd: input.cwd.clone(),
         user: identity.user.clone(),
         git: req.git.clone(),
+        at: req.at.map_or_else(now_ms, |t| t.min(now_ms())),
         cfg: &req.config,
     };
     Ok(HookResponse { output: handle(event, input, ctx).await? })
@@ -186,6 +216,8 @@ pub struct Ctx<'a> {
     pub user: Option<String>,
     /// The client's current code state, when the event needs it.
     pub git: Option<GitState>,
+    /// When the hook fired (what records are timestamped with).
+    pub at: Millis,
     pub cfg: &'a HookConfig,
 }
 
@@ -230,6 +262,7 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
             kind: kind.into(),
             content,
             data,
+            created_at: Some(ctx.at),
         })
         .await
         .map(drop)
@@ -355,6 +388,7 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
             notes: Some(notes),
             source: Some(format!("{} (auto)", ctx.cfg.agent)),
             git: ctx.git.clone(),
+            created_at: Some(ctx.at),
         })
         .await
         .map(drop)
@@ -397,6 +431,7 @@ mod tests {
             cwd: Some("/repo".into()),
             user: None,
             git: None,
+            at: now_ms(),
             cfg,
         }
     }

@@ -338,6 +338,7 @@ impl MemdusaMcp {
             notes: a.notes,
             source: self.agent(&ctx),
             git,
+            created_at: None,
         };
         let cp = self.store.checkpoint_save(c).await.map_err(err)?;
         Ok(format!("checkpoint {} saved", cp.id))
@@ -354,6 +355,7 @@ impl MemdusaMcp {
             kind: a.kind,
             content: a.content,
             data: a.data,
+            created_at: None,
         };
         let ev = self.store.event_append(e).await.map_err(err)?;
         Ok(format!("logged {}", ev.id))
