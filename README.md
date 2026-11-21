@@ -29,10 +29,18 @@ session or crash mid-task, and continue where you left off.
 machine and in every harness. Without a remote it falls back to the git root path, then the cwd. Override it with
 `--project` or `MEMDUSA_PROJECT`.
 
+## Install
+
+- **Prebuilt binaries** (Linux x86_64/arm64, macOS Intel/Apple Silicon, Windows): download from the GitHub release
+  for each `v*` tag, unpack, and put `memdusa` on your `PATH`.
+- **Server image**: `docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa` (SQLite in the `/data`
+  volume; set `MEMDUSA_DATABASE_URL=postgres://…` for Postgres, `MEMDUSA_ALLOWED_HOSTS` for your domain).
+  Create the first user with `docker exec <container> memdusa user add <name> --admin`.
+- **From source**: `cargo install --path crates/memdusa`
+
 ## Quick start
 
 ```sh
-cargo install --path crates/memdusa
 
 memdusa project                 # show the detected project key
 memdusa remember "Prefers small PRs" --kind preference --global
@@ -95,6 +103,81 @@ harnesses that ignore MCP server instructions, put one line in your `CLAUDE.md` 
 
 > At the start of every session call the memdusa `resume` tool; save a `checkpoint` before you stop.
 
+## Code state in checkpoints
+
+Notes are only useful if the code matches them. Every checkpoint records where the code was: branch, HEAD, uncommitted
+files, and the machine. Hooks, the CLI, stdio MCP and the remote proxy capture it on the client (one
+`git status --porcelain=v2` call). The model never has to pass it in, and the field is hidden from its tool schema.
+
+```
+### Goal: Add refunds
+**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted (src/refund.ts, src/api.ts) · on `laptop`
+```
+
+On resume, the brief compares that with the resuming agent's state, and puts any warnings above the notes:
+
+| Situation | Warning |
+|---|---|
+| Saved on another machine with uncommitted files | those changes may exist only on that machine |
+| Different branch | the checkpoint was on `feat/x`, you're on `main` |
+| Same branch, HEAD moved | new commits, a rebase, or a different checkout |
+| Uncommitted files are clean now | committed elsewhere, stashed or discarded? |
+
+State is only attached when the current directory's repo *is* the project being resumed, so
+`--project other/repo` never compares against an unrelated checkout.
+
+## Retention
+
+History grows with every edit and command. To keep the database and the brief fast:
+
+| What | Default | How |
+|---|---|---|
+| Hook activity (edits, commands, prompts, session start/end) | 30 days | **Summarized, then deleted**: each old session becomes one `session_summary` event ("14 files changed (…), 22 commands, 3 prompts. First request: …") |
+| Superseded checkpoints | 90 days | Deleted. The latest checkpoint of every task is always kept |
+| Finished runs and their steps | 90 days | Deleted |
+| Memories, events logged by agents | forever | Never pruned automatically |
+
+`memdusa serve` prunes once a day (`--no-auto-prune` to turn it off). Local mode prunes at the end of a session, at
+most once a day. To run it by hand: `memdusa prune [--dry-run] [--only-project P] [--activity-days N]
+[--checkpoint-days N] [--run-days N]` (locally, or as an admin against a server). Windows can also be set with
+`MEMDUSA_RETENTION_ACTIVITY_DAYS` / `_CHECKPOINT_DAYS` / `_RUN_DAYS`. `0` means keep forever.
+
+## Operations
+
+| | |
+|---|---|
+| **Backup** | `memdusa backup <file>`: consistent online copy of the SQLite database (`VACUUM INTO`). For Postgres use `pg_dump` |
+| **Export / import** | `memdusa export [--only-project P] [-o file]` writes JSON Lines (memories, events, checkpoints, runs with steps; never users or keys). `memdusa import <file\|->` keeps ids and timestamps, skips what already exists (safe to re-run), and re-applies redaction |
+| **Local → hosted** | `memdusa --database-url sqlite://$HOME/.memdusa/memdusa.db export \| memdusa import -` while logged in to a server (needs an admin key) |
+| **Rate limiting** | Per user (or IP for anonymous callers): `--rate-limit 50` req/s with bursts up to 10x, `0` = off. Over the limit you get `429` with `Retry-After`, and hooks queue instead of losing data |
+| **Body limits** | 1 MB per request, 16 MB for hook batches, 64 MB for imports |
+| **Metrics** | Prometheus at `/metrics` (`--no-metrics` to turn it off): requests and latency by route *template*, hook events, rate-limit and auth failures, users, running and stale runs. No ids, projects or users in labels |
+| **Logs** | One access-log line per request (method, route template, status, latency, user; never bodies or query strings). `MEMDUSA_LOG_FORMAT=json` for JSON, `RUST_LOG` for levels |
+
+## Secret redaction
+
+Hooks capture raw prompts and shell commands, and agents paste things into memories, so secrets will show up.
+Everything is redacted **before it is stored**: in the store layer, which every write path goes through, and again on
+the client before a remote hook sends anything. Secrets become `[REDACTED:<kind>]` and the surrounding text is kept:
+
+```
+PGPASSWORD=[REDACTED:assignment] psql postgres://app:[REDACTED:url_password]@db/prod
+```
+
+| Detected | Examples |
+|---|---|
+| Provider tokens | AWS, GitHub, GitLab, Anthropic, OpenAI, Stripe, Slack, Google, npm, JWTs, memdusa `mdk_` keys |
+| Structure | private key blocks, `user:password@` in URLs, `Bearer …` |
+| Assignments and flags | `*_TOKEN=…`, `password: …`, `"api_key": "…"`, `--password …`, `--api-key=…` |
+
+Not redacted on purpose: variable references (`TOKEN=$GH_TOKEN`), numbers (`max_tokens=1000`), paths
+(`--token-file ~/.config/token`), and ordinary words ("rotate tokens monthly").
+
+- Extra patterns: one regex per line in `MEMDUSA_REDACT_PATTERNS` or `~/.memdusa/redact-patterns.txt` (`#` comments).
+  Matches become `[REDACTED:custom]`.
+- `MEMDUSA_REDACT=off` stores everything verbatim.
+- Step outputs are redacted too, so a replayed step returns the redacted output. Don't pass secrets through runs.
+
 ## Hosted mode (any machine, cloud agents)
 
 **On the server**
@@ -119,6 +202,13 @@ After `login`, everything on that machine uses the server:
 | `memdusa hook …` | runs against the local DB | one `POST /v1/hooks/{event}`; the server runs the same hook logic |
 | `memdusa mcp` | MCP server on the local DB | stdio→HTTP proxy to `/mcp` (works in every stdio-only harness) |
 | `memdusa resume/remember/recall` | local DB | REST API |
+
+**When the server is unreachable**, nothing is lost:
+- Prompts, tool use, compaction and session end are queued in `~/.memdusa/spool/` and replayed (sorted by when they
+  happened, with their original timestamps) by the next hook that reaches the server, or by `memdusa sync`.
+- SessionStart serves the last cached brief, marked as possibly out of date.
+- `memdusa status` shows whether the server is reachable and how many events are queued.
+- Rejected requests (revoked key, bad input) are not queued, and delivery is at-least-once.
 
 The project key is always detected on the client from git, and sent along with each request. The token stays in
 `~/.memdusa/config.json`, never in a committable file like `.mcp.json`. `MEMDUSA_URL` / `MEMDUSA_TOKEN` override the
@@ -182,10 +272,14 @@ with `attempt: 2`.
 | Method | Path |
 |---|---|
 | GET | `/v1/whoami`: who am I (user, admin) |
+| POST | `/v1/hooks/batch` `{items: [{event, request}]}`: replay queued hooks (max 1000) |
 | GET/POST | `/v1/me/keys`, DELETE `/v1/me/keys/{id-or-prefix}`: your own keys |
 | GET/POST | `/v1/admin/users` (POST `{name, admin?, key_name?}` returns the user and their first key) |
 | POST | `/v1/admin/users/{name}/disable`, `/enable`, `/keys` `{name}` |
 | GET | `/v1/admin/keys?user=`, DELETE `/v1/admin/keys/{id-or-prefix}` |
+| POST | `/v1/admin/prune` `{policy?, project?, dry_run?}` |
+| GET | `/v1/admin/export?project=` (JSON Lines), POST `/v1/admin/import` (JSON Lines body) |
+| GET | `/metrics` (Prometheus, no auth), `/health` |
 | POST | `/v1/hooks/{event}` `{project, agent, journal_prompts, stop_guard_mins, input}` |
 | GET | `/v1/resume?project=` |
 | POST/GET | `/v1/memories` (GET: `?query&project&kind&limit`) |
@@ -210,6 +304,10 @@ crates/memdusa        binary: CLI, MCP server (rmcp, stdio + streamable HTTP), R
 
 ## Development
 
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, the store tests against
+Postgres 15 and 17, and a Docker build. Pushing a `v*` tag runs `release.yml`: binaries for five targets with
+SHA-256 checksums attached to a GitHub release, and a multi-arch image pushed to GHCR.
+
 ```sh
 cargo test                                                      # SQLite
 MEMDUSA_TEST_POSTGRES_URL=postgres://localhost/memdusa_test cargo test   # + Postgres
@@ -228,5 +326,6 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)
-- [ ] Local ⇄ hosted sync
+- [x] Local → hosted migration (`export | import`)
+- [ ] Continuous local ⇄ hosted sync
 - [ ] Transcript import from Claude Code / Codex session files

@@ -17,4 +17,5 @@ axum.workspace = true
 clap.workspace = true
 http = "1"
 reqwest.workspace = true
+gethostname = "1"
 rmcp.workspace = true

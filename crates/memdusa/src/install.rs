@@ -23,9 +23,7 @@ pub enum Scope {
 impl Scope {
     fn settings_path(self) -> anyhow::Result<PathBuf> {
         Ok(match self {
-            Self::User => {
-                PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".claude/settings.json")
-            }
+            Self::User => crate::config::home_dir()?.join(".claude/settings.json"),
             Self::Project => PathBuf::from(".claude/settings.json"),
             Self::Local => PathBuf::from(".claude/settings.local.json"),
         })

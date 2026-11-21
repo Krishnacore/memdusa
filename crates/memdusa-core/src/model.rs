@@ -190,6 +190,10 @@ pub struct NewEvent {
     pub content: String,
     #[serde(default)]
     pub data: Option<Value>,
+    /// When it happened (defaults to now; future times are clamped to now).
+    /// Lets queued events keep their original time when replayed.
+    #[serde(default)]
+    pub created_at: Option<Millis>,
 }
 
 // ---------------------------------------------------------------- checkpoints
@@ -208,6 +212,9 @@ pub struct Checkpoint {
     pub files: Vec<String>,
     pub notes: Option<String>,
     pub source: Option<String>,
+    /// Code state when the checkpoint was saved (captured on the client).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitState>,
     pub created_at: Millis,
 }
 
@@ -231,6 +238,105 @@ pub struct NewCheckpoint {
     pub notes: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Code state; filled in automatically by hooks, the CLI and the MCP proxy.
+    #[serde(default)]
+    pub git: Option<GitState>,
+    /// Defaults to now; future times are clamped to now.
+    #[serde(default)]
+    pub created_at: Option<Millis>,
+}
+
+/// Where the code was when something was recorded. Lets a resuming agent
+/// notice it's looking at a different branch, commit or machine than the one
+/// the notes describe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitState {
+    /// `None` when detached.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Full commit SHA; `None` in a repo without commits.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Number of modified/untracked files.
+    #[serde(default)]
+    pub dirty_count: i64,
+    /// Up to 20 of them.
+    #[serde(default)]
+    pub dirty_files: Vec<String>,
+    /// Machine name: uncommitted work only exists there.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+fn file_list(files: &[String], total: i64) -> String {
+    let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+    let more = total - shown.len() as i64;
+    if more > 0 { format!("{}, +{more} more", shown.join(", ")) } else { shown.join(", ") }
+}
+
+impl GitState {
+    /// One line for the brief: `` `feat/x` @ `a1b2c3d` · 3 uncommitted (a.rs, b.rs, c.rs) · on `mbp` ``
+    pub fn summary(&self) -> String {
+        let mut parts = vec![];
+        match (&self.branch, &self.head) {
+            (Some(b), Some(h)) => parts.push(format!("`{b}` @ `{}`", short(h))),
+            (None, Some(h)) => parts.push(format!("detached @ `{}`", short(h))),
+            (Some(b), None) => parts.push(format!("`{b}` (no commits)")),
+            (None, None) => {}
+        }
+        if self.dirty_count > 0 {
+            parts.push(format!(
+                "{} uncommitted ({})",
+                self.dirty_count,
+                file_list(&self.dirty_files, self.dirty_count)
+            ));
+        } else {
+            parts.push("clean".into());
+        }
+        if let Some(h) = &self.host {
+            parts.push(format!("on `{h}`"));
+        }
+        parts.join(" · ")
+    }
+
+    /// Differences between the code state a checkpoint was saved in (`self`)
+    /// and the resuming agent's (`current`) that could make the notes wrong.
+    pub fn drift(&self, current: &GitState) -> Vec<String> {
+        let mut w = vec![];
+        let other_host = matches!((&self.host, &current.host), (Some(a), Some(b)) if a != b);
+        if other_host && self.dirty_count > 0 {
+            w.push(format!(
+                "The checkpoint was saved on `{}` with {} uncommitted file(s) ({}). Those changes may exist only on that \
+                 machine: check before redoing or overwriting that work.",
+                self.host.as_deref().unwrap_or("?"),
+                self.dirty_count,
+                file_list(&self.dirty_files, self.dirty_count)
+            ));
+        }
+        match ((&self.branch, &self.head), (&current.branch, &current.head)) {
+            ((Some(a), _), (Some(b), _)) if a != b => {
+                w.push(format!("The checkpoint was on branch `{a}`, but you're on `{b}`."))
+            }
+            ((_, Some(a)), (_, Some(b))) if a != b => w.push(format!(
+                "HEAD moved since the checkpoint: `{}` → `{}` (new commits, a rebase, or a different checkout).",
+                short(a),
+                short(b)
+            )),
+            _ => {}
+        }
+        if !other_host && self.head == current.head && self.dirty_count > 0 && current.dirty_count == 0 {
+            w.push(format!(
+                "{} file(s) uncommitted at checkpoint time are no longer modified: they may have been committed \
+                 elsewhere, stashed or discarded.",
+                self.dirty_count
+            ));
+        }
+        w
+    }
 }
 
 // ---------------------------------------------------------------- durable execution
@@ -380,5 +486,52 @@ impl From<RunOutcome> for RunStatus {
             RunOutcome::Failed => Self::Failed,
             RunOutcome::Cancelled => Self::Cancelled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitState;
+
+    fn g(branch: &str, head: &str, dirty: &[&str], host: &str) -> GitState {
+        GitState {
+            branch: Some(branch.into()),
+            head: Some(head.into()),
+            dirty_count: dirty.len() as i64,
+            dirty_files: dirty.iter().map(|s| s.to_string()).collect(),
+            host: Some(host.into()),
+        }
+    }
+
+    #[test]
+    fn drift_detection() {
+        let saved = g("feat/refunds", "a1b2c3d4e5", &["src/refund.ts"], "laptop");
+        assert!(saved.drift(&saved).is_empty(), "identical state: no warnings");
+
+        let w = saved.drift(&g("feat/refunds", "a1b2c3d4e5", &[], "desktop"));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("saved on `laptop`") && w[0].contains("src/refund.ts"), "{w:?}");
+
+        let w = saved.drift(&g("main", "ffffff0000", &["src/refund.ts"], "laptop"));
+        assert_eq!(w, vec!["The checkpoint was on branch `feat/refunds`, but you're on `main`."]);
+
+        let w = saved.drift(&g("feat/refunds", "9f8e7d6c5b", &["src/refund.ts"], "laptop"));
+        assert!(w[0].contains("`a1b2c3d` → `9f8e7d6`"), "{w:?}");
+
+        let w = saved.drift(&g("feat/refunds", "a1b2c3d4e5", &[], "laptop"));
+        assert!(w[0].contains("no longer modified"), "{w:?}");
+
+        let clean = g("main", "a1b2c3d4e5", &[], "laptop");
+        assert!(clean.drift(&g("main", "a1b2c3d4e5", &[], "desktop")).is_empty(), "clean tree: machine doesn't matter");
+    }
+
+    #[test]
+    fn summary_line() {
+        let many: Vec<String> = (1..=8).map(|i| format!("f{i}.rs")).collect();
+        let s = GitState { dirty_count: 8, dirty_files: many, ..g("main", "a1b2c3d4e5", &[], "mbp") };
+        assert_eq!(
+            s.summary(),
+            "`main` @ `a1b2c3d` · 8 uncommitted (f1.rs, f2.rs, f3.rs, f4.rs, f5.rs, +3 more) · on `mbp`"
+        );
     }
 }

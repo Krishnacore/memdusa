@@ -67,6 +67,11 @@ impl HookEvent {
         }
     }
 
+    /// Events that save or compare code state (so the client reads git only then).
+    pub fn needs_git(self) -> bool {
+        matches!(self, Self::SessionStart | Self::PreCompact | Self::SessionEnd)
+    }
+
     /// Tool matcher for events that support one.
     pub fn matcher(self) -> Option<&'static str> {
         match self {
@@ -126,6 +131,38 @@ pub struct HookRequest {
     #[serde(flatten)]
     pub config: HookConfig,
     pub input: Value,
+    /// Code state of the client's repo (for events that save or compare it).
+    #[serde(default)]
+    pub git: Option<GitState>,
+    /// When the hook fired on the client. Queued hooks replayed later keep
+    /// their original time.
+    #[serde(default)]
+    pub at: Option<Millis>,
+}
+
+/// One queued hook, replayed through `POST /v1/hooks/batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookBatchItem {
+    /// Event name as used on the command line (`post-tool-use`).
+    pub event: String,
+    pub request: HookRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookBatchResponse {
+    pub processed: usize,
+    /// Items the server rejected as invalid (they are not retried).
+    #[serde(default)]
+    pub rejected: Vec<String>,
+}
+
+impl HookEvent {
+    /// Write-only events whose effect can be applied later if the server is
+    /// unreachable now. SessionStart and Stop produce output that is only
+    /// useful in the moment, so they aren't queued.
+    pub fn queueable(self) -> bool {
+        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -159,6 +196,8 @@ pub async fn handle_request(
         session: input.session_id.clone(),
         cwd: input.cwd.clone(),
         user: identity.user.clone(),
+        git: req.git.clone(),
+        at: req.at.map_or_else(now_ms, |t| t.min(now_ms())),
         cfg: &req.config,
     };
     Ok(HookResponse { output: handle(event, input, ctx).await? })
@@ -175,6 +214,10 @@ pub struct Ctx<'a> {
     pub cwd: Option<String>,
     /// Authenticated user, if any (decides which global memories are visible).
     pub user: Option<String>,
+    /// The client's current code state, when the event needs it.
+    pub git: Option<GitState>,
+    /// When the hook fired (what records are timestamped with).
+    pub at: Millis,
     pub cfg: &'a HookConfig,
 }
 
@@ -219,6 +262,7 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
             kind: kind.into(),
             content,
             data,
+            created_at: Some(ctx.at),
         })
         .await
         .map(drop)
@@ -226,7 +270,7 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
 
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     // Build the brief before journaling, so it doesn't report its own start.
-    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref()).await?;
+    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref()).await?;
     log(ctx, "session_start", format!("session started ({source})"), None).await?;
 
     let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty();
@@ -343,6 +387,8 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
             files,
             notes: Some(notes),
             source: Some(format!("{} (auto)", ctx.cfg.agent)),
+            git: ctx.git.clone(),
+            created_at: Some(ctx.at),
         })
         .await
         .map(drop)
@@ -370,7 +416,7 @@ mod tests {
     async fn ctx_store() -> Store {
         let dir = std::env::temp_dir().join(format!("memdusa-hooks-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        Store::connect(&format!("sqlite://{}", dir.join("t.db").display())).await.unwrap()
+        Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap()
     }
 
     fn cfg() -> HookConfig {
@@ -378,7 +424,16 @@ mod tests {
     }
 
     fn ctx<'a>(store: &'a Store, cfg: &'a HookConfig) -> Ctx<'a> {
-        Ctx { store, project: "p".into(), session: Some("s1".into()), cwd: Some("/repo".into()), user: None, cfg }
+        Ctx {
+            store,
+            project: "p".into(),
+            session: Some("s1".into()),
+            cwd: Some("/repo".into()),
+            user: None,
+            git: None,
+            at: now_ms(),
+            cfg,
+        }
     }
 
     fn input(v: Value) -> HookInput {

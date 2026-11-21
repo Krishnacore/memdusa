@@ -3,9 +3,11 @@ mod hooks;
 mod http;
 mod install;
 mod mcp;
+mod ops;
 mod project;
 mod proxy;
 mod remote;
+mod spool;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,6 +15,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memdusa_core::model::{self, ApiKey, CreatedKey, MemoryKind, MemoryQuery, NewMemory, User};
+use memdusa_core::redact::Redactor;
+use memdusa_core::retention::RetentionPolicy;
+use memdusa_core::transfer;
 use memdusa_core::{Store, brief};
 use rmcp::ServiceExt;
 
@@ -50,6 +55,26 @@ enum Cmd {
         /// Host header values accepted by /mcp (DNS-rebinding protection). Default: localhost only.
         #[arg(long = "allowed-host", env = "MEMDUSA_ALLOWED_HOSTS", value_delimiter = ',')]
         allowed_hosts: Vec<String>,
+        /// Don't prune old data automatically (otherwise once a day, see `memdusa prune`).
+        #[arg(long, env = "MEMDUSA_NO_AUTO_PRUNE")]
+        no_auto_prune: bool,
+        /// Requests per second per user (or IP), with bursts up to 10x. 0 = no limit.
+        #[arg(long, env = "MEMDUSA_RATE_LIMIT", default_value_t = 50.0)]
+        rate_limit: f64,
+        /// Don't serve Prometheus metrics at /metrics.
+        #[arg(long, env = "MEMDUSA_NO_METRICS")]
+        no_metrics: bool,
+    },
+    /// Summarize old hook activity and delete superseded checkpoints and finished runs.
+    Prune {
+        /// Show what would be pruned without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only this project (default: all).
+        #[arg(long = "only-project")]
+        only_project: Option<String>,
+        #[command(flatten)]
+        policy: RetentionArgs,
     },
     /// Print the hand-off brief for the current project.
     Resume {
@@ -81,6 +106,27 @@ enum Cmd {
     Logout,
     /// Show whether this machine uses a local database or a remote server, and check it.
     Status,
+    /// Send hook events queued while the server was unreachable.
+    Sync,
+    /// Write all data as JSON Lines (memories, events, checkpoints, runs; not users or keys).
+    Export {
+        /// Only this project (default: everything).
+        #[arg(long = "only-project")]
+        only_project: Option<String>,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Load a `memdusa export` file. Idempotent: existing records are skipped.
+    Import {
+        /// File to read, or `-` for stdin.
+        file: String,
+    },
+    /// Consistent online copy of the local SQLite database.
+    Backup {
+        /// Destination file (must not exist).
+        path: PathBuf,
+    },
     /// Manage users (admin). Acts on the local database, or on the logged-in server.
     User {
         #[command(subcommand)]
@@ -135,6 +181,73 @@ enum Cmd {
     },
 }
 
+/// Retention windows in days (0 = keep forever).
+#[derive(clap::Args, Clone, Copy)]
+struct RetentionArgs {
+    /// Days of raw hook activity to keep before summarizing it.
+    #[arg(long, env = "MEMDUSA_RETENTION_ACTIVITY_DAYS", default_value_t = 30)]
+    activity_days: i64,
+    /// Days to keep superseded checkpoints (the latest per task is always kept).
+    #[arg(long, env = "MEMDUSA_RETENTION_CHECKPOINT_DAYS", default_value_t = 90)]
+    checkpoint_days: i64,
+    /// Days to keep finished runs.
+    #[arg(long, env = "MEMDUSA_RETENTION_RUN_DAYS", default_value_t = 90)]
+    run_days: i64,
+}
+
+impl From<RetentionArgs> for RetentionPolicy {
+    fn from(a: RetentionArgs) -> Self {
+        Self { activity_days: a.activity_days, checkpoint_days: a.checkpoint_days, run_days: a.run_days }
+    }
+}
+
+/// Retention policy for automatic pruning (env overrides, else defaults).
+fn retention_from_env() -> RetentionPolicy {
+    let days = |var: &str, default: i64| std::env::var(var).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+    let d = RetentionPolicy::default();
+    RetentionPolicy {
+        activity_days: days("MEMDUSA_RETENTION_ACTIVITY_DAYS", d.activity_days),
+        checkpoint_days: days("MEMDUSA_RETENTION_CHECKPOINT_DAYS", d.checkpoint_days),
+        run_days: days("MEMDUSA_RETENTION_RUN_DAYS", d.run_days),
+    }
+}
+
+fn read_input(file: &str) -> anyhow::Result<String> {
+    if file == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("reading {file}"))
+    }
+}
+
+fn write_export(text: &str, output: Option<PathBuf>) -> anyhow::Result<()> {
+    match output {
+        Some(p) => {
+            std::fs::write(&p, text)?;
+            eprintln!("exported {} record(s) to {}", text.lines().count().saturating_sub(1), p.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+fn print_import(r: &transfer::ImportReport) {
+    println!(
+        "imported {} memories, {} events, {} checkpoints, {} runs ({} steps); skipped {} existing",
+        r.memories, r.events, r.checkpoints, r.runs, r.steps, r.skipped
+    );
+}
+
+fn print_prune(r: &memdusa_core::retention::PruneReport) {
+    let verb = if r.dry_run { "would" } else { "did" };
+    println!(
+        "{verb} summarize {} session(s) ({} activity events), delete {} checkpoint(s), {} run(s) ({} steps)",
+        r.sessions_summarized, r.events_deleted, r.checkpoints_deleted, r.runs_deleted, r.steps_deleted
+    );
+}
+
 #[derive(Subcommand)]
 enum UserCmd {
     /// Create a user and their first API key (printed once).
@@ -180,12 +293,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // stdout is the MCP channel in stdio mode: logs must go to stderr.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "memdusa=info,warn".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "memdusa=info,warn".into());
+    let logs = tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter);
+    if std::env::var("MEMDUSA_LOG_FORMAT").is_ok_and(|f| f.eq_ignore_ascii_case("json")) {
+        logs.json().init();
+    } else {
+        logs.init();
+    }
 
     match cli.cmd {
         Cmd::Install { scope, settings, bin, no_mcp, dry_run, .. } => {
@@ -261,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let store = match &mode {
         Mode::Remote(r) => return run_remote(cli.cmd, r, project).await,
-        Mode::Local(url) => Store::connect(url).await.with_context(|| format!("connecting to {url}"))?,
+        Mode::Local(url) => open_store(url).await.with_context(|| format!("connecting to {url}"))?,
     };
 
     match cli.cmd {
@@ -269,6 +383,15 @@ async fn main() -> anyhow::Result<()> {
             let Mode::Local(url) = &mode else { unreachable!() };
             println!("mode: local database {url} (schema ok, {} users)", store.user_count().await?);
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
+        }
+        Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
+        Cmd::Export { only_project, output } => {
+            write_export(&transfer::to_jsonl(&store.export(only_project.as_deref()).await?), output)?
+        }
+        Cmd::Import { file } => print_import(&store.import(transfer::parse_jsonl(&read_input(&file)?)?).await?),
+        Cmd::Backup { path } => {
+            store.backup_sqlite(&path.display().to_string()).await?;
+            println!("backed up to {}", path.display());
         }
         Cmd::User { cmd } => match cmd {
             UserCmd::Add { name, admin, key_name } => {
@@ -291,21 +414,22 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
-            let server = mcp::MemdusaMcp::new(store, mcp::Defaults { project, agent });
+            let server =
+                mcp::MemdusaMcp::new(store, mcp::Defaults { project, agent, cwd: std::env::current_dir().ok() });
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
-        Cmd::Serve { addr, token, allowed_hosts } => {
-            if token.is_none() && !addr.starts_with("127.0.0.1") && !addr.starts_with("localhost") {
-                tracing::warn!(
-                    "serving on a non-loopback address without --token: anyone who can reach it can read your memory"
-                );
-            }
-            http::serve(store, http::HttpOptions { addr, token, allowed_hosts }).await?;
+        Cmd::Serve { addr, token, allowed_hosts, no_auto_prune, rate_limit, no_metrics } => {
+            let auto_prune = (!no_auto_prune).then(retention_from_env);
+            let opts = http::HttpOptions { addr, token, allowed_hosts, auto_prune, rate_limit, metrics: !no_metrics };
+            http::serve(store, opts).await?;
+        }
+        Cmd::Prune { dry_run, only_project, policy } => {
+            print_prune(&store.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
         }
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = brief::build(&store, &project, None).await?;
+            let b = brief::build(&store, &project, None, project::git_state_for(&project).as_ref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -369,15 +493,51 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
     let client = || remote::Client::new(r.clone(), Duration::from_secs(15));
     match cmd {
         Cmd::Status => {
-            let info = client()?.whoami().await?;
-            println!(
-                "mode: remote {} (server v{}, {}, reachable)",
-                r.url,
-                info["version"].as_str().unwrap_or("?"),
-                info["backend"].as_str().unwrap_or("?")
-            );
-            println!("identity: {}", describe_identity(&info));
+            // Still useful when the server is down: that's when the queue matters.
+            match client()?.whoami().await {
+                Ok(info) => {
+                    println!(
+                        "mode: remote {} (server v{}, {}, reachable)",
+                        r.url,
+                        info["version"].as_str().unwrap_or("?"),
+                        info["backend"].as_str().unwrap_or("?")
+                    );
+                    println!("identity: {}", describe_identity(&info));
+                }
+                Err(e) => println!("mode: remote {} (NOT reachable: {e})", r.url),
+            }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
+            println!("offline queue: {} event(s)", spool::Spool::open()?.len());
+        }
+        Cmd::Prune { dry_run, only_project, policy } => {
+            print_prune(&client()?.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
+        }
+        Cmd::Export { only_project, output } => {
+            write_export(&client()?.export(only_project.as_deref()).await?, output)?
+        }
+        Cmd::Import { file } => {
+            // in chunks, so a big history doesn't hit the request size limit
+            let text = read_input(&file)?;
+            transfer::parse_jsonl(&text)?; // validate everything before sending anything
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut total = transfer::ImportReport::default();
+            let c = client()?;
+            for chunk in lines.chunks(2000) {
+                let r = c.import(&(chunk.join("\n") + "\n")).await?;
+                total.memories += r.memories;
+                total.events += r.events;
+                total.checkpoints += r.checkpoints;
+                total.runs += r.runs;
+                total.steps += r.steps;
+                total.skipped += r.skipped;
+            }
+            print_import(&total);
+        }
+        Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
+        Cmd::Sync => {
+            let spool = spool::Spool::open()?;
+            let n = spool.flush(&client()?, &r.url).await?;
+            println!("synced {n} event(s); {} still queued", spool.len());
         }
         Cmd::User { cmd } => {
             let c = client()?;
@@ -403,7 +563,7 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
         Cmd::Mcp { agent } => proxy::run(r, project, &agent).await?,
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = client()?.resume(&project).await?;
+            let b = client()?.resume(&project, project::git_state_for(&project).as_ref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -460,21 +620,109 @@ async fn run_hook(
         .or_else(|| cwd.as_deref().map(|d| project::detect(std::path::Path::new(d))))
         .or_else(project::detect_cwd)
         .context("could not determine project")?;
-    let req = hooks::HookRequest { project, config, input };
+    // Code state only for events that use it, and only if the hook's directory is this project's repo.
+    let git = cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|d| event.needs_git() && project::detect(d) == project)
+        .and_then(project::git_state);
+    let mut req = hooks::HookRequest { project, config, input, git, at: Some(model::now_ms()) };
 
     let resp = match Mode::detect(database_url)? {
-        Mode::Remote(r) => remote::Client::new(r, deadline)?.hook(event, &req).await?,
+        Mode::Remote(r) => {
+            // Redact on this machine too, so secrets never leave it (the server redacts again).
+            req.input = redactor_from_env()?.json(req.input);
+            remote_hook(event, req, &r, deadline).await?
+        }
         Mode::Local(url) => {
-            hooks::handle_request(&Store::connect(&url).await?, event, req, &model::Identity::root()).await?
+            let store = open_store(&url).await?;
+            let resp = hooks::handle_request(&store, event, req, &model::Identity::root()).await?;
+            // Local mode has no server to prune on a schedule: do it at session end, at most daily.
+            if let hooks::HookEvent::SessionEnd = event
+                && let Err(e) = store.maybe_prune(&retention_from_env(), 86_400_000).await
+            {
+                eprintln!("memdusa: pruning failed: {e}");
+            }
+            resp
         }
     };
     Ok(resp.output)
 }
 
+/// Remote hook with an offline fallback: replay any backlog first, then send
+/// this event. If the server is unreachable, queue write-only events locally
+/// and serve SessionStart from the cached brief.
+async fn remote_hook(
+    event: hooks::HookEvent,
+    req: hooks::HookRequest,
+    r: &config::Remote,
+    deadline: Duration,
+) -> anyhow::Result<hooks::HookResponse> {
+    let spool = spool::Spool::open()?;
+    let mut unreachable = None;
+    if !spool.is_empty() {
+        // a short budget, so a hanging server can't eat this hook's whole deadline
+        let flush_client = remote::Client::new(r.clone(), (deadline / 3).min(Duration::from_secs(2)))?;
+        match spool.flush(&flush_client, &r.url).await {
+            Ok(n) if n > 0 => eprintln!("memdusa: synced {n} queued event(s)"),
+            Ok(_) => {}
+            Err(e) if e.retryable => unreachable = Some(e),
+            Err(e) => eprintln!("memdusa: could not sync the offline queue: {e}"),
+        }
+    }
+    let result = match unreachable {
+        Some(e) => Err(e), // just failed to connect: don't wait for another timeout
+        None => remote::Client::new(r.clone(), deadline)?.hook(event, &req).await,
+    };
+    match result {
+        Ok(resp) => {
+            if let (hooks::HookEvent::SessionStart, Some(out)) = (event, &resp.output)
+                && let Err(e) = spool::cache_brief(&req.project, out)
+            {
+                eprintln!("memdusa: could not cache the brief: {e:#}");
+            }
+            Ok(resp)
+        }
+        Err(e) if e.retryable => {
+            let project = req.project.clone();
+            if event.queueable() {
+                spool.push(&r.url, hooks::HookBatchItem { event: event.arg().into(), request: req })?;
+                eprintln!("memdusa: server unreachable, queued {} for later ({e})", event.arg());
+            }
+            if let hooks::HookEvent::SessionStart = event {
+                return Ok(spool::cached_brief(&project, &e.message).unwrap_or_default());
+            }
+            Ok(hooks::HookResponse::default())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Redaction settings: `MEMDUSA_REDACT=off` disables it; extra regexes come
+/// from `MEMDUSA_REDACT_PATTERNS` (one per line) and `<MEMDUSA_HOME>/redact-patterns.txt`.
+fn redactor_from_env() -> anyhow::Result<Redactor> {
+    if let Ok(v) = std::env::var("MEMDUSA_REDACT")
+        && matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")
+    {
+        return Ok(Redactor::disabled());
+    }
+    let mut patterns: Vec<String> =
+        std::env::var("MEMDUSA_REDACT_PATTERNS").map(|v| v.lines().map(String::from).collect()).unwrap_or_default();
+    let file = config::dir()?.join("redact-patterns.txt");
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        patterns.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from));
+    }
+    Redactor::new(&patterns).with_context(|| format!("loading redaction patterns (env or {})", file.display()))
+}
+
+async fn open_store(url: &str) -> anyhow::Result<Store> {
+    Ok(Store::connect(url).await?.with_redactor(redactor_from_env()?))
+}
+
 fn default_db_url() -> anyhow::Result<String> {
     let dir = config::dir()?;
     std::fs::create_dir_all(&dir)?;
-    Ok(format!("sqlite://{}", dir.join("memdusa.db").display()))
+    Ok(memdusa_core::store::sqlite_url(&dir.join("memdusa.db")))
 }
 
 fn describe_identity(whoami: &serde_json::Value) -> String {

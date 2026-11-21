@@ -18,13 +18,17 @@ pub struct Brief {
     pub active_runs: Vec<RunWithSteps>,
     pub memories: Vec<Memory>,
     pub recent_events: Vec<Event>,
+    /// How the caller's code state differs from the latest checkpoint's.
+    pub git_warnings: Vec<String>,
     /// The same content rendered as Markdown, ready to paste into a prompt.
     pub markdown: String,
 }
 
 /// `user` is the caller (on a multi-user server): it decides whose global
 /// memories are included.
-pub async fn build(store: &Store, project: &str, user: Option<&str>) -> Result<Brief> {
+/// `current_git` is the caller's code state, compared against the latest
+/// checkpoint's to warn about a different branch, commit or machine.
+pub async fn build(store: &Store, project: &str, user: Option<&str>, current_git: Option<&GitState>) -> Result<Brief> {
     let checkpoints = store.checkpoints_latest(project, 5).await?;
     let mut active_runs = vec![];
     for run in store.run_list(Some(project), Some(RunStatus::Running), 10).await? {
@@ -40,8 +44,12 @@ pub async fn build(store: &Store, project: &str, user: Option<&str>) -> Result<B
         .await?;
     let recent_events = store.events_recent(project, None, 100).await?;
 
-    let markdown = render(project, &checkpoints, &active_runs, &memories, &recent_events);
-    Ok(Brief { project: project.into(), checkpoints, active_runs, memories, recent_events, markdown })
+    let git_warnings = match (checkpoints.first().and_then(|c| c.git.as_ref()), current_git) {
+        (Some(saved), Some(current)) => saved.drift(current),
+        _ => vec![],
+    };
+    let markdown = render(project, &checkpoints, &active_runs, &memories, &recent_events, &git_warnings);
+    Ok(Brief { project: project.into(), checkpoints, active_runs, memories, recent_events, git_warnings, markdown })
 }
 
 fn ago(ts: Millis) -> String {
@@ -71,9 +79,17 @@ fn render(
     runs: &[RunWithSteps],
     memories: &[Memory],
     events: &[Event],
+    git_warnings: &[String],
 ) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "# Resume brief: {project}\n");
+    if !git_warnings.is_empty() {
+        let _ = writeln!(o, "## ⚠ Code state differs from the last checkpoint");
+        for w in git_warnings {
+            let _ = writeln!(o, "- {w}");
+        }
+        let _ = writeln!(o, "\nVerify the actual state of the code before trusting the notes below.\n");
+    }
 
     if checkpoints.is_empty() && runs.is_empty() && memories.is_empty() && events.is_empty() {
         let _ = writeln!(o, "_Nothing recorded yet for this project. Start fresh, and save checkpoints as you go._");
@@ -86,6 +102,9 @@ fn render(
             let task = c.task.as_deref().map(|t| format!(" [{t}]")).unwrap_or_default();
             let by = c.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
             let _ = writeln!(o, "\n### Goal{task}: {}\n_checkpoint {}{by}_\n", c.goal, ago(c.created_at));
+            if let Some(g) = &c.git {
+                let _ = writeln!(o, "**Code:** {}\n", g.summary());
+            }
             bullets(&mut o, "Done", &c.done);
             bullets(&mut o, "Next", &c.next);
             bullets(&mut o, "Blockers", &c.blockers);

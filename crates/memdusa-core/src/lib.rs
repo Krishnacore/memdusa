@@ -5,7 +5,10 @@
 pub mod auth;
 pub mod brief;
 pub mod model;
+pub mod redact;
+pub mod retention;
 pub mod store;
+pub mod transfer;
 
 pub use brief::Brief;
 pub use store::{Backend, Store};

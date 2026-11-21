@@ -7,11 +7,14 @@
 //! * never bind a NULL where the server must infer its type (Postgres can't);
 //!   optional filters are added to the SQL text instead.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Executor, Row};
 
 use crate::model::*;
+use crate::redact::Redactor;
 use crate::{Error, Result};
 
 const DEFAULT_LEASE_SECS: i64 = 600;
@@ -26,6 +29,8 @@ pub enum Backend {
 pub struct Store {
     pub(crate) pool: AnyPool,
     backend: Backend,
+    /// Applied to every piece of user/agent text before it is written.
+    redactor: Arc<Redactor>,
 }
 
 // ---------------------------------------------------------------- tiny query builder
@@ -71,6 +76,12 @@ impl Q {
         }
         q
     }
+}
+
+/// A caller-supplied timestamp, never later than now.
+fn past_or_now(t: Option<Millis>) -> Millis {
+    let now = now_ms();
+    t.map_or(now, |t| t.min(now))
 }
 
 fn to_json(v: &Option<Value>) -> Option<String> {
@@ -176,7 +187,16 @@ const MIGRATIONS: &[&[&str]] = &[
         "CREATE INDEX api_keys_user ON api_keys (user_id)",
         "ALTER TABLE memories ADD COLUMN user_name TEXT",
     ],
+    // 3: code state on checkpoints
+    &["ALTER TABLE checkpoints ADD COLUMN git TEXT"],
 ];
+
+/// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
+/// breaks on Windows (the URL parser reads `C:` as host:port), so use the
+/// authority-less form with forward slashes: `sqlite:C:/x.db`, `sqlite:/tmp/x.db`.
+pub fn sqlite_url(path: &std::path::Path) -> String {
+    format!("sqlite:{}", path.display().to_string().replace('\\', "/"))
+}
 
 impl Store {
     /// Connect to `sqlite://path/to.db` or `postgres://...` and apply the schema.
@@ -212,9 +232,19 @@ impl Store {
             .connect(&url)
             .await?;
 
-        let store = Self { pool, backend };
+        let store = Self { pool, backend, redactor: Arc::new(Redactor::new(&[])?) };
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// Replace the default redaction rules (e.g. add custom patterns, or disable).
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = Arc::new(redactor);
+        self
+    }
+
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     pub fn backend(&self) -> Backend {
@@ -288,8 +318,10 @@ impl Store {
 
     /// Save a memory. Saving identical content (same kind and scope) again
     /// refreshes it and merges tags instead of creating a duplicate.
-    pub async fn memory_save(&self, m: NewMemory) -> Result<Memory> {
-        let content = m.content.trim().to_owned();
+    pub async fn memory_save(&self, mut m: NewMemory) -> Result<Memory> {
+        let red = &self.redactor;
+        m.tags = red.list(m.tags);
+        let content = red.string(m.content.trim().to_owned());
         if content.is_empty() {
             return Err(Error::Invalid("memory content is empty".into()));
         }
@@ -398,9 +430,9 @@ impl Store {
             session: e.session,
             source: e.source,
             kind: e.kind,
-            content: e.content,
-            data: e.data,
-            created_at: now_ms(),
+            content: self.redactor.string(e.content),
+            data: self.redactor.opt_json(e.data),
+            created_at: past_or_now(e.created_at),
         };
         let mut q =
             Q::new("INSERT INTO events (id, project, session, source, kind, content, data, created_at) VALUES (");
@@ -456,17 +488,18 @@ impl Store {
             id: new_id(),
             project: c.project,
             task: c.task,
-            goal: c.goal,
-            done: c.done,
-            next: c.next,
-            blockers: c.blockers,
+            goal: self.redactor.string(c.goal),
+            done: self.redactor.list(c.done),
+            next: self.redactor.list(c.next),
+            blockers: self.redactor.list(c.blockers),
             files: c.files,
-            notes: c.notes,
+            notes: self.redactor.opt(c.notes),
             source: c.source,
-            created_at: now_ms(),
+            git: c.git,
+            created_at: past_or_now(c.created_at),
         };
         let mut q = Q::new(
-            "INSERT INTO checkpoints (id, project, task, goal, done, next, blockers, files, notes, source, created_at) VALUES (",
+            "INSERT INTO checkpoints (id, project, task, goal, done, next, blockers, files, notes, source, git, created_at) VALUES (",
         );
         let vals = [
             q.text(&cp.id),
@@ -479,6 +512,7 @@ impl Store {
             q.text(list_to_json(&cp.files)),
             q.opt_text(cp.notes.clone()),
             q.opt_text(cp.source.clone()),
+            q.opt_text(cp.git.as_ref().and_then(|g| serde_json::to_string(g).ok())),
             q.int(cp.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
@@ -527,6 +561,7 @@ impl Store {
                 files: list_from_json(r.try_get("files")?),
                 notes: r.try_get("notes")?,
                 source: r.try_get("source")?,
+                git: r.try_get::<Option<String>, _>("git")?.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: r.try_get("created_at")?,
             });
             if out.len() as i64 >= limit {
@@ -591,7 +626,9 @@ impl Store {
     }
 
     /// Start a run, or return the existing one with the same idempotency key.
-    pub async fn run_start(&self, r: NewRun) -> Result<RunWithSteps> {
+    pub async fn run_start(&self, mut r: NewRun) -> Result<RunWithSteps> {
+        r.name = self.redactor.string(r.name);
+        r.input = self.redactor.opt_json(r.input);
         let owner = r.owner.unwrap_or_else(|| "anonymous".into());
         let lease = r.lease_secs.unwrap_or(DEFAULT_LEASE_SECS).max(0);
         if let Some(key) = &r.idempotency_key {
@@ -676,6 +713,7 @@ impl Store {
     /// Enter a step. Completed steps are replayed from the journal; anything
     /// else (new, crashed mid-way, failed) must be executed by the caller.
     pub async fn step_begin(&self, run_id: &str, key: &str, input: Option<Value>, owner: &str) -> Result<StepDecision> {
+        let input = self.redactor.opt_json(input);
         self.run_claim(run_id, owner, None, false).await?;
 
         let mut q = Q::new("SELECT * FROM steps WHERE run_id = ");
@@ -719,7 +757,9 @@ impl Store {
 
     /// Record a step's result. The journal is append-only: completing an
     /// already-completed step keeps the first recorded output.
+    /// Outputs are redacted too: a replayed step returns the redacted output.
     pub async fn step_complete(&self, run_id: &str, key: &str, output: Option<Value>) -> Result<Step> {
+        let output = self.redactor.opt_json(output);
         let mut q = Q::new("UPDATE steps SET ");
         let (s, o, n, r, k, done) = (
             q.text(StepStatus::Completed.as_str()),
@@ -737,6 +777,8 @@ impl Store {
     }
 
     pub async fn step_fail(&self, run_id: &str, key: &str, error: &str) -> Result<Step> {
+        let error = self.redactor.text(error).into_owned();
+        let error = error.as_str();
         let mut q = Q::new("UPDATE steps SET ");
         let (s, e, r, k, done) = (
             q.text(StepStatus::Failed.as_str()),
@@ -769,6 +811,7 @@ impl Store {
         output: Option<Value>,
         error: Option<String>,
     ) -> Result<RunWithSteps> {
+        let (output, error) = (self.redactor.opt_json(output), self.redactor.opt(error));
         let mut q = Q::new("UPDATE runs SET ");
         let (s, o, e, n, i, running) = (
             q.text(RunStatus::from(outcome).as_str()),
@@ -788,6 +831,15 @@ impl Store {
         self.run_get(id).await
     }
 
+    /// (running, stale) run counts, for metrics.
+    pub async fn run_counts(&self) -> Result<(i64, i64)> {
+        let mut q = Q::new("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN lease_until IS NULL OR lease_until <= ");
+        let (now, running) = (q.int(now_ms()), q.text(RunStatus::Running.as_str()));
+        q.push(&format!("{now} THEN 1 ELSE 0 END), 0) AS stale FROM runs WHERE status = {running}"));
+        let row = q.build().fetch_one(&self.pool).await?;
+        Ok((row.try_get("n")?, row.try_get("stale")?))
+    }
+
     pub async fn run_list(&self, project: Option<&str>, status: Option<RunStatus>, limit: i64) -> Result<Vec<Run>> {
         let mut q = Q::new("SELECT * FROM runs WHERE 1=1");
         if let Some(p) = project {
@@ -801,5 +853,18 @@ impl Store {
         let l = q.int(limit.clamp(1, 200));
         q.push(&format!(" ORDER BY updated_at DESC LIMIT {l}"));
         q.build().fetch_all(&self.pool).await?.iter().map(Self::row_to_run).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sqlite_urls_are_portable() {
+        use std::path::Path;
+        assert_eq!(super::sqlite_url(Path::new("/tmp/x.db")), "sqlite:/tmp/x.db");
+        assert_eq!(
+            super::sqlite_url(Path::new(r"C:\Users\a\.memdusa\memdusa.db")),
+            "sqlite:C:/Users/a/.memdusa/memdusa.db"
+        );
     }
 }

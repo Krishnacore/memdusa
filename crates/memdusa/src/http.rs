@@ -4,13 +4,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, MatchedPath, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use memdusa_core::model::*;
+use memdusa_core::retention::{PruneReport, RetentionPolicy};
+use memdusa_core::transfer;
 use memdusa_core::{Error, Store, brief};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -18,12 +20,15 @@ use rmcp::transport::streamable_http_server::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::hooks::{self, HookEvent, HookRequest, HookResponse};
+use crate::hooks::{self, HookBatchItem, HookBatchResponse, HookEvent, HookRequest, HookResponse};
 use crate::mcp::{Defaults, MemdusaMcp};
+use crate::ops::{Gauges, Metrics, RateLimiter};
 
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    metrics: Arc<Metrics>,
+    limiter: Option<Arc<RateLimiter>>,
     /// Shared break-glass token (`--token`): full admin access.
     token: Option<Arc<str>>,
     /// Latched to true once any user exists (or a token is set). Users can be
@@ -49,6 +54,12 @@ pub struct HttpOptions {
     pub addr: String,
     pub token: Option<String>,
     pub allowed_hosts: Vec<String>,
+    /// Prune old data once a day with this policy (`None` = never).
+    pub auto_prune: Option<RetentionPolicy>,
+    /// Sustained requests per second per caller (bursts up to 10x); 0 = off.
+    pub rate_limit: f64,
+    /// Serve Prometheus metrics at `/metrics`.
+    pub metrics: bool,
 }
 
 struct ApiError(Error);
@@ -88,7 +99,25 @@ pub async fn serve(store: Store, opts: HttpOptions) -> anyhow::Result<()> {
         (0, Some(_)) => tracing::info!("auth: shared token only"),
         (n, t) => tracing::info!("auth: API keys ({n} users){}", if t.is_some() { " + shared token" } else { "" }),
     }
-    axum::serve(listener, app(store, opts)).with_graceful_shutdown(shutdown()).await?;
+    if let Some(policy) = opts.auto_prune {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match store.maybe_prune(&policy, 86_400_000).await {
+                    Ok(Some(r)) if r.events_deleted + r.checkpoints_deleted + r.runs_deleted > 0 => {
+                        tracing::info!(?r, "pruned old data")
+                    }
+                    Ok(Some(_)) => tracing::debug!("nothing to prune"),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("auto-prune failed: {e}"),
+                }
+            }
+        });
+    }
+    let app = app(store, opts).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }
 
@@ -103,15 +132,18 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
             Ok(MemdusaMcp::new(
                 mcp_store.clone(),
                 // Remote clients have no cwd: they must name the project.
-                Defaults { project: None, agent: "mcp-http".into() },
+                Defaults { project: None, agent: "mcp-http".into(), cwd: None },
             ))
         },
         Arc::new(LocalSessionManager::default()),
         mcp_config,
     );
 
+    let serve_metrics = opts.metrics;
     let state = AppState {
         store,
+        metrics: Arc::new(Metrics::default()),
+        limiter: (opts.rate_limit > 0.0).then(|| Arc::new(RateLimiter::new(opts.rate_limit, opts.rate_limit * 10.0))),
         auth_required: Arc::new(AtomicBool::new(opts.token.is_some())),
         token: opts.token.map(Into::into),
     };
@@ -125,7 +157,11 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/admin/users/{name}/enable", post(admin_user_enable))
         .route("/v1/admin/users/{name}/keys", post(admin_key_create))
         .route("/v1/admin/keys", get(admin_keys))
+        .route("/v1/admin/prune", post(admin_prune))
+        .route("/v1/admin/export", get(admin_export))
+        .route("/v1/admin/import", post(admin_import).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         .route("/v1/admin/keys/{id}", delete(admin_key_revoke))
+        .route("/v1/hooks/batch", post(hook_batch).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/v1/hooks/{event}", post(hook))
         .route("/v1/resume", get(resume))
         .route("/v1/memories", post(memory_save).get(memory_search))
@@ -141,9 +177,48 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/runs/{id}/steps/{key}/fail", post(step_fail))
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state);
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(state.clone(), observe))
+        .with_state(state.clone());
 
-    Router::new().route("/health", get(|| async { "ok" })).merge(api)
+    let mut public = Router::new().route("/health", get(|| async { "ok" }));
+    if serve_metrics {
+        public = public.route("/metrics", get(metrics));
+    }
+    public.with_state(state).merge(api)
+}
+
+/// Who made the request, filled in by `auth` for the access log.
+#[derive(Clone, Default)]
+struct UserSlot(Arc<std::sync::Mutex<Option<String>>>);
+
+/// Access log + metrics, around everything (including rejected requests).
+/// Only route templates are recorded, never ids, query strings or bodies.
+async fn observe(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = req.method().to_string();
+    let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |p| p.as_str()).to_owned();
+    let slot = UserSlot::default();
+    req.extensions_mut().insert(slot.clone());
+    let resp = next.run(req).await;
+    let (status, elapsed) = (resp.status().as_u16(), start.elapsed());
+    s.metrics.observe(&method, &route, status, elapsed);
+    let user = slot.0.lock().map(|u| u.clone()).unwrap_or_default();
+    tracing::info!(
+        target: "memdusa::access",
+        method,
+        route,
+        status,
+        ms = elapsed.as_millis() as u64,
+        user = user.as_deref().unwrap_or("-")
+    );
+    resp
+}
+
+async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
+    let (runs_running, runs_stale) = s.store.run_counts().await?;
+    let gauges = Gauges { users: s.store.user_count().await?, runs_running, runs_stale };
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], s.metrics.render(&gauges)).into_response())
 }
 
 async fn shutdown() {
@@ -153,7 +228,10 @@ async fn shutdown() {
 /// Resolve the caller and attach an [`Identity`] to the request (REST
 /// handlers and MCP tools both read it).
 async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
-    let unauthorized = |msg: &str| (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response();
+    let unauthorized = |msg: &str| {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
+    };
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -177,6 +255,30 @@ async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Respon
             Err(e) => return ApiError(e).into_response(),
         },
     };
+    if let Some(slot) = req.extensions().get::<UserSlot>()
+        && let Ok(mut u) = slot.0.lock()
+    {
+        *u = Some(identity.user.clone().unwrap_or_else(|| "root".into()));
+    }
+    if let Some(limiter) = &s.limiter {
+        let key = match &identity.user {
+            Some(u) => format!("user:{u}"),
+            None => req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map_or_else(|| "anonymous".into(), |c| format!("ip:{}", c.0.ip())),
+        };
+        if let Err(wait) = limiter.check(&key) {
+            s.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                Json(json!({ "error": format!("rate limit exceeded; retry in {secs}s") })),
+            )
+                .into_response();
+        }
+    }
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
@@ -208,7 +310,44 @@ async fn hook(
     Json(req): Json<HookRequest>,
 ) -> ApiResult<HookResponse> {
     let event: HookEvent = event.parse().map_err(|e: String| Error::Invalid(format!("unknown hook event: {e}")))?;
+    s.metrics.hook(event.arg());
     Ok(Json(hooks::handle_request(&s.store, event, req, &id).await?))
+}
+
+#[derive(Deserialize)]
+struct BatchBody {
+    items: Vec<HookBatchItem>,
+}
+
+/// Replay of hooks queued on a client while the server was unreachable.
+/// Items are applied in order; invalid ones are reported and skipped (so one
+/// bad entry can't block a queue forever), database errors abort the batch
+/// so the client retries it.
+async fn hook_batch(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Json(b): Json<BatchBody>,
+) -> ApiResult<HookBatchResponse> {
+    if b.items.len() > 1000 {
+        return Err(Error::Invalid("at most 1000 items per batch".into()).into());
+    }
+    let mut resp = HookBatchResponse::default();
+    for (i, item) in b.items.into_iter().enumerate() {
+        let event: HookEvent = match item.event.parse() {
+            Ok(e) => e,
+            Err(e) => {
+                resp.rejected.push(format!("#{i}: unknown event {e}"));
+                continue;
+            }
+        };
+        s.metrics.hook(event.arg());
+        match hooks::handle_request(&s.store, event, item.request, &id).await {
+            Ok(_) => resp.processed += 1,
+            Err(Error::Invalid(m)) => resp.rejected.push(format!("#{i}: {m}")),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Json(resp))
 }
 
 // ---------------------------------------------------------------- keys & users
@@ -310,6 +449,48 @@ async fn admin_key_create(
 }
 
 #[derive(Deserialize)]
+struct ExportQ {
+    project: Option<String>,
+}
+
+async fn admin_export(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(q): Query<ExportQ>,
+) -> Result<Response, ApiError> {
+    admin(&id)?;
+    let body = transfer::to_jsonl(&s.store.export(q.project.as_deref()).await?);
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
+}
+
+async fn admin_import(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    body: String,
+) -> ApiResult<transfer::ImportReport> {
+    admin(&id)?;
+    Ok(Json(s.store.import(transfer::parse_jsonl(&body)?).await?))
+}
+
+#[derive(Deserialize)]
+struct PruneBody {
+    #[serde(default)]
+    policy: RetentionPolicy,
+    project: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn admin_prune(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Json(b): Json<PruneBody>,
+) -> ApiResult<PruneReport> {
+    admin(&id)?;
+    Ok(Json(s.store.prune(&b.policy, b.project.as_deref(), b.dry_run).await?))
+}
+
+#[derive(Deserialize)]
 struct KeysQ {
     user: Option<String>,
 }
@@ -341,12 +522,21 @@ struct ProjectQ {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct ResumeQ {
+    project: String,
+    /// Caller's code state as JSON (`GitState`), to get drift warnings.
+    git: Option<String>,
+}
+
 async fn resume(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
-    Query(q): Query<ProjectQ>,
+    Query(q): Query<ResumeQ>,
 ) -> ApiResult<memdusa_core::Brief> {
-    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref()).await?))
+    let git: Option<GitState> =
+        q.git.map(|g| serde_json::from_str(&g)).transpose().map_err(|e| Error::Invalid(format!("git: {e}")))?;
+    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref(), git.as_ref()).await?))
 }
 
 /// Attribution always comes from the credential, never from the request body.
@@ -515,8 +705,15 @@ mod tests {
     async fn spawn(token: Option<&str>) -> (String, Store) {
         let dir = std::env::temp_dir().join(format!("memdusa-http-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::connect(&format!("sqlite://{}", dir.join("t.db").display())).await.unwrap();
-        let opts = HttpOptions { addr: String::new(), token: token.map(String::from), allowed_hosts: vec![] };
+        let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: token.map(String::from),
+            allowed_hosts: vec![],
+            auto_prune: None,
+            rate_limit: 0.0,
+            metrics: true,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = app(store.clone(), opts);
@@ -539,6 +736,8 @@ mod tests {
             project: "github.com/acme/shop".into(),
             config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
             input,
+            git: None,
+            at: None,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -583,7 +782,7 @@ mod tests {
             user: None,
         };
         assert_eq!(c.memory_search(&q).await.unwrap().len(), 1);
-        assert!(c.resume("p").await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
+        assert!(c.resume("p", None).await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
     }
 
     /// Raw request helper: (status, body).
@@ -688,5 +887,105 @@ mod tests {
         assert_eq!(call(reqwest::Method::GET, &format!("{url}/v1/whoami"), None, None).await.0, 200, "open");
         store.user_create("carol", true).await.unwrap(); // e.g. CLI on the server, while it runs
         assert_eq!(call(reqwest::Method::GET, &format!("{url}/v1/whoami"), None, None).await.0, 401, "now locked");
+    }
+
+    #[tokio::test]
+    async fn offline_queue_replays_in_order_once_server_is_back() {
+        use crate::hooks::HookBatchItem;
+        use crate::spool::Spool;
+
+        let dir = std::env::temp_dir().join(format!("memdusa-spool-{}", new_id()));
+        let spool = Spool::at(dir.clone()).unwrap();
+        let req = |input: Value, at: i64| HookRequest {
+            project: "shop".into(),
+            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            input,
+            git: None,
+            at: Some(at),
+        };
+        let item = |event: &str, input: Value, at: i64| HookBatchItem { event: event.into(), request: req(input, at) };
+        let t0 = now_ms() - 60_000;
+        // queued out of order on purpose: replay must sort by fire time
+        let edit = json!({"session_id": "A", "cwd": "/r", "tool_name": "Edit", "tool_input": {"file_path": "/r/a.rs"}});
+        spool
+            .push("http://dead", item("session-end", json!({"session_id": "A", "reason": "logout"}), t0 + 2000))
+            .unwrap();
+        spool.push("http://dead", item("post-tool-use", edit, t0 + 1000)).unwrap();
+        spool
+            .push("http://dead", item("user-prompt-submit", json!({"session_id": "A", "prompt": "fix a.rs"}), t0))
+            .unwrap();
+        assert_eq!(spool.len(), 3);
+
+        // server down: retryable error, nothing lost
+        let dead = Client::new(Remote::new("http://127.0.0.1:9", None).unwrap(), Duration::from_secs(1)).unwrap();
+        let err = spool.flush(&dead, "http://dead").await.unwrap_err();
+        assert!(err.retryable, "{err}");
+        assert_eq!(spool.len(), 3, "entries survive a failed flush");
+
+        // server up (entries were queued for "http://dead": re-address them via a fresh spool line check)
+        let (url, store) = spawn(None).await;
+        assert_eq!(spool.flush(&client(&url, None), &url).await.unwrap(), 0, "entries for another server aren't sent");
+        assert_eq!(spool.len(), 3);
+        let text: String = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .collect::<String>()
+            .replace("http://dead", &url);
+        for f in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        std::fs::write(dir.join("queue.jsonl"), text).unwrap();
+        assert_eq!(spool.flush(&client(&url, None), &url).await.unwrap(), 3);
+        assert_eq!(spool.len(), 0, "delivered entries are removed");
+
+        // sorted replay => the session-end saw the prompt and the edit
+        let cp = &store.checkpoints_latest("shop", 1).await.unwrap()[0];
+        assert_eq!((cp.goal.as_str(), cp.files.clone()), ("fix a.rs", vec!["a.rs".to_string()]));
+        assert_eq!(cp.created_at, t0 + 2000, "original fire time kept");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_body_limit_and_metrics() {
+        use reqwest::Method as M;
+        let dir = std::env::temp_dir().join(format!("memdusa-ops-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
+        // 1 req/s sustained, bursts of 10
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: None,
+            allowed_hosts: vec![],
+            auto_prune: None,
+            rate_limit: 1.0,
+            metrics: true,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = app(store, opts);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for i in 0..10 {
+            assert_eq!(call(M::GET, &format!("{url}/v1/whoami"), None, None).await.0, 200, "request {i} within burst");
+        }
+        let resp = reqwest::get(format!("{url}/v1/whoami")).await.unwrap();
+        assert_eq!(resp.status(), 429);
+        assert!(resp.headers().get("retry-after").is_some());
+        assert_eq!(reqwest::get(format!("{url}/health")).await.unwrap().status(), 200, "health isn't rate limited");
+
+        // fresh limiter-free server for the body limit
+        let (url2, _) = spawn(None).await;
+        let big = "x".repeat(2 * 1024 * 1024);
+        let (st, _) = call(M::POST, &format!("{url2}/v1/memories"), None, Some(json!({"content": big}))).await;
+        assert_eq!(st, 413, "1 MB default body limit");
+
+        let text = reqwest::get(format!("{url}/metrics")).await.unwrap().text().await.unwrap();
+        assert!(
+            text.contains(r#"memdusa_http_requests_total{method="GET",route="/v1/whoami",status="200"} 10"#),
+            "{text}"
+        );
+        assert!(text.contains(r#"route="/v1/whoami",status="429"} 1"#), "{text}");
+        assert!(text.contains("memdusa_rate_limited_total 1"), "{text}");
+        assert!(text.contains("memdusa_runs_running 0"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "no addresses or ids in labels");
     }
 }

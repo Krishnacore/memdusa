@@ -31,6 +31,8 @@ pub struct Defaults {
     pub project: Option<String>,
     /// Identifies this agent/harness as the owner of leases and author of records.
     pub agent: String,
+    /// Repo directory whose git state is recorded (stdio only; remote callers send it).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -57,6 +59,10 @@ pub struct ProjectArg {
     /// Project key (e.g. `github.com/org/repo`). Defaults to the current project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Code state, attached automatically by the client (hidden from the model).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub git: Option<GitState>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -114,6 +120,10 @@ pub struct CheckpointArgs {
     pub task: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    /// Code state, attached automatically by the client (hidden from the model).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub git: Option<GitState>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -219,6 +229,14 @@ impl MemdusaMcp {
         identity(ctx).qualify(&header(ctx, AGENT_HEADER).unwrap_or_else(|| self.defaults.agent.clone()))
     }
 
+    /// Only when the call is about the repo this server was started in.
+    fn local_git(&self, project: &str) -> Option<GitState> {
+        if self.defaults.project.as_deref() != Some(project) {
+            return None;
+        }
+        self.defaults.cwd.as_deref().and_then(crate::project::git_state)
+    }
+
     fn agent(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
         Some(self.agent_name(ctx))
     }
@@ -250,7 +268,11 @@ impl MemdusaMcp {
     )]
     async fn resume(&self, Parameters(a): Parameters<ProjectArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
-        Ok(brief::build(&self.store, &project, identity(&ctx).user.as_deref()).await.map_err(err)?.markdown)
+        let git = a.git.or_else(|| self.local_git(&project));
+        Ok(brief::build(&self.store, &project, identity(&ctx).user.as_deref(), git.as_ref())
+            .await
+            .map_err(err)?
+            .markdown)
     }
 
     #[tool(
@@ -303,8 +325,10 @@ impl MemdusaMcp {
         Parameters(a): Parameters<CheckpointArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        let git = a.git.or_else(|| self.local_git(&project));
         let c = NewCheckpoint {
-            project: self.project(&ctx, a.project)?,
+            project,
             task: a.task,
             goal: a.goal,
             done: a.done,
@@ -313,6 +337,8 @@ impl MemdusaMcp {
             files: a.files,
             notes: a.notes,
             source: self.agent(&ctx),
+            git,
+            created_at: None,
         };
         let cp = self.store.checkpoint_save(c).await.map_err(err)?;
         Ok(format!("checkpoint {} saved", cp.id))
@@ -329,6 +355,7 @@ impl MemdusaMcp {
             kind: a.kind,
             content: a.content,
             data: a.data,
+            created_at: None,
         };
         let ev = self.store.event_append(e).await.map_err(err)?;
         Ok(format!("logged {}", ev.id))
