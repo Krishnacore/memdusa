@@ -67,6 +67,11 @@ impl HookEvent {
         }
     }
 
+    /// Events that save or compare code state (so the client reads git only then).
+    pub fn needs_git(self) -> bool {
+        matches!(self, Self::SessionStart | Self::PreCompact | Self::SessionEnd)
+    }
+
     /// Tool matcher for events that support one.
     pub fn matcher(self) -> Option<&'static str> {
         match self {
@@ -126,6 +131,9 @@ pub struct HookRequest {
     #[serde(flatten)]
     pub config: HookConfig,
     pub input: Value,
+    /// Code state of the client's repo (for events that save or compare it).
+    #[serde(default)]
+    pub git: Option<GitState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -159,6 +167,7 @@ pub async fn handle_request(
         session: input.session_id.clone(),
         cwd: input.cwd.clone(),
         user: identity.user.clone(),
+        git: req.git.clone(),
         cfg: &req.config,
     };
     Ok(HookResponse { output: handle(event, input, ctx).await? })
@@ -175,6 +184,8 @@ pub struct Ctx<'a> {
     pub cwd: Option<String>,
     /// Authenticated user, if any (decides which global memories are visible).
     pub user: Option<String>,
+    /// The client's current code state, when the event needs it.
+    pub git: Option<GitState>,
     pub cfg: &'a HookConfig,
 }
 
@@ -226,7 +237,7 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
 
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     // Build the brief before journaling, so it doesn't report its own start.
-    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref()).await?;
+    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref()).await?;
     log(ctx, "session_start", format!("session started ({source})"), None).await?;
 
     let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty();
@@ -343,6 +354,7 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
             files,
             notes: Some(notes),
             source: Some(format!("{} (auto)", ctx.cfg.agent)),
+            git: ctx.git.clone(),
         })
         .await
         .map(drop)
@@ -378,7 +390,15 @@ mod tests {
     }
 
     fn ctx<'a>(store: &'a Store, cfg: &'a HookConfig) -> Ctx<'a> {
-        Ctx { store, project: "p".into(), session: Some("s1".into()), cwd: Some("/repo".into()), user: None, cfg }
+        Ctx {
+            store,
+            project: "p".into(),
+            session: Some("s1".into()),
+            cwd: Some("/repo".into()),
+            user: None,
+            git: None,
+            cfg,
+        }
     }
 
     fn input(v: Value) -> HookInput {

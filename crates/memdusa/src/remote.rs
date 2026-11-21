@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use memdusa_core::model::{ApiKey, CreatedKey, Memory, MemoryQuery, NewMemory, User};
+use memdusa_core::model::{ApiKey, CreatedKey, GitState, Memory, MemoryQuery, NewMemory, User};
 use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -56,8 +56,12 @@ impl Client {
     }
 
     /// The brief as JSON (its `markdown` field holds the rendered text).
-    pub async fn resume(&self, project: &str) -> anyhow::Result<Value> {
-        self.send(self.request(Method::GET, "/v1/resume").query(&[("project", project)])).await
+    pub async fn resume(&self, project: &str, git: Option<&GitState>) -> anyhow::Result<Value> {
+        let mut q = vec![("project", project.to_owned())];
+        if let Some(g) = git {
+            q.push(("git", serde_json::to_string(g)?));
+        }
+        self.send(self.request(Method::GET, "/v1/resume").query(&q)).await
     }
 
     pub async fn memory_save(&self, m: &NewMemory) -> anyhow::Result<Memory> {

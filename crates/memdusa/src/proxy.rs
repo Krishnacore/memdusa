@@ -28,6 +28,8 @@ use crate::mcp::{AGENT_HEADER, PROJECT_HEADER};
 struct Proxy {
     upstream: RunningService<RoleClient, ()>,
     instructions: Option<String>,
+    /// Project detected from the directory this proxy runs in.
+    project: Option<String>,
 }
 
 impl ServerHandler for Proxy {
@@ -53,9 +55,19 @@ impl ServerHandler for Proxy {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // The server can't see this machine's repo: attach its code state.
+        // Only when the call targets this directory's project, not another one.
+        let target = request.arguments.as_ref().and_then(|a| a.get("project")).and_then(|p| p.as_str());
+        if matches!(request.name.as_ref(), "checkpoint" | "resume")
+            && let Some(project) = target.or(self.project.as_deref())
+            && let Some(git) = crate::project::git_state_for(project)
+            && let Ok(value) = serde_json::to_value(git)
+        {
+            request.arguments.get_or_insert_with(Default::default).entry("git").or_insert(value);
+        }
         Ok(match self.upstream.call_tool(request).await {
             Ok(result) => result.into(),
             // Surface transport failures to the agent as a readable tool error.
@@ -84,7 +96,7 @@ pub async fn run(remote: &Remote, project: Option<String>, agent: &str) -> anyho
     let instructions = upstream.peer_info().and_then(|i| i.instructions.clone());
     tracing::info!(url = remote.url, ?project, agent, "memdusa MCP proxy on stdio");
 
-    let server = Proxy { upstream, instructions }.serve(rmcp::transport::stdio()).await?;
+    let server = Proxy { upstream, instructions, project }.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())
 }

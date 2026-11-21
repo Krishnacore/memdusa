@@ -292,7 +292,8 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
-            let server = mcp::MemdusaMcp::new(store, mcp::Defaults { project, agent });
+            let server =
+                mcp::MemdusaMcp::new(store, mcp::Defaults { project, agent, cwd: std::env::current_dir().ok() });
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
@@ -306,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = brief::build(&store, &project, None).await?;
+            let b = brief::build(&store, &project, None, project::git_state_for(&project).as_ref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -404,7 +405,7 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
         Cmd::Mcp { agent } => proxy::run(r, project, &agent).await?,
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = client()?.resume(&project).await?;
+            let b = client()?.resume(&project, project::git_state_for(&project).as_ref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -461,7 +462,13 @@ async fn run_hook(
         .or_else(|| cwd.as_deref().map(|d| project::detect(std::path::Path::new(d))))
         .or_else(project::detect_cwd)
         .context("could not determine project")?;
-    let mut req = hooks::HookRequest { project, config, input };
+    // Code state only for events that use it, and only if the hook's directory is this project's repo.
+    let git = cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|d| event.needs_git() && project::detect(d) == project)
+        .and_then(project::git_state);
+    let mut req = hooks::HookRequest { project, config, input, git };
 
     let resp = match Mode::detect(database_url)? {
         Mode::Remote(r) => {

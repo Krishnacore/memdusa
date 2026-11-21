@@ -103,7 +103,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
             Ok(MemdusaMcp::new(
                 mcp_store.clone(),
                 // Remote clients have no cwd: they must name the project.
-                Defaults { project: None, agent: "mcp-http".into() },
+                Defaults { project: None, agent: "mcp-http".into(), cwd: None },
             ))
         },
         Arc::new(LocalSessionManager::default()),
@@ -341,12 +341,21 @@ struct ProjectQ {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct ResumeQ {
+    project: String,
+    /// Caller's code state as JSON (`GitState`), to get drift warnings.
+    git: Option<String>,
+}
+
 async fn resume(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
-    Query(q): Query<ProjectQ>,
+    Query(q): Query<ResumeQ>,
 ) -> ApiResult<memdusa_core::Brief> {
-    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref()).await?))
+    let git: Option<GitState> =
+        q.git.map(|g| serde_json::from_str(&g)).transpose().map_err(|e| Error::Invalid(format!("git: {e}")))?;
+    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref(), git.as_ref()).await?))
 }
 
 /// Attribution always comes from the credential, never from the request body.
@@ -539,6 +548,7 @@ mod tests {
             project: "github.com/acme/shop".into(),
             config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
             input,
+            git: None,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -583,7 +593,7 @@ mod tests {
             user: None,
         };
         assert_eq!(c.memory_search(&q).await.unwrap().len(), 1);
-        assert!(c.resume("p").await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
+        assert!(c.resume("p", None).await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
     }
 
     /// Raw request helper: (status, body).

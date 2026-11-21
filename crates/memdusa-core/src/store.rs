@@ -181,6 +181,8 @@ const MIGRATIONS: &[&[&str]] = &[
         "CREATE INDEX api_keys_user ON api_keys (user_id)",
         "ALTER TABLE memories ADD COLUMN user_name TEXT",
     ],
+    // 3: code state on checkpoints
+    &["ALTER TABLE checkpoints ADD COLUMN git TEXT"],
 ];
 
 impl Store {
@@ -480,10 +482,11 @@ impl Store {
             files: c.files,
             notes: self.redactor.opt(c.notes),
             source: c.source,
+            git: c.git,
             created_at: now_ms(),
         };
         let mut q = Q::new(
-            "INSERT INTO checkpoints (id, project, task, goal, done, next, blockers, files, notes, source, created_at) VALUES (",
+            "INSERT INTO checkpoints (id, project, task, goal, done, next, blockers, files, notes, source, git, created_at) VALUES (",
         );
         let vals = [
             q.text(&cp.id),
@@ -496,6 +499,7 @@ impl Store {
             q.text(list_to_json(&cp.files)),
             q.opt_text(cp.notes.clone()),
             q.opt_text(cp.source.clone()),
+            q.opt_text(cp.git.as_ref().and_then(|g| serde_json::to_string(g).ok())),
             q.int(cp.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
@@ -544,6 +548,7 @@ impl Store {
                 files: list_from_json(r.try_get("files")?),
                 notes: r.try_get("notes")?,
                 source: r.try_get("source")?,
+                git: r.try_get::<Option<String>, _>("git")?.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: r.try_get("created_at")?,
             });
             if out.len() as i64 >= limit {

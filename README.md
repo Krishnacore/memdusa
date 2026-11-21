@@ -103,6 +103,29 @@ harnesses that ignore MCP server instructions, put one line in your `CLAUDE.md` 
 
 > At the start of every session call the memdusa `resume` tool; save a `checkpoint` before you stop.
 
+## Code state in checkpoints
+
+Notes are only useful if the code matches them. Every checkpoint records where the code was: branch, HEAD, uncommitted
+files, and the machine. Hooks, the CLI, stdio MCP and the remote proxy capture it on the client (one
+`git status --porcelain=v2` call). The model never has to pass it in, and the field is hidden from its tool schema.
+
+```
+### Goal: Add refunds
+**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted (src/refund.ts, src/api.ts) · on `laptop`
+```
+
+On resume, the brief compares that with the resuming agent's state, and puts any warnings above the notes:
+
+| Situation | Warning |
+|---|---|
+| Saved on another machine with uncommitted files | those changes may exist only on that machine |
+| Different branch | the checkpoint was on `feat/x`, you're on `main` |
+| Same branch, HEAD moved | new commits, a rebase, or a different checkout |
+| Uncommitted files are clean now | committed elsewhere, stashed or discarded? |
+
+State is only attached when the current directory's repo *is* the project being resumed, so
+`--project other/repo` never compares against an unrelated checkout.
+
 ## Secret redaction
 
 Hooks capture raw prompts and shell commands, and agents paste things into memories, so secrets will show up.

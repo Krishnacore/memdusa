@@ -188,7 +188,7 @@ async fn brief_contains_everything() {
     for (name, s) in stores().await {
         let p = project();
         // global memories from other tests may show up; project-scoped state must be empty
-        let empty = brief::build(&s, &p, None).await.unwrap();
+        let empty = brief::build(&s, &p, None, None).await.unwrap();
         assert!(
             empty.checkpoints.is_empty() && empty.active_runs.is_empty() && empty.recent_events.is_empty(),
             "{name}"
@@ -224,7 +224,7 @@ async fn brief_contains_everything() {
         .unwrap();
         s.run_start(NewRun { project: p.clone(), name: "refactor".into(), ..Default::default() }).await.unwrap();
 
-        let b = brief::build(&s, &p, None).await.unwrap();
+        let b = brief::build(&s, &p, None, None).await.unwrap();
         assert_eq!(b.checkpoints.len(), 1, "{name}: only latest checkpoint per task");
         assert_eq!(b.checkpoints[0].goal, "ship v2", "{name}");
         for needle in ["ship v2", "SQLite for local mode", "commit", "refactor"] {
@@ -281,5 +281,48 @@ async fn secrets_are_redacted_before_storage() {
         // and the persisted copy is redacted, not just the returned value
         let again = s.memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap();
         assert!(again.iter().all(|m| !m.content.contains("ghp_")), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn brief_warns_when_code_state_drifted() {
+    for (name, s) in stores().await {
+        let p = project();
+        let saved = GitState {
+            branch: Some("feat/refunds".into()),
+            head: Some("a1b2c3d4e5f6".into()),
+            dirty_count: 2,
+            dirty_files: vec!["src/refund.ts".into(), "src/api.ts".into()],
+            host: Some("laptop".into()),
+        };
+        s.checkpoint_save(NewCheckpoint {
+            project: p.clone(),
+            goal: "refunds".into(),
+            git: Some(saved.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let same = brief::build(&s, &p, None, Some(&saved)).await.unwrap();
+        assert!(same.git_warnings.is_empty(), "{name}");
+        assert!(
+            same.markdown.contains("**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted"),
+            "{name}: {}",
+            same.markdown
+        );
+
+        let elsewhere = GitState {
+            host: Some("desktop".into()),
+            branch: Some("main".into()),
+            dirty_count: 0,
+            dirty_files: vec![],
+            ..saved
+        };
+        let b = brief::build(&s, &p, None, Some(&elsewhere)).await.unwrap();
+        assert_eq!(b.git_warnings.len(), 2, "{name}: {:?}", b.git_warnings);
+        let warn_at = b.markdown.find("⚠ Code state differs").expect("warning section");
+        assert!(warn_at < b.markdown.find("Where things stand").unwrap(), "{name}: warnings come first");
+        assert!(b.markdown.contains("saved on `laptop`") && b.markdown.contains("you're on `main`"), "{name}");
     }
 }
