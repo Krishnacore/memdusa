@@ -191,6 +191,13 @@ const MIGRATIONS: &[&[&str]] = &[
     &["ALTER TABLE checkpoints ADD COLUMN git TEXT"],
 ];
 
+/// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
+/// breaks on Windows (the URL parser reads `C:` as host:port), so use the
+/// authority-less form with forward slashes: `sqlite:C:/x.db`, `sqlite:/tmp/x.db`.
+pub fn sqlite_url(path: &std::path::Path) -> String {
+    format!("sqlite:{}", path.display().to_string().replace('\\', "/"))
+}
+
 impl Store {
     /// Connect to `sqlite://path/to.db` or `postgres://...` and apply the schema.
     pub async fn connect(url: &str) -> Result<Self> {
@@ -824,6 +831,15 @@ impl Store {
         self.run_get(id).await
     }
 
+    /// (running, stale) run counts, for metrics.
+    pub async fn run_counts(&self) -> Result<(i64, i64)> {
+        let mut q = Q::new("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN lease_until IS NULL OR lease_until <= ");
+        let (now, running) = (q.int(now_ms()), q.text(RunStatus::Running.as_str()));
+        q.push(&format!("{now} THEN 1 ELSE 0 END), 0) AS stale FROM runs WHERE status = {running}"));
+        let row = q.build().fetch_one(&self.pool).await?;
+        Ok((row.try_get("n")?, row.try_get("stale")?))
+    }
+
     pub async fn run_list(&self, project: Option<&str>, status: Option<RunStatus>, limit: i64) -> Result<Vec<Run>> {
         let mut q = Q::new("SELECT * FROM runs WHERE 1=1");
         if let Some(p) = project {
@@ -837,5 +853,18 @@ impl Store {
         let l = q.int(limit.clamp(1, 200));
         q.push(&format!(" ORDER BY updated_at DESC LIMIT {l}"));
         q.build().fetch_all(&self.pool).await?.iter().map(Self::row_to_run).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sqlite_urls_are_portable() {
+        use std::path::Path;
+        assert_eq!(super::sqlite_url(Path::new("/tmp/x.db")), "sqlite:/tmp/x.db");
+        assert_eq!(
+            super::sqlite_url(Path::new(r"C:\Users\a\.memdusa\memdusa.db")),
+            "sqlite:C:/Users/a/.memdusa/memdusa.db"
+        );
     }
 }

@@ -142,6 +142,18 @@ most once a day. To run it by hand: `memdusa prune [--dry-run] [--only-project P
 [--checkpoint-days N] [--run-days N]` (locally, or as an admin against a server). Windows can also be set with
 `MEMDUSA_RETENTION_ACTIVITY_DAYS` / `_CHECKPOINT_DAYS` / `_RUN_DAYS`. `0` means keep forever.
 
+## Operations
+
+| | |
+|---|---|
+| **Backup** | `memdusa backup <file>`: consistent online copy of the SQLite database (`VACUUM INTO`). For Postgres use `pg_dump` |
+| **Export / import** | `memdusa export [--only-project P] [-o file]` writes JSON Lines (memories, events, checkpoints, runs with steps; never users or keys). `memdusa import <file\|->` keeps ids and timestamps, skips what already exists (safe to re-run), and re-applies redaction |
+| **Local → hosted** | `memdusa --database-url sqlite://$HOME/.memdusa/memdusa.db export \| memdusa import -` while logged in to a server (needs an admin key) |
+| **Rate limiting** | Per user (or IP for anonymous callers): `--rate-limit 50` req/s with bursts up to 10x, `0` = off. Over the limit you get `429` with `Retry-After`, and hooks queue instead of losing data |
+| **Body limits** | 1 MB per request, 16 MB for hook batches, 64 MB for imports |
+| **Metrics** | Prometheus at `/metrics` (`--no-metrics` to turn it off): requests and latency by route *template*, hook events, rate-limit and auth failures, users, running and stale runs. No ids, projects or users in labels |
+| **Logs** | One access-log line per request (method, route template, status, latency, user; never bodies or query strings). `MEMDUSA_LOG_FORMAT=json` for JSON, `RUST_LOG` for levels |
+
 ## Secret redaction
 
 Hooks capture raw prompts and shell commands, and agents paste things into memories, so secrets will show up.
@@ -266,6 +278,8 @@ with `attempt: 2`.
 | POST | `/v1/admin/users/{name}/disable`, `/enable`, `/keys` `{name}` |
 | GET | `/v1/admin/keys?user=`, DELETE `/v1/admin/keys/{id-or-prefix}` |
 | POST | `/v1/admin/prune` `{policy?, project?, dry_run?}` |
+| GET | `/v1/admin/export?project=` (JSON Lines), POST `/v1/admin/import` (JSON Lines body) |
+| GET | `/metrics` (Prometheus, no auth), `/health` |
 | POST | `/v1/hooks/{event}` `{project, agent, journal_prompts, stop_guard_mins, input}` |
 | GET | `/v1/resume?project=` |
 | POST/GET | `/v1/memories` (GET: `?query&project&kind&limit`) |
@@ -312,5 +326,6 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)
-- [ ] Local ⇄ hosted sync
+- [x] Local → hosted migration (`export | import`)
+- [ ] Continuous local ⇄ hosted sync
 - [ ] Transcript import from Claude Code / Codex session files

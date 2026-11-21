@@ -416,7 +416,7 @@ mod tests {
     async fn ctx_store() -> Store {
         let dir = std::env::temp_dir().join(format!("memdusa-hooks-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        Store::connect(&format!("sqlite://{}", dir.join("t.db").display())).await.unwrap()
+        Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap()
     }
 
     fn cfg() -> HookConfig {

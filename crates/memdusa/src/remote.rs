@@ -115,6 +115,26 @@ impl Client {
         Ok(self.send(self.request(Method::POST, "/v1/admin/prune").json(&body)).await?)
     }
 
+    /// JSON Lines export (admin).
+    pub async fn export(&self, project: Option<&str>) -> anyhow::Result<String> {
+        let mut req = self.request(Method::GET, "/v1/admin/export");
+        if let Some(p) = project {
+            req = req.query(&[("project", p)]);
+        }
+        let resp = req.send().await.map_err(|e| RemoteError::unreachable(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("{} returned {status}: {text}", self.remote.url);
+        }
+        Ok(text)
+    }
+
+    pub async fn import(&self, jsonl: &str) -> anyhow::Result<memdusa_core::transfer::ImportReport> {
+        let req = self.request(Method::POST, "/v1/admin/import").header("content-type", "application/x-ndjson");
+        Ok(self.send(req.body(jsonl.to_owned())).await?)
+    }
+
     // ------------------------------------------------------------ users & keys
 
     pub async fn user_list(&self) -> anyhow::Result<Vec<User>> {

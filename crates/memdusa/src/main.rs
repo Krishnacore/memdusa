@@ -3,6 +3,7 @@ mod hooks;
 mod http;
 mod install;
 mod mcp;
+mod ops;
 mod project;
 mod proxy;
 mod remote;
@@ -16,6 +17,7 @@ use clap::{Parser, Subcommand};
 use memdusa_core::model::{self, ApiKey, CreatedKey, MemoryKind, MemoryQuery, NewMemory, User};
 use memdusa_core::redact::Redactor;
 use memdusa_core::retention::RetentionPolicy;
+use memdusa_core::transfer;
 use memdusa_core::{Store, brief};
 use rmcp::ServiceExt;
 
@@ -56,6 +58,12 @@ enum Cmd {
         /// Don't prune old data automatically (otherwise once a day, see `memdusa prune`).
         #[arg(long, env = "MEMDUSA_NO_AUTO_PRUNE")]
         no_auto_prune: bool,
+        /// Requests per second per user (or IP), with bursts up to 10x. 0 = no limit.
+        #[arg(long, env = "MEMDUSA_RATE_LIMIT", default_value_t = 50.0)]
+        rate_limit: f64,
+        /// Don't serve Prometheus metrics at /metrics.
+        #[arg(long, env = "MEMDUSA_NO_METRICS")]
+        no_metrics: bool,
     },
     /// Summarize old hook activity and delete superseded checkpoints and finished runs.
     Prune {
@@ -100,6 +108,25 @@ enum Cmd {
     Status,
     /// Send hook events queued while the server was unreachable.
     Sync,
+    /// Write all data as JSON Lines (memories, events, checkpoints, runs; not users or keys).
+    Export {
+        /// Only this project (default: everything).
+        #[arg(long = "only-project")]
+        only_project: Option<String>,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Load a `memdusa export` file. Idempotent: existing records are skipped.
+    Import {
+        /// File to read, or `-` for stdin.
+        file: String,
+    },
+    /// Consistent online copy of the local SQLite database.
+    Backup {
+        /// Destination file (must not exist).
+        path: PathBuf,
+    },
     /// Manage users (admin). Acts on the local database, or on the logged-in server.
     User {
         #[command(subcommand)]
@@ -185,6 +212,34 @@ fn retention_from_env() -> RetentionPolicy {
     }
 }
 
+fn read_input(file: &str) -> anyhow::Result<String> {
+    if file == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("reading {file}"))
+    }
+}
+
+fn write_export(text: &str, output: Option<PathBuf>) -> anyhow::Result<()> {
+    match output {
+        Some(p) => {
+            std::fs::write(&p, text)?;
+            eprintln!("exported {} record(s) to {}", text.lines().count().saturating_sub(1), p.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+fn print_import(r: &transfer::ImportReport) {
+    println!(
+        "imported {} memories, {} events, {} checkpoints, {} runs ({} steps); skipped {} existing",
+        r.memories, r.events, r.checkpoints, r.runs, r.steps, r.skipped
+    );
+}
+
 fn print_prune(r: &memdusa_core::retention::PruneReport) {
     let verb = if r.dry_run { "would" } else { "did" };
     println!(
@@ -238,12 +293,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // stdout is the MCP channel in stdio mode: logs must go to stderr.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "memdusa=info,warn".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "memdusa=info,warn".into());
+    let logs = tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter);
+    if std::env::var("MEMDUSA_LOG_FORMAT").is_ok_and(|f| f.eq_ignore_ascii_case("json")) {
+        logs.json().init();
+    } else {
+        logs.init();
+    }
 
     match cli.cmd {
         Cmd::Install { scope, settings, bin, no_mcp, dry_run, .. } => {
@@ -329,6 +385,14 @@ async fn main() -> anyhow::Result<()> {
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
+        Cmd::Export { only_project, output } => {
+            write_export(&transfer::to_jsonl(&store.export(only_project.as_deref()).await?), output)?
+        }
+        Cmd::Import { file } => print_import(&store.import(transfer::parse_jsonl(&read_input(&file)?)?).await?),
+        Cmd::Backup { path } => {
+            store.backup_sqlite(&path.display().to_string()).await?;
+            println!("backed up to {}", path.display());
+        }
         Cmd::User { cmd } => match cmd {
             UserCmd::Add { name, admin, key_name } => {
                 let user = store.user_create(&name, admin).await?;
@@ -355,9 +419,10 @@ async fn main() -> anyhow::Result<()> {
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
-        Cmd::Serve { addr, token, allowed_hosts, no_auto_prune } => {
+        Cmd::Serve { addr, token, allowed_hosts, no_auto_prune, rate_limit, no_metrics } => {
             let auto_prune = (!no_auto_prune).then(retention_from_env);
-            http::serve(store, http::HttpOptions { addr, token, allowed_hosts, auto_prune }).await?;
+            let opts = http::HttpOptions { addr, token, allowed_hosts, auto_prune, rate_limit, metrics: !no_metrics };
+            http::serve(store, opts).await?;
         }
         Cmd::Prune { dry_run, only_project, policy } => {
             print_prune(&store.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
@@ -447,6 +512,28 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
         Cmd::Prune { dry_run, only_project, policy } => {
             print_prune(&client()?.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
         }
+        Cmd::Export { only_project, output } => {
+            write_export(&client()?.export(only_project.as_deref()).await?, output)?
+        }
+        Cmd::Import { file } => {
+            // in chunks, so a big history doesn't hit the request size limit
+            let text = read_input(&file)?;
+            transfer::parse_jsonl(&text)?; // validate everything before sending anything
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut total = transfer::ImportReport::default();
+            let c = client()?;
+            for chunk in lines.chunks(2000) {
+                let r = c.import(&(chunk.join("\n") + "\n")).await?;
+                total.memories += r.memories;
+                total.events += r.events;
+                total.checkpoints += r.checkpoints;
+                total.runs += r.runs;
+                total.steps += r.steps;
+                total.skipped += r.skipped;
+            }
+            print_import(&total);
+        }
+        Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
         Cmd::Sync => {
             let spool = spool::Spool::open()?;
             let n = spool.flush(&client()?, &r.url).await?;
@@ -635,7 +722,7 @@ async fn open_store(url: &str) -> anyhow::Result<Store> {
 fn default_db_url() -> anyhow::Result<String> {
     let dir = config::dir()?;
     std::fs::create_dir_all(&dir)?;
-    Ok(format!("sqlite://{}", dir.join("memdusa.db").display()))
+    Ok(memdusa_core::store::sqlite_url(&dir.join("memdusa.db")))
 }
 
 fn describe_identity(whoami: &serde_json::Value) -> String {

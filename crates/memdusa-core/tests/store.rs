@@ -10,7 +10,7 @@ async fn stores() -> Vec<(String, Store)> {
     std::fs::create_dir_all(&dir).unwrap();
     let mut out = vec![(
         "sqlite".to_string(),
-        Store::connect(&format!("sqlite://{}", dir.join("t.db").display())).await.unwrap(),
+        Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap(),
     )];
     if let Ok(url) = std::env::var("MEMDUSA_TEST_POSTGRES_URL") {
         out.push(("postgres".into(), Store::connect(&url).await.unwrap()));
@@ -426,4 +426,85 @@ impl PruneReportLike {
     fn zero() -> memdusa_core::retention::PruneReport {
         memdusa_core::retention::PruneReport::default()
     }
+}
+
+#[tokio::test]
+async fn export_import_round_trip_is_idempotent() {
+    use memdusa_core::transfer::{self, Record};
+    let stores = stores().await;
+    let (_, src) = &stores[0]; // sqlite
+    let p = project();
+    src.memory_save(NewMemory { project: Some(p.clone()), content: "uses JWT".into(), ..Default::default() })
+        .await
+        .unwrap();
+    src.event_append(NewEvent {
+        project: p.clone(),
+        kind: "commit".into(),
+        content: "init".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    src.checkpoint_save(NewCheckpoint {
+        project: p.clone(),
+        goal: "ship".into(),
+        next: vec!["docs".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let run = src
+        .run_start(NewRun {
+            project: p.clone(),
+            name: "deploy".into(),
+            idempotency_key: Some("k".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    src.step_begin(&run.run.id, "build", None, "anonymous").await.unwrap();
+    src.step_complete(&run.run.id, "build", Some(json!({"image": "app:1"}))).await.unwrap();
+
+    let records = src.export(Some(&p)).await.unwrap();
+    assert!(matches!(records[0], Record::Header { .. }));
+    let text = transfer::to_jsonl(&records);
+    let parsed = transfer::parse_jsonl(&text).unwrap();
+    assert_eq!(parsed.len(), 5, "header + memory + event + checkpoint + run");
+
+    // into every backend (sqlite -> fresh sqlite, and -> postgres when available)
+    for (name, _) in &stores {
+        let dir = std::env::temp_dir().join(format!("memdusa-import-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = match name.as_str() {
+            "sqlite" => Store::connect(&memdusa_core::store::sqlite_url(&dir.join("dst.db"))).await.unwrap(),
+            _ => stores.iter().find(|(n, _)| n == name).unwrap().1.clone(),
+        };
+        let r = dst.import(parsed.clone()).await.unwrap();
+        assert_eq!((r.memories, r.events, r.checkpoints, r.runs, r.steps, r.skipped), (1, 1, 1, 1, 1, 0), "{name}");
+        let again = dst.import(parsed.clone()).await.unwrap();
+        assert_eq!((again.memories, again.runs, again.skipped), (0, 0, 4), "{name}: re-import skips everything");
+
+        // identical project data on both sides (a shared test DB may hold other tests' global memories,
+        // so compare the project-scoped export rather than the brief)
+        let strip = |r: Vec<Record>| -> Vec<String> {
+            r.into_iter()
+                .filter(|r| !matches!(r, Record::Header { .. }))
+                .map(|r| serde_json::to_string(&r).unwrap().replace("\"stale\":true", "\"stale\":false"))
+                .collect()
+        };
+        assert_eq!(strip(src.export(Some(&p)).await.unwrap()), strip(dst.export(Some(&p)).await.unwrap()), "{name}");
+        let step = &dst.run_get(&run.run.id).await.unwrap().steps[0];
+        assert_eq!(step.output, Some(json!({"image": "app:1"})), "{name}: journal intact, replay still works");
+    }
+
+    assert!(transfer::parse_jsonl("{\"type\":\"bogus\"}").is_err());
+
+    // SQLite online backup
+    let dir = std::env::temp_dir().join(format!("memdusa-backup-{}", new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("copy.db");
+    src.backup_sqlite(&file.display().to_string()).await.unwrap();
+    let copy = Store::connect(&memdusa_core::store::sqlite_url(&file)).await.unwrap();
+    assert_eq!(copy.export(Some(&p)).await.unwrap().len(), 5);
+    assert!(src.backup_sqlite(&file.display().to_string()).await.is_err(), "won't overwrite");
 }
