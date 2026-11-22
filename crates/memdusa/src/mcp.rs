@@ -4,6 +4,8 @@
 
 use memdusa_core::model::*;
 use memdusa_core::{Store, brief};
+
+use crate::http::AccessCache;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
     GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
@@ -409,6 +411,55 @@ fn header(ctx: &RequestContext<RoleServer>, name: &str) -> Option<String> {
     parts.headers.get(name)?.to_str().ok().map(str::trim).filter(|v| !v.is_empty()).map(String::from)
 }
 
+fn cache(ctx: &RequestContext<RoleServer>) -> Option<&AccessCache> {
+    ctx.extensions.get::<http::request::Parts>()?.extensions.get::<AccessCache>()
+}
+
+/// Remote MCP calls carry the same per-request access snapshot as REST. Over
+/// stdio there is no HTTP request: the local user owns the database (root).
+async fn authorize(
+    ctx: &RequestContext<RoleServer>,
+    project: &str,
+    needed: Access,
+    action: &str,
+) -> Result<(), String> {
+    match cache(ctx) {
+        Some(c) => c.authorize(&identity(ctx), project, needed, action).await.map_err(err),
+        None => Ok(()),
+    }
+}
+
+async fn readable_projects(store: &Store, ctx: &RequestContext<RoleServer>) -> Result<Vec<String>, String> {
+    match cache(ctx) {
+        Some(c) => c.readable_projects(store, &identity(ctx)).await.map_err(err),
+        None => store.readable_projects(&identity(ctx), DefaultPolicy::Write).await.map_err(err),
+    }
+}
+
+async fn authorize_run(
+    store: &Store,
+    ctx: &RequestContext<RoleServer>,
+    run: &str,
+    needed: Access,
+    action: &str,
+) -> Result<String, String> {
+    let project = store.run_project(run).await.map_err(err)?;
+    authorize(ctx, &project, needed, action).await?;
+    Ok(project)
+}
+
+async fn authorize_memory(
+    store: &Store,
+    ctx: &RequestContext<RoleServer>,
+    id: &str,
+    action: &str,
+) -> Result<(), String> {
+    if let Some(project) = store.memory_project(id).await.map_err(err)? {
+        authorize(ctx, &project, Access::Write, action).await?;
+    }
+    Ok(())
+}
+
 #[tool_router]
 impl MemdusaMcp {
     #[tool(
@@ -416,6 +467,7 @@ impl MemdusaMcp {
     )]
     async fn resume(&self, Parameters(a): Parameters<ProjectArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Read, "resume").await?;
         let git = a.git.or_else(|| self.local_git(&project));
         let task = self.task(a.task);
         Ok(brief::build(&self.store, &project, identity(&ctx).user.as_deref(), git.as_ref(), task.as_deref())
@@ -433,6 +485,9 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let project = if a.global { None } else { Some(self.project(&ctx, a.project)?) };
+        if let Some(project) = &project {
+            authorize(&ctx, project, Access::Write, "memory.save").await?;
+        }
         let m = NewMemory {
             project,
             kind: a.kind,
@@ -457,6 +512,7 @@ impl MemdusaMcp {
         Parameters(a): Parameters<MemoryUpdateArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        authorize_memory(&self.store, &ctx, &a.id, "memory.update").await?;
         let patch = MemoryPatch { content: a.content, kind: a.kind, tags: a.tags, source: self.agent(&ctx) };
         json(self.store.memory_update_as(&a.id, patch, &identity(&ctx)).await.map_err(err)?)
     }
@@ -467,12 +523,15 @@ impl MemdusaMcp {
         Parameters(a): Parameters<MemorySearchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Read, "memory.search").await?;
         let q = MemoryQuery {
             query: a.query,
-            project: Some(self.project(&ctx, a.project)?),
+            project: Some(project),
             kind: a.kind,
             limit: a.limit,
             user: identity(&ctx).user,
+            allowed_projects: None,
         };
         json(self.store.memory_search(q).await.map_err(err)?)
     }
@@ -486,12 +545,19 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Read, "memory.review").await?;
         let review = self.store.memory_review(&project, identity(&ctx).user.as_deref()).await.map_err(err)?;
         Ok(review.markdown(&project, memdusa_core::model::now_ms()))
     }
 
     #[tool(description = "Delete a memory that is wrong or obsolete.")]
     async fn memory_forget(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        authorize_memory(&self.store, &ctx, &a.id, "memory.forget").await?;
+        let project = self.store.memory_project(&a.id).await.map_err(err)?.unwrap_or_default();
+        self.store
+            .audit(NewAuditEvent::ok(identity(&ctx).actor(), "memory.forget").project(&project).target(&a.id))
+            .await
+            .map_err(err)?;
         self.store.memory_forget_as(&a.id, &identity(&ctx)).await.map_err(err)?;
         Ok(format!("forgot {}", a.id))
     }
@@ -505,6 +571,7 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Write, "checkpoint").await?;
         let git = a.git.or_else(|| self.local_git(&project));
         let c = NewCheckpoint {
             project,
@@ -527,8 +594,10 @@ impl MemdusaMcp {
         description = "Append an entry to the project's activity journal (notable actions, commits, test results, discoveries)."
     )]
     async fn log_event(&self, Parameters(a): Parameters<LogArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Write, "log_event").await?;
         let e = NewEvent {
-            project: self.project(&ctx, a.project)?,
+            project,
             session: a.session,
             source: self.agent(&ctx),
             kind: a.kind,
@@ -544,8 +613,10 @@ impl MemdusaMcp {
         description = "Start a durable multi-step run (or re-enter an existing one via idempotency_key). Returns the run with its journaled steps."
     )]
     async fn run_start(&self, Parameters(a): Parameters<RunStartArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Write, "run.start").await?;
         let r = NewRun {
-            project: self.project(&ctx, a.project)?,
+            project,
             name: a.name,
             idempotency_key: a.idempotency_key,
             input: a.input,
@@ -559,21 +630,37 @@ impl MemdusaMcp {
         description = "Enter a step of a durable run. Returns {action: \"replay\", output} if the step already completed (do NOT redo it), or {action: \"execute\", attempt} if you must perform it now and then call run_step_complete / run_step_fail."
     )]
     async fn run_step(&self, Parameters(a): Parameters<StepArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step").await?;
         json(self.store.step_begin(&a.run_id, &a.step_key, a.input, &self.agent_name(&ctx)).await.map_err(err)?)
     }
 
     #[tool(description = "Record the result of a step you executed. The output is journaled and replayed on resume.")]
-    async fn run_step_complete(&self, Parameters(a): Parameters<StepCompleteArgs>) -> ToolResult {
+    async fn run_step_complete(
+        &self,
+        Parameters(a): Parameters<StepCompleteArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step_complete").await?;
         json(self.store.step_complete(&a.run_id, &a.step_key, a.output).await.map_err(err)?)
     }
 
     #[tool(description = "Record that a step failed. Calling run_step again for it retries it.")]
-    async fn run_step_fail(&self, Parameters(a): Parameters<StepFailArgs>) -> ToolResult {
+    async fn run_step_fail(
+        &self,
+        Parameters(a): Parameters<StepFailArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step_fail").await?;
         json(self.store.step_fail(&a.run_id, &a.step_key, &a.error).await.map_err(err)?)
     }
 
     #[tool(description = "Finish a durable run as completed, failed or cancelled, releasing its lease.")]
-    async fn run_finish(&self, Parameters(a): Parameters<RunFinishArgs>) -> ToolResult {
+    async fn run_finish(
+        &self,
+        Parameters(a): Parameters<RunFinishArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.finish").await?;
         json(self.store.run_finish(&a.run_id, a.outcome, a.output, a.error).await.map_err(err)?)
     }
 
@@ -581,6 +668,7 @@ impl MemdusaMcp {
         description = "Take over a durable run (e.g. a STALE one left by a crashed agent or another tool). Returns the run and its step journal."
     )]
     async fn run_claim(&self, Parameters(a): Parameters<RunClaimArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.claim").await?;
         json(self.store.run_claim(&a.run_id, &self.agent_name(&ctx), None, a.force).await.map_err(err)?)
     }
 
@@ -589,6 +677,7 @@ impl MemdusaMcp {
     )]
     async fn delegate(&self, Parameters(a): Parameters<DelegateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        authorize(&ctx, &project, Access::Write, "delegate").await?;
         let run = self.store.run_delegate(&project, &a.name, a.tasks, a.idempotency_key).await.map_err(err)?;
         Ok(brief::delegate_report(&run))
     }
@@ -596,8 +685,13 @@ impl MemdusaMcp {
     #[tool(
         description = "Worker: mark your delegated task (MEMDUSA_RUN / MEMDUSA_TASK) as done, with a short summary of what was done and where. Do this once, when the task is finished."
     )]
-    async fn task_complete(&self, Parameters(a): Parameters<TaskCompleteArgs>) -> ToolResult {
+    async fn task_complete(
+        &self,
+        Parameters(a): Parameters<TaskCompleteArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let (run, task) = self.run_task(a.run, a.task)?;
+        authorize_run(&self.store, &ctx, &run, Access::Write, "task.complete").await?;
         let output = a.summary.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).map(Value::String);
         self.store.step_complete(&run, &task, output).await.map_err(err)?;
         Ok(format!("task {task} marked done"))
@@ -606,21 +700,29 @@ impl MemdusaMcp {
     #[tool(
         description = "Worker: give up on your delegated task (MEMDUSA_RUN / MEMDUSA_TASK) with the reason. A replacement worker can claim it again."
     )]
-    async fn task_fail(&self, Parameters(a): Parameters<TaskFailArgs>) -> ToolResult {
+    async fn task_fail(&self, Parameters(a): Parameters<TaskFailArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let (run, task) = self.run_task(a.run, a.task)?;
+        authorize_run(&self.store, &ctx, &run, Access::Write, "task.fail").await?;
         self.store.step_fail(&run, &task, &a.reason).await.map_err(err)?;
         Ok(format!("task {task} marked failed"))
     }
 
     #[tool(description = "Get a durable run with its full step journal.")]
-    async fn run_get(&self, Parameters(a): Parameters<IdArg>) -> ToolResult {
+    async fn run_get(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        authorize_run(&self.store, &ctx, &a.id, Access::Read, "run.get").await?;
         json(self.store.run_get(&a.id).await.map_err(err)?)
     }
 
     #[tool(description = "List durable runs for the project (or all projects), newest first.")]
     async fn run_list(&self, Parameters(a): Parameters<RunListArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
-        let project = if a.all_projects { None } else { Some(self.project(&ctx, a.project)?) };
-        json(self.store.run_list(project.as_deref(), a.status, 50).await.map_err(err)?)
+        let (project, allowed) = if a.all_projects {
+            (None, Some(readable_projects(&self.store, &ctx).await?))
+        } else {
+            let project = self.project(&ctx, a.project)?;
+            authorize(&ctx, &project, Access::Read, "run.list").await?;
+            (Some(project), None)
+        };
+        json(self.store.run_list_visible(project.as_deref(), allowed.as_deref(), a.status, 50).await.map_err(err)?)
     }
 }
 
@@ -663,6 +765,7 @@ impl MemdusaMcp {
         project: Option<String>,
     ) -> Result<String, McpError> {
         let project = self.project(ctx, project).map_err(|e| McpError::invalid_params(e, None))?;
+        authorize(ctx, &project, Access::Read, "brief").await.map_err(|e| McpError::internal_error(e, None))?;
         let git = self.local_git(&project);
         let task = self.task(None);
         Ok(brief::build(&self.store, &project, identity(ctx).user.as_deref(), git.as_ref(), task.as_deref())
@@ -673,6 +776,7 @@ impl MemdusaMcp {
 
     async fn memories_markdown(&self, ctx: &RequestContext<RoleServer>) -> Result<String, McpError> {
         let project = self.project(ctx, None).map_err(|e| McpError::invalid_params(e, None))?;
+        authorize(ctx, &project, Access::Read, "memories").await.map_err(|e| McpError::internal_error(e, None))?;
         let memories = self
             .store
             .memory_search(MemoryQuery {
