@@ -130,7 +130,7 @@ Most harnesses refuse to run a project's hooks or MCP servers until you approve 
 | Cursor CLI (`cursor-agent`) | Untrusted folders won't start in print mode: trust the folder interactively or pass `--trust`; `--approve-mcps` auto-approves the MCP server. Cursor runs memdusa through its Claude Code hooks import. |
 | pi | Project extensions (`.pi/`) load only for trusted projects: answer the trust prompt, or pass `--approve` / `-a` for one run. |
 | Hermes | Shell hooks must be allowlisted: run Hermes once with `--accept-hooks` (or approve at its prompt). `hermes hooks doctor` shows their status. |
-| OpenCode v2 | Plugins run in OpenCode's background service, which does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is written into the plugin), not with shell env vars. `opencode run --standalone` uses a private server that does inherit env. |
+| OpenCode v2 | Plugins run in OpenCode's background service, which does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is saved in `~/.memdusa` and read by every hook), not with shell env vars. `opencode run --standalone` uses a private server that does inherit env. |
 | Gemini CLI | Google stopped serving individual accounts in Gemini CLI (June 2026): use Antigravity (`agy`, `memdusa install antigravity`). |
 
 Things to know per tool:
