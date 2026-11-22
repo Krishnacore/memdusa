@@ -110,7 +110,7 @@ in that tool's dialect. Remote mode, the offline queue, redaction and code state
 | Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, PostCompact (summary), SessionEnd |
 | Codex CLI | `~/.codex/hooks.json` + `config.toml` | ✓ (also after compaction) | ✓ | ✓ (patch → files) | Stop | PreCompact, SessionEnd |
 | Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
-| Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | (no such hooks) |
+| Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | Stop when fully idle (once per session; last words from the transcript) |
 | Gemini CLI | `~/.gemini/settings.json` | ✓ | ✓ (`BeforeAgent`) | ✓ | AfterAgent (`deny`) | PreCompress, SessionEnd |
 | OpenCode | TypeScript plugin in `.opencode/plugins/` | ✓ (first prompt) | ✓ | ✓ | `experimental.idle` | compaction hook |
 | pi | TypeScript extension in `~/.pi/agent/extensions/` | ✓ (first run) | ✓ | ✓ | `agent_before_settle` | session_before_compact, session_shutdown |
@@ -127,6 +127,7 @@ Most harnesses refuse to run a project's hooks or MCP servers until you approve 
 | Harness | One-time step |
 |---|---|
 | Codex | Project hooks run only after trust: approve in `/hooks` (automation: `--dangerously-bypass-hook-trust`). A project `.codex/config.toml` also needs the project trusted (trust prompt / `codex --trust`). |
+| Antigravity CLI (`agy`) | Project hooks in `.agents/` run in `agy -p` without a trust prompt. Headless mode soft-denies MCP tools it would have to ask about, so `memdusa install antigravity` adds a PreToolUse hook that auto-approves **only** calls to memdusa's own server (`checkpoint` works with plain `agy -p`; no `--dangerously-skip-permissions` needed). `MEMDUSA_RUN` / `MEMDUSA_TASK` from the launching shell do reach the MCP server — no `env` entry is needed in `mcp_config.json`. |
 | Cursor CLI (`cursor-agent`) | Untrusted folders won't start in print mode: trust the folder interactively or pass `--trust`; `--approve-mcps` auto-approves the MCP server. Cursor runs memdusa through its Claude Code hooks import. |
 | pi | Project extensions (`.pi/`) load only for trusted projects: answer the trust prompt, or pass `--approve` / `-a` for one run. |
 | Hermes | Shell hooks must be allowlisted: run Hermes once with `--accept-hooks` (or approve at its prompt). `hermes hooks doctor` shows their status. |
@@ -137,8 +138,11 @@ Things to know per tool:
 - **Codex** runs new hooks only after you trust them in `/hooks`.
 - **Cursor** also runs Claude Code hooks by default ("Third-Party Imports"). If both are installed, turn that off so events
   aren't recorded twice; `memdusa install cursor` warns you.
-- **Antigravity** has no session-end or compaction hooks, so there's no fallback checkpoint there; the stop reminder does
-  that job. Gemini CLI remains for enterprise and paid-API users (consumer accounts moved to Antigravity in June 2026).
+- **Antigravity** has no session-end or compaction hooks. Its Stop hook payload has no assistant text, so memdusa reads
+  the agent's last words from the session transcript (`transcriptPath`, last `PLANNER_RESPONSE` step) and writes a single
+  fallback checkpoint when the agent goes fully idle after editing files. The Stop reminder still asks for a richer
+  checkpoint when the memdusa MCP tools are available. Gemini CLI remains for enterprise and paid-API users (consumer
+  accounts moved to Antigravity in June 2026).
 - **pi** hides MCP tools behind "code mode" by default; memdusa registers its server with `exposure: "direct"`.
 - **Hermes** hooks need allowlisting (see above). memdusa merges into your existing `config.yaml` by inserting marked
   `# >>> memdusa` / `# <<< memdusa` blocks (under your existing `hooks:` / `mcp_servers:` keys, or as new sections),

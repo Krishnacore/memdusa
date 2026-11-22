@@ -16,7 +16,9 @@
 
 use std::path::Path;
 
-use memdusa_core::brief::{self, AGENT_MESSAGE, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, MEMORY_RECALL, STOP_GUARD};
+use memdusa_core::brief::{
+    self, AGENT_MESSAGE, CHECKPOINT_FALLBACK, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, MEMORY_RECALL, STOP_GUARD,
+};
 use memdusa_core::model::*;
 use memdusa_core::store::{significant_words, words};
 use memdusa_core::{Result, Store};
@@ -35,6 +37,8 @@ pub enum HookEvent {
     SessionEnd,
     /// Commits, branch switches and merges, collected by `memdusa git-hook`.
     Git,
+    /// PreToolUse hook that auto-approves calls to memdusa's own MCP server (Antigravity).
+    McpApproval,
 }
 
 impl HookEvent {
@@ -49,6 +53,7 @@ impl HookEvent {
             Self::PostCompact => "post-compact",
             Self::SessionEnd => "session-end",
             Self::Git => "git",
+            Self::McpApproval => "mcp-approval",
         }
     }
 
@@ -94,6 +99,10 @@ pub struct HookInput {
     /// Stop: the agent's final message of the turn (Claude Code, Codex; adapters normalize others).
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// Stop: the agent is completely finished (Antigravity's `fullyIdle`). Used only to decide
+    /// when a harness with no SessionEnd hook can write its fallback checkpoint.
+    #[serde(default)]
+    pub fully_idle: Option<bool>,
     /// PostCompact: the summary the harness generated.
     #[serde(default)]
     pub compact_summary: Option<String>,
@@ -302,7 +311,7 @@ async fn claim_step(ctx: &Ctx<'_>, source: &str) -> Option<String> {
 pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<Option<String>> {
     // Every event of a worker is a sign of life. SessionEnd is not: the lease is left to expire, so a worker
     // that stopped mid-task shows as stale (completion is explicit: `task_complete`).
-    if !matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::Git) {
+    if !matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::Git | HookEvent::McpApproval) {
         heartbeat(&ctx).await;
     }
     match event {
@@ -333,7 +342,13 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
             if let Some(m) = input.last_assistant_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
                 record_agent_message(&ctx, m).await?;
             }
-            stop(&ctx, input.stop_hook_active.unwrap_or(false)).await
+            let out = stop(&ctx, input.stop_hook_active.unwrap_or(false)).await?;
+            // Antigravity has no SessionEnd or compaction hook: a fully idle stop is the last chance
+            // to preserve work done in this session. Other harnesses don't set `fully_idle`.
+            if input.fully_idle.unwrap_or(false) {
+                stop_checkpoint(&ctx).await?;
+            }
+            Ok(out)
         }
         HookEvent::PostCompact => {
             if let Some(s) = input.compact_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -364,6 +379,14 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
             auto_checkpoint(&ctx, &format!("session end ({reason})")).await?;
             log(&ctx, "session_end", format!("session ended ({reason})"), None).await?;
             Ok(None)
+        }
+        HookEvent::McpApproval => {
+            // Antigravity's headless mode soft-denies MCP tools it would have to ask about. Auto-approve
+            // memdusa's own server only; every other tool falls back to the harness's normal policy.
+            let server = input.tool_input.as_ref().and_then(|i| i.get("ServerName")).and_then(Value::as_str);
+            let eager = input.tool_name.as_deref().is_some_and(|n| n.starts_with("mcp_memdusa_"));
+            let decision = if eager || server == Some("memdusa") { "auto_approve" } else { "allow" };
+            Ok(Some(format!(r#"{{"decision":"{decision}"}}"#)))
         }
         HookEvent::Git => {
             let git_event = input.git_event.as_deref().unwrap_or_default();
@@ -699,10 +722,11 @@ async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>>
     Ok(Some(json!({ "decision": "block", "reason": reason }).to_string()))
 }
 
-/// Fallback when context is about to be lost (compaction, session end) and
-/// the agent changed files without checkpointing: record what we know.
-async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
-    let Some(session) = &ctx.session else { return Ok(()) };
+/// Fallback when context is about to be lost (compaction, session end, an idle
+/// stop on a harness with no session-end hook) and the agent changed files without
+/// checkpointing: record what we know. Returns whether a checkpoint was written.
+async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<bool> {
+    let Some(session) = &ctx.session else { return Ok(false) };
     // Carry the previous checkpoint of this scope forward so its plan isn't lost.
     let prev = scope_checkpoint(ctx).await?;
     let last = prev.as_ref().map_or(0, |p| p.created_at);
@@ -720,7 +744,7 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
         }
     }
     if files.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // The session's requests, oldest first, in full: the first is usually the task itself.
     let prompts: Vec<String> = events
@@ -774,6 +798,20 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
         })
         .await
         .map(drop)
+        .map(|()| true)
+}
+
+/// At most one fallback checkpoint per session when the only hook left is a stop. The marker is
+/// journaled only if a checkpoint was actually written, so a stop with no file changes stays silent
+/// and a later stop can still save the work.
+async fn stop_checkpoint(ctx: &Ctx<'_>) -> Result<()> {
+    if has_event(ctx, CHECKPOINT_FALLBACK).await? {
+        return Ok(());
+    }
+    if auto_checkpoint(ctx, "an idle stop (no session-end hook)").await? {
+        log(ctx, CHECKPOINT_FALLBACK, "fallback checkpoint written at stop".into(), None).await?;
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1046,6 +1084,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_idle_stop_writes_one_fallback_checkpoint() {
+        let store = ctx_store().await;
+        let cfg = HookConfig { agent: "antigravity".into(), ..cfg() };
+
+        handle(HookEvent::UserPromptSubmit, input(json!({"prompt": "add refunds"})), ctx(&store, &cfg)).await.unwrap();
+        handle(
+            HookEvent::PostToolUse,
+            input(json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}})),
+            ctx(&store, &cfg),
+        )
+        .await
+        .unwrap();
+
+        // A non-idle stop (background work still running) does not write a fallback.
+        handle(HookEvent::Stop, input(json!({"fully_idle": false})), ctx(&store, &cfg)).await.unwrap();
+        assert!(store.checkpoints_latest("p", 5).await.unwrap().is_empty());
+
+        handle(
+            HookEvent::Stop,
+            input(json!({"fully_idle": true, "last_assistant_message": "DONE"})),
+            ctx(&store, &cfg),
+        )
+        .await
+        .unwrap();
+        let cps = store.checkpoints_latest("p", 5).await.unwrap();
+        assert_eq!(cps.len(), 1, "fully idle stop is the session end for Antigravity");
+        assert_eq!(cps[0].source.as_deref(), Some("antigravity (auto)"));
+        assert_eq!(cps[0].goal, "add refunds");
+        assert_eq!(cps[0].files, vec!["a.rs"]);
+        assert!(cps[0].notes.as_deref().unwrap().contains("The agent's last message:\n\n> DONE"));
+
+        // Even another edit followed by a second idle stop cannot create a second fallback.
+        handle(
+            HookEvent::PostToolUse,
+            input(json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/b.rs"}})),
+            ctx(&store, &cfg),
+        )
+        .await
+        .unwrap();
+        handle(HookEvent::Stop, input(json!({"fully_idle": true})), ctx(&store, &cfg)).await.unwrap();
+        assert_eq!(store.checkpoints_latest("p", 5).await.unwrap().len(), 1);
+        let events = store.events_recent("p", Some("s1"), 50).await.unwrap();
+        assert_eq!(events.iter().filter(|e| e.kind == CHECKPOINT_FALLBACK).count(), 1);
+    }
+
+    #[tokio::test]
     async fn fallback_checkpoint_includes_last_message() {
         let store = ctx_store().await;
         let cfg = cfg();
@@ -1056,6 +1140,26 @@ mod tests {
         handle(HookEvent::SessionEnd, input(json!({})), ctx(&store, &cfg)).await.unwrap();
         let notes = store.checkpoints_latest("p", 1).await.unwrap()[0].notes.clone().unwrap();
         assert!(notes.contains("The agent's last message:\n\n> Left off at the refund validation."), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn mcp_approval_only_auto_approves_our_own_server() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let ours =
+            json!({"tool_name": "call_mcp_tool", "tool_input": {"ServerName": "memdusa", "ToolName": "checkpoint"}});
+        let out = handle(HookEvent::McpApproval, input(ours), ctx(&store, &cfg)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["decision"], "auto_approve");
+
+        let other =
+            json!({"tool_name": "call_mcp_tool", "tool_input": {"ServerName": "filesystem", "ToolName": "read"}});
+        let out = handle(HookEvent::McpApproval, input(other), ctx(&store, &cfg)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["decision"], "allow");
+
+        let eager = json!({"tool_name": "mcp_memdusa_checkpoint"});
+        let out = handle(HookEvent::McpApproval, input(eager), ctx(&store, &cfg)).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["decision"], "auto_approve");
+        assert!(store.events_recent("p", None, 10).await.unwrap().is_empty(), "approval writes nothing");
     }
 
     #[tokio::test]

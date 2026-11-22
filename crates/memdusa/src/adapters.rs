@@ -112,7 +112,7 @@ impl Harness {
                 hook(
                     "PostToolUse",
                     PostToolUse,
-                    Some("run_command|write_to_file|replace_file_content|multi_replace_file_content"),
+                    Some("run_command|write_file|write_to_file|replace_file_content|multi_replace_file_content"),
                     5,
                 ),
                 hook("Stop", Stop, None, 5),
@@ -199,13 +199,38 @@ impl Harness {
                         let args = at(&o, &["toolCall", "args"]).cloned().unwrap_or_default();
                         let (tool, input) = match name.as_str() {
                             "run_command" => ("Bash", json!({ "command": args.get("CommandLine") })),
-                            "write_to_file" | "replace_file_content" | "multi_replace_file_content" => {
-                                ("Edit", json!({ "file_path": args.get("TargetFile") }))
+                            // Live agy 1.5.14 calls the write tool `write_file` with a `Path` argument; older
+                            // docs (and some builds) name it `write_to_file` with `TargetFile`. Accept both.
+                            "write_file" | "write_to_file" | "replace_file_content" | "multi_replace_file_content" => {
+                                let path = args.get("Path").or_else(|| args.get("TargetFile"));
+                                ("Edit", json!({ "file_path": path }))
                             }
                             _ => return None,
                         };
                         o.insert("tool_name".into(), json!(tool));
                         o.insert("tool_input".into(), input);
+                    }
+                    HookEvent::Stop => {
+                        // agy has no SessionEnd hook and its Stop payload carries no assistant text. The
+                        // transcript does: the last PLANNER_RESPONSE with content is the agent's last words.
+                        antigravity_transcript_last_message(&mut o);
+                        if let Some(idle) = o.remove("fullyIdle") {
+                            o.insert("fully_idle".into(), idle);
+                        }
+                        // `continuationActive` is agy's `stop_hook_active`: a stop caused by our own
+                        // "continue" decision, not a new turn ending.
+                        rename(&mut o, "continuationActive", "stop_hook_active");
+                        rename(&mut o, "terminationReason", "reason");
+                    }
+                    HookEvent::McpApproval => {
+                        // Let the handler decide from the tool call: only memdusa's own MCP server is
+                        // auto-approved, never a call to some other server through `call_mcp_tool`.
+                        if let Some(name) = at(&o, &["toolCall", "name"]).cloned() {
+                            o.insert("tool_name".into(), name);
+                        }
+                        if let Some(args) = at(&o, &["toolCall", "args"]).cloned() {
+                            o.insert("tool_input".into(), args);
+                        }
                     }
                     _ => {}
                 }
@@ -298,10 +323,32 @@ impl Harness {
     }
 }
 
+/// Antigravity hooks name the transcript `transcriptPath` (JSONL, one step per line). The agent's
+/// final message is the last `PLANNER_RESPONSE` step with non-empty `content`; tool results are
+/// `GENERIC` steps and the request itself is `USER_INPUT`, so neither is mistaken for last words.
+const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
+
+fn antigravity_transcript_last_message(o: &mut Map<String, Value>) {
+    let Some(path) = o.get("transcriptPath").and_then(Value::as_str).filter(|p| !p.is_empty()) else { return };
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    for line in text.lines().rev() {
+        let Ok(step) = serde_json::from_str::<Value>(line) else { continue };
+        if step.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        if let Some(content) = step.get("content").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            o.insert("last_assistant_message".into(), json!(content));
+            return;
+        }
+    }
+}
+
 /// Cursor hands hooks the path of the session's transcript (JSONL, one message per line). Fill
 /// `last_assistant_message` from it (and `prompt` when `with_prompt`), unless the payload has them.
 fn cursor_transcript_fields(o: &mut Map<String, Value>, with_prompt: bool) {
-    const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
     let Some(path) = o.get("transcript_path").and_then(Value::as_str).filter(|p| !p.is_empty()) else { return };
     if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES) {
         return;
@@ -557,6 +604,48 @@ mod tests {
             Harness::Antigravity.render(HookEvent::Stop, Some(block.into())).unwrap(),
             r#"{"decision":"continue","reason":"checkpoint first"}"#
         );
+    }
+
+    /// Real `agy -p` payloads (Antigravity CLI 1.5.14), scrubbed of home paths and ids.
+    #[test]
+    fn antigravity_real_payloads_journal_edits_commands_and_last_words() {
+        let read = |f: &str| {
+            serde_json::from_str::<Value>(&std::fs::read_to_string(format!("{FIXTURES}/{f}")).unwrap()).unwrap()
+        };
+
+        let start = Harness::Antigravity.normalize(HookEvent::SessionStart, read("agy-session-start.json")).unwrap();
+        assert_eq!(start["session_id"], "9f8ccf15-b22c-46d1-b2de-65e80ebbeff4");
+        assert_eq!(start["cwd"], "/work/repo");
+
+        let mut first = read("agy-pre-invocation.json");
+        assert!(Harness::Antigravity.normalize(HookEvent::UserPromptSubmit, first.clone()).is_some());
+        first["invocationNum"] = json!(1);
+        assert!(Harness::Antigravity.normalize(HookEvent::UserPromptSubmit, first).is_none());
+
+        // live agy writes with `write_file` + `Path`, not the `write_to_file` + `TargetFile` of its docs
+        let write =
+            Harness::Antigravity.normalize(HookEvent::PostToolUse, read("agy-post-tool-use-write.json")).unwrap();
+        assert_eq!(write["tool_name"], "Edit");
+        assert_eq!(write["tool_input"]["file_path"], "/work/repo/notes.txt");
+        let cmd =
+            Harness::Antigravity.normalize(HookEvent::PostToolUse, read("agy-post-tool-use-command.json")).unwrap();
+        assert_eq!(cmd["tool_name"], "Bash");
+        assert_eq!(cmd["tool_input"]["command"], "printf shellok > shell.txt");
+
+        let stop = read("agy-stop.json");
+        let v = Harness::Antigravity.normalize(HookEvent::Stop, stop.clone()).unwrap();
+        assert!(v.get("last_assistant_message").is_none(), "unreadable transcript: no last words");
+        let stop = serde_json::from_str::<Value>(
+            &serde_json::to_string(&stop)
+                .unwrap()
+                .replace("\"__TRANSCRIPT__\"", &json!(format!("{FIXTURES}/agy-transcript.jsonl")).to_string()),
+        )
+        .unwrap();
+        let v = Harness::Antigravity.normalize(HookEvent::Stop, stop).unwrap();
+        assert_eq!(v["last_assistant_message"], "DONE", "last PLANNER_RESPONSE, not the tool result");
+        assert_eq!(v["fully_idle"], true);
+        assert_eq!(v["stop_hook_active"], false);
+        assert_eq!(v["reason"], "NO_TOOL_CALL");
     }
 
     #[test]

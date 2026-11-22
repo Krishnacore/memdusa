@@ -15,13 +15,16 @@ pub const AGENT_MESSAGE: &str = "agent_message";
 pub const COMPACT_SUMMARY: &str = "compact_summary";
 pub const COMMAND: &str = "command";
 pub const STOP_GUARD: &str = "stop_guard";
+/// A fallback checkpoint was written at an idle stop (harnesses with no session-end hook).
+pub const CHECKPOINT_FALLBACK: &str = "checkpoint_fallback";
 /// Which memories were already shown to an agent in a session (`data: {"ids": [...]}`).
 pub const MEMORY_RECALL: &str = "memory_recall";
 /// A worker's session started under `MEMDUSA_TASK` (`data: {task, parent, harness, source}`).
 pub const DELEGATED_SESSION: &str = "delegated_session";
 pub const SESSION_END: &str = "session_end";
 /// Bookkeeping events that would only be noise in the brief.
-const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL, DELEGATED_SESSION];
+const HIDDEN: &[&str] =
+    &[STOP_GUARD, CHECKPOINT_FALLBACK, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL, DELEGATED_SESSION];
 /// How far back the coordinator's "Delegated work" section looks, and how many tasks it lists.
 const DELEGATED_WINDOW_MS: Millis = 7 * 86_400_000;
 const DELEGATED_MAX: usize = 10;
