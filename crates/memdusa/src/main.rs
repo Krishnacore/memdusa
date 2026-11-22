@@ -8,6 +8,7 @@ mod ops;
 mod project;
 mod proxy;
 mod remote;
+mod self_update;
 mod spool;
 mod transcripts;
 
@@ -210,6 +211,15 @@ enum Cmd {
         #[arg(long)]
         no_mcp: bool,
     },
+    /// Update memdusa from the latest GitHub release (or a specific version).
+    SelfUpdate {
+        /// Version to install, e.g. v0.1.1 (default: the latest release).
+        #[arg(long)]
+        version: Option<String>,
+        /// Only report whether an update is available; don't install anything.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// Retention windows in days (0 = keep forever).
@@ -399,6 +409,9 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Cmd::SelfUpdate { version, check } => {
+            return self_update::run(version, check).await;
+        }
         Cmd::Login { url, token } => {
             let r = config::Remote::new(&url, token)?;
             let info = remote::Client::new(r.clone(), Duration::from_secs(10))?
@@ -535,6 +548,7 @@ async fn main() -> anyhow::Result<()> {
         | Cmd::GitHook { .. }
         | Cmd::Install { .. }
         | Cmd::Uninstall { .. }
+        | Cmd::SelfUpdate { .. }
         | Cmd::Login { .. }
         | Cmd::Logout => unreachable!(),
     }
@@ -675,6 +689,7 @@ async fn run_remote(
                 println!("[{}] ({}) {}  — {}", m.kind.as_str(), scope, m.content, m.id);
             }
         }
+        Cmd::SelfUpdate { .. } => unreachable!("handled before mode selection"),
         _ => unreachable!("handled before mode selection"),
     }
     Ok(())
