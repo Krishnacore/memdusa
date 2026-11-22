@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && useradd --system --uid 10001 --home-dir /data memdusa \
  && mkdir /data && chown memdusa /data
 COPY --from=build /src/target/release/memdusa /usr/local/bin/memdusa
+COPY LICENSE NOTICE /usr/share/doc/memdusa/
 USER memdusa
 ENV MEMDUSA_HOME=/data \
     MEMDUSA_DATABASE_URL=sqlite:///data/memdusa.db \
