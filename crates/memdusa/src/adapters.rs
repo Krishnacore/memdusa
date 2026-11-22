@@ -21,6 +21,13 @@ pub enum Harness {
     Gemini,
     /// Google Antigravity CLI (`agy`), Gemini CLI's successor for consumer accounts.
     Antigravity,
+    /// OpenCode v2: a TypeScript plugin that calls `memdusa hook` with canonical payloads.
+    #[value(name = "opencode")]
+    OpenCode,
+    /// pi coding agent: a TypeScript extension, like OpenCode's plugin.
+    Pi,
+    /// Nous Research's Hermes Agent: shell hooks in ~/.hermes/config.yaml.
+    Hermes,
 }
 
 /// One native hook the installer registers.
@@ -47,6 +54,9 @@ impl Harness {
             Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Antigravity => "antigravity",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -101,6 +111,18 @@ impl Harness {
                 ),
                 hook("Stop", Stop, None, 5),
             ],
+            // `pre_llm_call` is the only hook that can inject context; it runs on every turn,
+            // so session-start only acts on the first. No pre-compaction hook exists, and
+            // `pre_verify` (the only "continue" hook) fires only after code edits.
+            Self::Hermes => vec![
+                hook("pre_llm_call", SessionStart, None, 10),
+                hook("pre_llm_call", UserPromptSubmit, None, 5),
+                hook("post_tool_call", PostToolUse, Some("write_file|patch|terminal"), 5),
+                hook("pre_verify", Stop, None, 5),
+                hook("on_session_finalize", SessionEnd, None, 10),
+            ],
+            // Plugin-based: their plugins call `memdusa hook` directly with canonical payloads.
+            Self::OpenCode | Self::Pi => vec![],
         }
     }
 
@@ -176,6 +198,35 @@ impl Harness {
                     _ => {}
                 }
             }
+            Self::Hermes => {
+                let extra = o.get("extra").cloned().unwrap_or_default();
+                match event {
+                    HookEvent::SessionStart => {
+                        if extra.get("is_first_turn").and_then(Value::as_bool) != Some(true) {
+                            return None;
+                        }
+                        o.insert("source".into(), json!("startup"));
+                    }
+                    HookEvent::UserPromptSubmit => {
+                        o.insert("prompt".into(), extra.get("user_message").cloned().unwrap_or_default());
+                    }
+                    HookEvent::PostToolUse => {
+                        let input = o.get("tool_input").cloned().unwrap_or_default();
+                        let (tool, canonical) = match o.get("tool_name").and_then(Value::as_str) {
+                            Some("write_file" | "patch") => ("Edit", json!({ "file_path": input.get("path") })),
+                            Some("terminal") => ("Bash", json!({ "command": input.get("command") })),
+                            _ => return None,
+                        };
+                        o.insert("tool_name".into(), json!(tool));
+                        o.insert("tool_input".into(), canonical);
+                    }
+                    HookEvent::SessionEnd => {
+                        o.insert("reason".into(), extra.get("reason").cloned().unwrap_or(json!("other")));
+                    }
+                    _ => {}
+                }
+            }
+            Self::OpenCode | Self::Pi => {} // their plugins already send canonical payloads
             Self::Gemini => {
                 if event == HookEvent::PostToolUse {
                     let canonical = match o.get("tool_name").and_then(Value::as_str) {
@@ -199,8 +250,8 @@ impl Harness {
         let context = v.pointer("/hookSpecificOutput/additionalContext").and_then(Value::as_str);
         let reason = v.get("reason").and_then(Value::as_str);
         let rendered = match (self, event) {
-            // Claude Code and Codex share the canonical format
-            (Self::ClaudeCode | Self::Codex, _) => return Some(out),
+            // Claude Code and Codex share the canonical format; OpenCode/pi plugins read it
+            (Self::ClaudeCode | Self::Codex | Self::OpenCode | Self::Pi, _) => return Some(out),
             (Self::Gemini, HookEvent::SessionStart) => return Some(out), // same hookSpecificOutput shape
             (Self::Gemini, HookEvent::Stop) => json!({ "decision": "deny", "reason": reason? }),
             (Self::Cursor, HookEvent::SessionStart) => json!({ "additional_context": context? }),
@@ -209,6 +260,8 @@ impl Harness {
                 json!({ "injectSteps": [{ "systemMessage": { "systemMessage": context? } }] })
             }
             (Self::Antigravity, HookEvent::Stop) => json!({ "decision": "continue", "reason": reason? }),
+            (Self::Hermes, HookEvent::SessionStart) => json!({ "context": context? }),
+            (Self::Hermes, HookEvent::Stop) => json!({ "action": "continue", "message": reason? }),
             _ => return Some(out),
         };
         Some(rendered.to_string())
@@ -370,6 +423,31 @@ mod tests {
         assert_eq!(
             Harness::Antigravity.render(HookEvent::Stop, Some(block.into())).unwrap(),
             r#"{"decision":"continue","reason":"checkpoint first"}"#
+        );
+    }
+
+    #[test]
+    fn hermes_payloads_and_outputs() {
+        let first = json!({"hook_event_name": "pre_llm_call", "session_id": "h1", "cwd": "/r",
+                           "extra": {"is_first_turn": true, "user_message": "fix the build"}});
+        let later =
+            json!({"session_id": "h1", "cwd": "/r", "extra": {"is_first_turn": false, "user_message": "and tests"}});
+        assert!(Harness::Hermes.normalize(HookEvent::SessionStart, first.clone()).is_some());
+        assert!(Harness::Hermes.normalize(HookEvent::SessionStart, later.clone()).is_none(), "brief only on turn one");
+        assert_eq!(Harness::Hermes.normalize(HookEvent::UserPromptSubmit, later).unwrap()["prompt"], "and tests");
+        let edit =
+            json!({"tool_name": "patch", "tool_input": {"path": "/r/a.py", "old_string": "x"}, "session_id": "h1"});
+        let v = Harness::Hermes.normalize(HookEvent::PostToolUse, edit).unwrap();
+        assert_eq!((v["tool_name"].as_str(), v["tool_input"]["file_path"].as_str()), (Some("Edit"), Some("/r/a.py")));
+        let start = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"brief"}}"#;
+        assert_eq!(
+            Harness::Hermes.render(HookEvent::SessionStart, Some(start.into())).unwrap(),
+            r#"{"context":"brief"}"#
+        );
+        let block = r#"{"decision":"block","reason":"checkpoint"}"#;
+        assert_eq!(
+            Harness::Hermes.render(HookEvent::Stop, Some(block.into())).unwrap(),
+            r#"{"action":"continue","message":"checkpoint"}"#
         );
     }
 }

@@ -74,57 +74,43 @@ your other hooks, and backs the file up to `settings.json.memdusa-backup` first:
 Hooks never break a session. Any error is logged to stderr, the hook exits 0, and it gives up well inside Claude
 Code's timeout. A hook takes about 15 ms. In remote mode they call the server instead (see below).
 
-## Connect other harnesses (local, stdio)
+## Other harnesses
 
-Each harness launches `memdusa mcp`. Pass `--agent` so records and leases show who did what.
+One command per harness. It installs that tool's own hooks (or plugin) and registers the MCP server:
 
-**Claude Code (MCP only, no hooks)**
 ```sh
-claude mcp add memdusa --scope user -- memdusa mcp --agent claude-code
+memdusa install codex          # or: cursor | antigravity | gemini | opencode | pi | hermes
+memdusa install codex --scope project
+memdusa uninstall codex
 ```
 
-**Codex** (`~/.codex/config.toml`)
-```toml
-[mcp_servers.memdusa]
-command = "memdusa"
-args = ["mcp", "--agent", "codex"]
-```
+Each tool's hook payload is translated to memdusa's canonical format on your machine, and the output is rendered back
+in that tool's dialect. Remote mode, the offline queue, redaction and code state therefore work the same everywhere.
 
-**Cursor** (`.cursor/mcp.json`) / **Gemini CLI** (`~/.gemini/settings.json`)
-```json
-{ "mcpServers": { "memdusa": { "command": "memdusa", "args": ["mcp", "--agent", "cursor"] } } }
-```
+| Harness | How memdusa plugs in | Brief at start | Prompts | Edits / commands | Checkpoint reminder | Fallback checkpoint |
+|---|---|---|---|---|---|---|
+| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, SessionEnd |
+| Codex CLI | `~/.codex/hooks.json` + `config.toml` | ✓ (also after compaction) | ✓ | ✓ (patch → files) | Stop | PreCompact, SessionEnd |
+| Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
+| Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | (no such hooks) |
+| Gemini CLI | `~/.gemini/settings.json` | ✓ | ✓ (`BeforeAgent`) | ✓ | AfterAgent (`deny`) | PreCompress, SessionEnd |
+| OpenCode | TypeScript plugin in `.opencode/plugins/` | ✓ (first prompt) | ✓ | ✓ | `experimental.idle` | compaction hook |
+| pi | TypeScript extension in `~/.pi/agent/extensions/` | ✓ (first run) | ✓ | ✓ | `agent_before_settle` | session_before_compact, session_shutdown |
+| Hermes Agent | shell hooks in `~/.hermes/config.yaml` | ✓ (first turn) | ✓ | ✓ | `pre_verify` (after edits only) | on_session_finalize |
 
-> If a harness doesn't start MCP servers in the project directory, add `"env": {"MEMDUSA_PROJECT": "github.com/org/repo"}`
-> or let the agent pass `project` explicitly.
+Things to know per tool:
+- **Codex** runs new hooks only after you trust them in `/hooks`.
+- **Cursor** also runs Claude Code hooks by default ("Third-Party Imports"). If both are installed, turn that off so events
+  aren't recorded twice; `memdusa install cursor` warns you.
+- **Antigravity** has no session-end or compaction hooks, so there's no fallback checkpoint there; the stop reminder does
+  that job. Gemini CLI remains for enterprise and paid-API users (consumer accounts moved to Antigravity in June 2026).
+- **pi** hides MCP tools behind "code mode" by default; memdusa registers its server with `exposure: "direct"`.
+- **Hermes** asks once to approve each hook (headless: `--accept-hooks`). memdusa writes a marked block into
+  `config.yaml`, or prints it for you to merge if the file already has `hooks:` / `mcp_servers:`.
+- The checkpoint reminder fires **at most once per session per window** for every harness, so it can't trap an agent that
+  has no way to checkpoint.
 
-The server ships instructions telling the agent to call `resume` first, `checkpoint` before stopping, and so on. For
-harnesses that ignore MCP server instructions, put one line in your `CLAUDE.md` / `AGENTS.md`:
-
-> At the start of every session call the memdusa `resume` tool; save a `checkpoint` before you stop.
-
-## Code state in checkpoints
-
-Notes are only useful if the code matches them. Every checkpoint records where the code was: branch, HEAD, uncommitted
-files, and the machine. Hooks, the CLI, stdio MCP and the remote proxy capture it on the client (one
-`git status --porcelain=v2` call). The model never has to pass it in, and the field is hidden from its tool schema.
-
-```
-### Goal: Add refunds
-**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted (src/refund.ts, src/api.ts) · on `laptop`
-```
-
-On resume, the brief compares that with the resuming agent's state, and puts any warnings above the notes:
-
-| Situation | Warning |
-|---|---|
-| Saved on another machine with uncommitted files | those changes may exist only on that machine |
-| Different branch | the checkpoint was on `feat/x`, you're on `main` |
-| Same branch, HEAD moved | new commits, a rebase, or a different checkout |
-| Uncommitted files are clean now | committed elsewhere, stashed or discarded? |
-
-State is only attached when the current directory's repo *is* the project being resumed, so
-`--project other/repo` never compares against an unrelated checkout.
+Any other MCP client can use memdusa as a plain MCP server (`memdusa mcp --agent <name>`), without hooks.
 
 ## Retention
 
@@ -320,7 +306,10 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Claude Code hooks: auto-resume, journaling, checkpoint guard, fallback checkpoints
 - [x] Remote mode: `memdusa login`, hooks over REST, stdio→HTTP MCP proxy
 - [ ] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
-- [ ] Hook adapters for other harnesses (Codex, Gemini CLI, Cursor) and git hooks
+- [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
+- [x] Handoff eval with real agents (`eval/`)
+- [ ] Git hooks (commits, branch switches) as events
+- [ ] Transcript import (Claude Code, Codex, pi, OpenCode sessions)
 - [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories
 - [x] Per-user API keys, server-side attribution, private global memories

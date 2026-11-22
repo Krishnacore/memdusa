@@ -48,6 +48,7 @@ fn hooks_path(h: Harness, scope: Scope) -> anyhow::Result<PathBuf> {
         (Harness::Gemini, _) => ".gemini/settings.json".into(),
         (Harness::Antigravity, Scope::User) => home()?.join(".gemini/config/hooks.json"),
         (Harness::Antigravity, _) => ".agents/hooks.json".into(),
+        (Harness::OpenCode | Harness::Pi | Harness::Hermes, _) => bail!("{} has no JSON hooks file", h.agent()),
     })
 }
 
@@ -62,7 +63,8 @@ fn mcp_json_path(h: Harness, scope: Scope) -> anyhow::Result<Option<PathBuf>> {
         } else {
             ".agents/mcp_config.json".into()
         }),
-        Harness::ClaudeCode | Harness::Codex => None,
+        Harness::Pi => Some(if user { home_dir()?.join(".pi/agent/mcp.json") } else { ".pi/mcp.json".into() }),
+        Harness::ClaudeCode | Harness::Codex | Harness::OpenCode | Harness::Hermes => None,
     })
 }
 
@@ -188,6 +190,9 @@ pub fn merge_mcp_json(mut config: Value, h: Harness, bin: &str, uninstall: bool)
         if h == Harness::Cursor {
             entry["type"] = json!("stdio");
         }
+        if h == Harness::Pi {
+            entry["exposure"] = json!("direct"); // pi's default "codemode" hides tools from the model
+        }
         servers.insert("memdusa".into(), entry);
     }
     if servers.is_empty() {
@@ -270,6 +275,11 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
         Some(b) => b.clone(),
         None => std::env::current_exe()?.canonicalize()?.display().to_string(),
     };
+    match h {
+        Harness::OpenCode | Harness::Pi => return install_plugin(&opts, &bin),
+        Harness::Hermes => return install_hermes(&opts, &bin),
+        _ => {}
+    }
 
     // hooks
     let path = match &opts.settings {
@@ -351,9 +361,202 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
              run `memdusa install antigravity`."
                 .into(),
         ),
+        Harness::Pi => n.push(
+            "pi loads project extensions (.pi/) only after you trust the project; user scope works everywhere.".into(),
+        ),
+        Harness::OpenCode => n.push("Restart OpenCode to load the plugin.".into()),
+        Harness::Hermes => n.push(
+            "Hermes asks once to approve each new hook. Headless runs never ask: approve them first in an \
+             interactive session, or run with --accept-hooks."
+                .into(),
+        ),
         Harness::ClaudeCode => {}
     }
     Ok(n)
+}
+
+const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.ts");
+const PI_EXTENSION: &str = include_str!("../assets/pi-extension.ts");
+
+/// The plugin source with the memdusa binary baked in.
+pub fn plugin_source(h: Harness, bin: &str) -> String {
+    let template = if h == Harness::OpenCode { OPENCODE_PLUGIN } else { PI_EXTENSION };
+    template.replace("__MEMDUSA_BIN__", &serde_json::to_string(bin).expect("string serializes"))
+}
+
+/// OpenCode and pi: write the plugin/extension file and register the MCP server.
+fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    let h = opts.harness;
+    let user = opts.scope == Scope::User;
+    let path: PathBuf = match &opts.settings {
+        Some(p) => p.clone(),
+        None => match (h, user) {
+            (Harness::OpenCode, true) => home_dir()?.join(".config/opencode/plugins/memdusa/index.ts"),
+            (Harness::OpenCode, false) => ".opencode/plugins/memdusa/index.ts".into(),
+            (_, true) => home_dir()?.join(".pi/agent/extensions/memdusa.ts"),
+            (_, false) => ".pi/extensions/memdusa.ts".into(),
+        },
+    };
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    if opts.uninstall {
+        if opts.dry_run {
+            println!("# would remove {}", path.display());
+        } else if path.exists() {
+            std::fs::remove_file(&path)?;
+            if h == Harness::OpenCode
+                && let Some(dir) = path.parent()
+            {
+                let _ = std::fs::remove_dir(dir); // only if empty
+            }
+            println!("removed {}", path.display());
+        }
+    } else {
+        apply(&path, &old, &plugin_source(h, bin), if h == Harness::OpenCode { "plugin" } else { "extension" }, opts)?;
+    }
+
+    if opts.mcp {
+        match h {
+            Harness::OpenCode => opencode_mcp(bin, user, opts.dry_run, opts.uninstall)?,
+            _ => {
+                if let Some(p) = mcp_json_path(h, opts.scope)? {
+                    let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
+                    let merged = merge_mcp_json(read_json(&p)?, h, bin, opts.uninstall)?;
+                    apply(&p, &old, &json_text(&merged)?, "MCP server", opts)?;
+                }
+            }
+        }
+    }
+    if !opts.uninstall && !opts.dry_run {
+        for note in notes(h)? {
+            println!("\nnote: {note}");
+        }
+        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
+}
+
+fn opencode_mcp(bin: &str, user: bool, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+    if uninstall {
+        println!("OpenCode has no `mcp remove`: delete `memdusa` from `mcp.servers` in your opencode.json(c).");
+        return Ok(());
+    }
+    let mut args: Vec<String> = vec!["mcp".into(), "add".into()];
+    if user {
+        args.push("--global".into());
+    }
+    args.extend(["memdusa", "--", bin, "mcp", "--agent", "opencode"].map(String::from));
+    let shown = format!("opencode {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
+    if dry_run {
+        println!("# would run: {shown}");
+        return Ok(());
+    }
+    let listed = Command::new("opencode").args(["mcp", "list"]).output();
+    match listed {
+        Err(_) => println!("`opencode` CLI not found; register the MCP server with:\n  {shown}"),
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("memdusa") => {
+            println!("MCP server `memdusa` already registered with OpenCode")
+        }
+        Ok(_) => {
+            if !Command::new("opencode").args(&args).status()?.success() {
+                bail!("`{shown}` failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+const HERMES_BEGIN: &str =
+    "# >>> memdusa (managed by `memdusa install hermes`; remove with `memdusa uninstall hermes`)";
+const HERMES_END: &str = "# <<< memdusa";
+
+/// Add or remove memdusa's marked block in Hermes' config.yaml. Returns
+/// `Err(block)` when the file already has its own top-level `hooks:` or
+/// `mcp_servers:` (merging YAML by hand would lose the user's formatting).
+pub fn merge_hermes_yaml(text: &str, bin: &str, mcp: bool, uninstall: bool) -> Result<String, String> {
+    // drop our previous block
+    let mut kept: Vec<&str> = vec![];
+    let mut inside = false;
+    for line in text.lines() {
+        if line.trim_end() == HERMES_BEGIN {
+            inside = true;
+        } else if inside && line.trim_end() == HERMES_END {
+            inside = false;
+        } else if !inside {
+            kept.push(line);
+        }
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !uninstall {
+        let q = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
+        let mut block = vec![HERMES_BEGIN.to_owned(), "hooks:".to_owned()];
+        let mut current = "";
+        for nh in Harness::Hermes.events() {
+            if nh.native != current {
+                block.push(format!("  {}:", nh.native));
+                current = nh.native;
+            }
+            block.push(format!("    - command: {}", q(&hook_command(bin, Harness::Hermes, nh.event))));
+            if let Some(m) = nh.matcher {
+                block.push(format!("      matcher: {}", q(m)));
+            }
+            block.push(format!("      timeout: {}", nh.timeout_secs));
+        }
+        if mcp {
+            block.extend([
+                "mcp_servers:".to_owned(),
+                "  memdusa:".to_owned(),
+                format!("    command: {}", q(bin)),
+                "    args: [\"mcp\", \"--agent\", \"hermes\"]".to_owned(),
+            ]);
+        }
+        block.push(HERMES_END.to_owned());
+        let clash = |key: &str| kept.iter().any(|l| l.starts_with(&format!("{key}:")));
+        if clash("hooks") || (mcp && clash("mcp_servers")) {
+            return Err(block.join("\n"));
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block.join("\n"));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    if opts.scope != Scope::User {
+        bail!("Hermes only has a user config (~/.hermes/config.yaml); use --scope user");
+    }
+    let path = match &opts.settings {
+        Some(p) => p.clone(),
+        None => std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .map_or_else(|| Ok(home_dir()?.join(".hermes")), Ok::<_, anyhow::Error>)?
+            .join("config.yaml"),
+    };
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    match merge_hermes_yaml(&old, bin, opts.mcp, opts.uninstall) {
+        Ok(text) => apply(&path, &old, &text, "hooks", opts)?,
+        Err(block) => {
+            println!(
+                "{} already has its own `hooks:` or `mcp_servers:` section; merge this into it by hand:\n\n{block}\n",
+                path.display()
+            );
+            return Ok(());
+        }
+    }
+    if !opts.uninstall && !opts.dry_run {
+        for note in notes(Harness::Hermes)? {
+            println!("\nnote: {note}");
+        }
+        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
 }
 
 fn write_with_backup(path: &Path, text: &str) -> anyhow::Result<()> {
@@ -521,6 +724,32 @@ mod tests {
             merge_codex_toml(between, BIN, true),
             "[profile]\nx = 1\n",
             "removes nested tables, keeps later ones"
+        );
+    }
+
+    #[test]
+    fn plugins_and_hermes() {
+        let src = plugin_source(Harness::OpenCode, "/opt/my \"tools\"/memdusa");
+        assert!(src.contains(r#"const BIN: string = "/opt/my \"tools\"/memdusa""#), "bin is a JSON string literal");
+        assert!(!src.contains("__MEMDUSA_BIN__"));
+        assert!(plugin_source(Harness::Pi, BIN).contains("agent_before_settle"));
+        let pi = merge_mcp_json(json!({}), Harness::Pi, BIN, false).unwrap();
+        assert_eq!(pi["mcpServers"]["memdusa"]["exposure"], "direct");
+
+        let base = "model: hermes-4\nterminal:\n  backend: local\n";
+        let added = merge_hermes_yaml(base, BIN, true, false).unwrap();
+        assert!(added.starts_with(base), "user's config kept as-is");
+        assert!(added.contains(
+            "  pre_llm_call:\n    - command: \"/usr/local/bin/memdusa hook session-start --harness hermes\""
+        ));
+        assert!(added.contains("      matcher: \"write_file|patch|terminal\""));
+        assert!(added.contains("mcp_servers:\n  memdusa:\n    command: \"/usr/local/bin/memdusa\""));
+        assert_eq!(added.matches("pre_llm_call:").count(), 1, "both pre_llm_call hooks under one key");
+        assert_eq!(merge_hermes_yaml(&added, BIN, true, false).unwrap(), added, "idempotent");
+        assert_eq!(merge_hermes_yaml(&added, BIN, true, true).unwrap(), base, "uninstall restores the original");
+        assert!(
+            merge_hermes_yaml("hooks:\n  on_session_start: []\n", BIN, true, false).is_err(),
+            "won't clobber existing hooks"
         );
     }
 }
