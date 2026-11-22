@@ -430,6 +430,8 @@ After `login`, everything on that machine uses the server:
 - SessionStart serves the last cached brief, marked as possibly out of date.
 - `memdusa status` shows whether the server is reachable and how many events are queued.
 - Rejected requests (revoked key, bad input) are not queued, and delivery is at-least-once.
+- Before v0.1.9, `memdusa sync` flushed this queue by hand. It now runs project sync (see "Team server: sync");
+  the queue still flushes on its own with the next hook that reaches the server.
 
 The project key is always detected on the client from git, and sent along with each request. The token stays in
 `~/.memdusa/config.json`, never in a committable file like `.mcp.json`. `MEMDUSA_URL` / `MEMDUSA_TOKEN` override the
