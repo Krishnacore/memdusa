@@ -3,7 +3,7 @@
 
 use memdusa_core::model::*;
 use memdusa_core::{Error, Store, brief};
-use serde_json::json;
+use serde_json::{Value, json};
 
 async fn stores() -> Vec<(String, Store)> {
     let dir = std::env::temp_dir().join(format!("memdusa-test-{}", new_id()));
@@ -1186,6 +1186,87 @@ async fn coordinator_brief_shows_each_tasks_step_status() {
         // a worker's own brief has no coordinator section
         let w = brief::build(&s, &p, None, None, Some("a")).await.unwrap();
         assert!(w.delegated.is_empty() && !w.markdown.contains("Delegated work"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn worker_brief_carries_full_assignment_and_latest_instruction() {
+    for (name, s) in stores().await {
+        let p = project();
+        let ending = "Then add tests in test_refunds.py covering the new validation logic and edge cases.";
+        let assignment = format!(
+            "Build the refunds feature in shop/refunds.py: reject any refund that would exceed the original charge, \
+             support partial refunds with the right currency, and write an audit entry naming the admin who approved it. \
+             {ending}"
+        );
+        assert!(assignment.chars().count() > 200, "{name}: assignment should be long");
+        let base = now_ms() - 120_000;
+        let ev = |session: &str, source: &str, kind: &str, content: &str, at: Millis, data: Option<Value>| NewEvent {
+            project: p.clone(),
+            session: Some(session.into()),
+            source: Some(source.into()),
+            kind: kind.into(),
+            content: content.into(),
+            data,
+            created_at: Some(at),
+        };
+
+        // Worker 1 (opencode) gets the full assignment as its prompt, then its session is delegated `refunds`.
+        // `content` is the 200-char timeline cut; the full text lives in `data.text` as hooks store it.
+        s.event_append(ev(
+            "w1",
+            "opencode",
+            "prompt",
+            &assignment.chars().take(200).collect::<String>(),
+            base,
+            Some(json!({ "text": assignment })),
+        ))
+        .await
+        .unwrap();
+        s.event_append(ev(
+            "w1",
+            "opencode",
+            "delegated_session",
+            "refunds",
+            base + 1,
+            Some(json!({ "task": "refunds" })),
+        ))
+        .await
+        .unwrap();
+
+        // A replacement worker (claude-code) only knows "continue".
+        let latest = "Continue your delegated task.";
+        s.event_append(ev("w2", "claude-code", "prompt", latest, base + 2, Some(json!({ "text": latest }))))
+            .await
+            .unwrap();
+        s.event_append(ev(
+            "w2",
+            "claude-code",
+            "delegated_session",
+            "refunds",
+            base + 3,
+            Some(json!({ "task": "refunds" })),
+        ))
+        .await
+        .unwrap();
+
+        let worker = brief::build(&s, &p, None, None, Some("refunds")).await.unwrap();
+        assert!(worker.markdown.contains("## Your assignment"), "{name}\n{}", worker.markdown);
+        assert!(worker.markdown.contains("_first given to opencode "), "{name}\n{}", worker.markdown);
+        assert!(worker.markdown.contains(ending), "{name}: full assignment ending missing\n{}", worker.markdown);
+        assert!(worker.markdown.contains("_latest instruction (claude-code, "), "{name}\n{}", worker.markdown);
+        assert!(worker.markdown.contains("> Continue your delegated task."), "{name}\n{}", worker.markdown);
+
+        // The coordinator's brief is unchanged: no "Your assignment" section.
+        let coord = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(!coord.markdown.contains("## Your assignment"), "{name}\n{}", coord.markdown);
+
+        // A long, busy task pushes the assignment far out of the 100-most-recent window; it still survives.
+        for i in 0..150 {
+            s.event_append(ev("w1", "opencode", "note", &format!("filler {i}"), base + 100 + i, None)).await.unwrap();
+        }
+        let busy = brief::build(&s, &p, None, None, Some("refunds")).await.unwrap();
+        assert!(busy.markdown.contains(ending), "{name}: assignment lost behind 150 newer events\n{}", busy.markdown);
     }
 }
 

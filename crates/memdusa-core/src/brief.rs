@@ -33,6 +33,10 @@ const TASK_CHECKPOINTS: i64 = 3;
 const DELEGATED_NEXT: usize = 3;
 /// How much of a compaction summary the brief quotes.
 const SUMMARY_CHARS: usize = 1_500;
+/// How much of a worker's original assignment the brief quotes (full prompts are stored up to 4k).
+const ASSIGNMENT_CHARS: usize = 4_000;
+/// How much of a later worker instruction the brief quotes.
+const LATEST_INSTRUCTION_CHARS: usize = 1_000;
 /// Flagged memories from which the brief suggests running `memory_review`.
 const REVIEW_NUDGE: usize = 3;
 /// Default character budget of the brief's Memory section.
@@ -387,6 +391,11 @@ pub async fn build_with_budget(
     memory_budget: usize,
 ) -> Result<Brief> {
     let starts = delegated_starts(store, project).await?;
+    // A worker gets its task's original assignment up front, no matter how much activity came after it.
+    let assignment = match task {
+        Some(t) => assignment_lines(store, project, &starts, t).await?,
+        None => None,
+    };
     let delegated = if task.is_none() { delegated_work(store, project, &starts).await? } else { vec![] };
     let checkpoints = match task {
         // A worker's brief is its task: other workstreams would only compete for "where things stand".
@@ -462,6 +471,7 @@ pub async fn build_with_budget(
         delegated: &delegated,
         message: message.as_ref(),
         summary: summary.as_ref(),
+        assignment: assignment.as_ref(),
     });
     Ok(Brief {
         project: project.into(),
@@ -698,6 +708,61 @@ pub fn memories_markdown(project: &str, memories: &[Memory]) -> String {
     o
 }
 
+/// One prompt shown in a worker's "Your assignment" section: the full text as stored (quoted in the
+/// brief), plus who gave it and when for the italic attribution line.
+struct AssignmentLine {
+    source: Option<String>,
+    created_at: Millis,
+    text: String,
+}
+
+/// A prompt event's full text (`data.text`, the 4k version hooks store) with the truncated `content` as fallback.
+fn prompt_text(e: &Event) -> String {
+    e.data.as_ref().and_then(|d| d.get("text")).and_then(|t| t.as_str()).unwrap_or(&e.content).to_owned()
+}
+
+/// A too-short latest prompt (e.g. "ok") is noise, not an instruction worth repeating.
+fn trivial_instruction(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty() || s.chars().count() < 3
+}
+
+/// The worker's original assignment and, when it differs, the latest instruction. Both come from
+/// prompt events of the task's own sessions, fetched directly (not via the recent-events window) so
+/// an old assignment survives a long, busy task. Only worker briefs have one.
+async fn assignment_lines(
+    store: &Store,
+    project: &str,
+    starts: &[Event],
+    task: &str,
+) -> Result<Option<(AssignmentLine, Option<AssignmentLine>)>> {
+    let sessions: Vec<&str> = task_sessions(starts, Some(task)).into_iter().collect();
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    // Oldest first: the first prompt is the assignment, the last any later worker's instruction.
+    let prompts = store.events_for_sessions_kind(project, &sessions, "prompt", 500).await?;
+    let Some(first) = prompts.first() else { return Ok(None) };
+    let assignment_text = prompt_text(first);
+    let assignment = AssignmentLine {
+        source: first.source.clone(),
+        created_at: first.created_at,
+        text: truncate(&assignment_text, ASSIGNMENT_CHARS),
+    };
+    let latest = prompts.last().filter(|last| last.id != first.id).and_then(|last| {
+        let text = prompt_text(last);
+        if text.trim() == assignment_text.trim() || trivial_instruction(&text) {
+            return None;
+        }
+        Some(AssignmentLine {
+            source: last.source.clone(),
+            created_at: last.created_at,
+            text: truncate(&text, LATEST_INSTRUCTION_CHARS),
+        })
+    });
+    Ok(Some((assignment, latest)))
+}
+
 /// Everything [`render`] shows.
 struct Parts<'a> {
     project: &'a str,
@@ -716,6 +781,8 @@ struct Parts<'a> {
     delegated: &'a [DelegatedWork],
     message: Option<&'a Event>,
     summary: Option<&'a Event>,
+    /// A worker's original assignment and optional later instruction; `None` for coordinator briefs.
+    assignment: Option<&'a (AssignmentLine, Option<AssignmentLine>)>,
 }
 
 fn render(parts: &Parts) -> String {
@@ -734,6 +801,7 @@ fn render(parts: &Parts) -> String {
         delegated,
         message,
         summary,
+        assignment,
     } = *parts;
     let mut o = String::new();
     let _ = writeln!(o, "# Resume brief: {project}\n");
@@ -743,6 +811,18 @@ fn render(parts: &Parts) -> String {
             "_You are a worker on the delegated task **{t}**: this brief covers that task only (its checkpoints and \
              the last words of its previous workers)._\n"
         );
+    }
+    if let Some((first, latest)) = assignment {
+        let quote = |t: &str| t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+        let _ = writeln!(o, "## Your assignment");
+        let by = first.source.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
+        let _ = writeln!(o, "_first given to{by} {}_\n", ago(first.created_at));
+        let _ = writeln!(o, "{}\n", quote(&first.text));
+        if let Some(l) = latest {
+            let by = l.source.as_deref().map(|s| format!("{s}, ")).unwrap_or_default();
+            let _ = writeln!(o, "_latest instruction ({by}{}):_\n", ago(l.created_at));
+            let _ = writeln!(o, "{}\n", quote(&l.text));
+        }
     }
     if !git_warnings.is_empty() {
         let _ = writeln!(o, "## ⚠ Code state differs from the last checkpoint");
@@ -755,7 +835,13 @@ fn render(parts: &Parts) -> String {
         let _ = writeln!(o, "{note}\n");
     }
 
-    if checkpoints.is_empty() && runs.is_empty() && memories.is_empty() && events.is_empty() && delegated.is_empty() {
+    if checkpoints.is_empty()
+        && runs.is_empty()
+        && memories.is_empty()
+        && events.is_empty()
+        && delegated.is_empty()
+        && assignment.is_none()
+    {
         let _ = writeln!(o, "_Nothing recorded yet for this project. Start fresh, and save checkpoints as you go._");
         return o;
     }
