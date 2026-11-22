@@ -134,7 +134,8 @@ async fn select_memories(
     let mut used = 0;
     for m in &ordered {
         let cost = memory_cost(m, events);
-        if m.kind != MemoryKind::Preference && used + cost > budget {
+        // a single memory larger than the budget is still shown, so the section is never empty
+        if m.kind != MemoryKind::Preference && used + cost > budget && !shown.is_empty() {
             break;
         }
         used += cost;

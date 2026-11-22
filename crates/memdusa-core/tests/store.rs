@@ -816,20 +816,36 @@ fn goal(p: &str, goal: &str) -> NewCheckpoint {
     NewCheckpoint { project: p.into(), goal: goal.into(), ..Default::default() }
 }
 
+/// Postgres tests share one database, so global memories other tests saved show up in every brief
+/// (global preferences are always shown). Returns how many globals are visible and the budget their
+/// preferences take, so assertions can be about the test project's own memories.
+async fn visible_globals(s: &Store) -> (usize, usize) {
+    let q = MemoryQuery { project: Some("no-such-project".into()), limit: Some(200), ..Default::default() };
+    let globals: Vec<Memory> = s.memory_search(q).await.unwrap().into_iter().filter(|m| m.project.is_none()).collect();
+    let prefs =
+        globals.iter().filter(|m| m.kind == MemoryKind::Preference).map(|m| m.content.chars().count() + 16).sum();
+    (globals.len(), prefs)
+}
+
+fn own<'a>(b: &'a brief::Brief, p: &str) -> Vec<&'a Memory> {
+    b.memories.iter().filter(|m| m.project.as_deref() == Some(p)).collect()
+}
+
 #[tokio::test]
 async fn brief_prefers_memories_relevant_to_the_checkpoint() {
     for (name, s) in stores().await {
         let p = project();
         seed_many(&s, &p).await;
         s.checkpoint_save(goal(&p, "finish the zebra migration")).await.unwrap();
+        let (globals, room) = visible_globals(&s).await;
 
-        let b = brief::build_with_budget(&s, &p, None, None, 500).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, 500 + room).await.unwrap();
         for needle in ["Zebra migration must keep ids stable", "Run zebra migration dry first"] {
             assert!(b.markdown.contains(needle), "{name}: missing {needle}:\n{}", b.markdown);
         }
         assert!(b.markdown.contains("more memories not shown: use the memory_search tool"), "{name}");
-        assert!(b.memories.len() < 30, "{name}");
-        let omitted = 30 - b.memories.len();
+        assert!(own(&b, &p).len() < 30, "{name}");
+        let omitted = 30 + globals - b.memories.len();
         assert!(b.markdown.contains(&format!("_{omitted} more memories not shown")), "{name}:\n{}", b.markdown);
 
         // the latest prompt counts when newer than the checkpoint
@@ -842,7 +858,7 @@ async fn brief_prefers_memories_relevant_to_the_checkpoint() {
         })
         .await
         .unwrap();
-        let b = brief::build_with_budget(&s, &p, None, None, 500).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, 500 + room).await.unwrap();
         assert!(b.memories.iter().any(|m| m.content.starts_with("filler7")), "{name}: prompt ignored");
     }
 }
@@ -862,10 +878,11 @@ async fn brief_always_keeps_preferences_and_respects_budget() {
         // the preference alone is bigger than the budget: it is still shown
         let b = brief::build_with_budget(&s, &p, None, None, 100).await.unwrap();
         assert!(b.memories.iter().any(|m| m.kind == MemoryKind::Preference), "{name}");
-        assert_eq!(b.memories.len(), 1, "{name}: nothing else fits");
+        assert_eq!(own(&b, &p).len(), 1, "{name}: nothing else fits");
 
         let b = brief::build_with_budget(&s, &p, None, None, 1_000).await.unwrap();
-        let used: usize = b.memories.iter().filter(|m| m.kind != MemoryKind::Preference).map(|m| m.content.len()).sum();
+        let used: usize =
+            own(&b, &p).iter().filter(|m| m.kind != MemoryKind::Preference).map(|m| m.content.len()).sum();
         assert!(used <= 1_000, "{name}: budget exceeded");
         assert!(b.markdown.contains("more memories not shown"), "{name}");
     }
@@ -878,9 +895,10 @@ async fn brief_without_focus_lists_recent_memories() {
         seed_many(&s, &p).await;
         // no checkpoint, no prompt: most recent first, nothing reordered, all fit a big budget
         let b = brief::build_with_budget(&s, &p, None, None, 1_000_000).await.unwrap();
-        assert_eq!(b.memories.len(), 30, "{name}");
-        assert!(b.memories[0].content.starts_with("filler27"), "{name}");
-        assert!(b.memories[29].content.starts_with("Zebra migration"), "{name}");
+        let mine = own(&b, &p);
+        assert_eq!(mine.len(), 30, "{name}");
+        assert!(mine[0].content.starts_with("filler27"), "{name}");
+        assert!(mine[29].content.starts_with("Zebra migration"), "{name}");
         assert!(!b.markdown.contains("more memories not shown"), "{name}");
     }
 }
