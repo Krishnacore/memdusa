@@ -20,7 +20,8 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let db = format!("sqlite://{}", self.dir.join("t.db").display());
+        // sqlite_url, not "sqlite://{path}": a Windows path's "C:" parses as host:port
+        let db = memdusa_core::store::sqlite_url(&self.dir.join("t.db"));
         let out = Command::new(env!("CARGO_BIN_EXE_memdusa"))
             .args(["--database-url", &db, "--project", "demo"])
             .args(args)
