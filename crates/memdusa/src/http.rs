@@ -165,6 +165,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/hooks/{event}", post(hook))
         .route("/v1/resume", get(resume))
         .route("/v1/memories", post(memory_save).get(memory_search))
+        .route("/v1/memories/review", get(memory_review))
         .route("/v1/memories/{id}", delete(memory_forget).patch(memory_update))
         .route("/v1/events", post(event_append).get(events_recent))
         .route("/v1/checkpoints", post(checkpoint_save).get(checkpoints_latest))
@@ -577,6 +578,19 @@ async fn memory_search(
 ) -> ApiResult<Vec<Memory>> {
     q.user = id.user;
     Ok(Json(s.store.memory_search(q).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct ReviewQuery {
+    project: String,
+}
+
+async fn memory_review(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(q): Query<ReviewQuery>,
+) -> ApiResult<memdusa_core::review::MemoryReview> {
+    Ok(Json(s.store.memory_review(&q.project, id.user.as_deref()).await?))
 }
 
 async fn memory_forget(

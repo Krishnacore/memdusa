@@ -126,6 +126,12 @@ pub struct MemorySearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct MemoryReviewArgs {
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct IdArg {
     pub id: String,
 }
@@ -410,6 +416,19 @@ impl MemdusaMcp {
             user: identity(&ctx).user,
         };
         json(self.store.memory_search(q).await.map_err(err)?)
+    }
+
+    #[tool(
+        description = "Find memories that need consolidating. Use periodically, or when the brief says memories need review. Lists related memories to merge, memories that mention files changed since they were written, and old todos, each with ids. Then: merge each related group with memory_update on one memory and memory_forget on the rest; verify stale ones against the code (memory_update or memory_forget); close old todos."
+    )]
+    async fn memory_review(
+        &self,
+        Parameters(a): Parameters<MemoryReviewArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        let review = self.store.memory_review(&project, identity(&ctx).user.as_deref()).await.map_err(err)?;
+        Ok(review.markdown(&project, memdusa_core::model::now_ms()))
     }
 
     #[tool(description = "Delete a memory that is wrong or obsolete.")]
@@ -878,6 +897,22 @@ mod tests {
         assert!(!ok);
         let (_, found) = call(&c, "memory_search", serde_json::json!({ "query": "cookies" })).await;
         assert!(found.contains(&id), "{found}");
+    }
+
+    #[tokio::test]
+    async fn memory_review_lists_related_memories_with_ids() {
+        let c = client().await;
+        let mut ids = vec![];
+        for content in
+            ["Payments webhook retries use exponential backoff", "Payments webhook retries use capped backoff delays"]
+        {
+            let (ok, saved) = call(&c, "memory_save", serde_json::json!({ "content": content, "kind": "fact" })).await;
+            assert!(ok, "{saved}");
+            ids.push(serde_json::from_str::<Value>(&saved).unwrap()["id"].as_str().unwrap().to_owned());
+        }
+        let (ok, text) = call(&c, "memory_review", serde_json::json!({})).await;
+        assert!(ok, "{text}");
+        assert!(text.contains("Related memories") && ids.iter().all(|id| text.contains(id)), "{text}");
     }
 
     #[tokio::test]

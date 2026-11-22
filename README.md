@@ -350,7 +350,7 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 
 ## MCP tools
 
-`resume`, `memory_save`, `memory_update`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`,
+`resume`, `memory_save`, `memory_update`, `memory_search`, `memory_review`, `memory_forget`, `checkpoint`, `log_event`, `run_start`,
 `run_step`, `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
 
 ### Memory hygiene
@@ -504,7 +504,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
     several agents worked recently
 - [ ] Semantic memory search (embeddings behind a trait; local model or API)
 - [x] Memory hygiene: update, near-duplicate merge, stale flags
-- [ ] Memory consolidation: summarize old events
+- [x] Memory consolidation: agent-driven review. `memory_review` (or `memdusa review`) finds related memories to merge, memories that mention files changed since, and old todos; the agent merges them with `memory_update` / `memory_forget`, and the brief nudges when there is enough to review. Old events are already summarized by retention.
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)

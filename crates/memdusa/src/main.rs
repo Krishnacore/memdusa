@@ -112,6 +112,8 @@ enum Cmd {
     },
     /// Search memories.
     Recall { query: Option<String> },
+    /// List memories that need consolidating: related ones to merge, possibly outdated ones, old todos.
+    Review,
     /// Print the detected project key.
     Project,
     /// Use a remote memdusa server for hooks, MCP and the CLI on this machine.
@@ -607,6 +609,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("[{}] ({}) {}  — {}", m.kind.as_str(), scope, m.content, m.id);
             }
         }
+        Cmd::Review => {
+            let project = project.context("could not detect project; pass --project")?;
+            let review = store.memory_review(&project, None).await?;
+            print!("{}", review.markdown(&project, memdusa_core::model::now_ms()));
+        }
         Cmd::Project
         | Cmd::Hook { .. }
         | Cmd::GitHook { .. }
@@ -762,6 +769,11 @@ async fn run_remote(
                 let scope = m.project.as_deref().unwrap_or("global");
                 println!("[{}] ({}) {}  — {}", m.kind.as_str(), scope, m.content, m.id);
             }
+        }
+        Cmd::Review => {
+            let project = project.context("could not detect project; pass --project")?;
+            let review = client()?.memory_review(&project).await?;
+            print!("{}", review.markdown(&project, memdusa_core::model::now_ms()));
         }
         Cmd::SelfUpdate { .. } => unreachable!("handled before mode selection"),
         _ => unreachable!("handled before mode selection"),
