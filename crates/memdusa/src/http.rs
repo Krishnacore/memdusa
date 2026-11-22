@@ -260,6 +260,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/sync/pull", get(sync_pull))
         .route("/v1/sync/projects", get(sync_projects))
         .nest_service("/mcp", mcp)
+        .layer(middleware::from_fn(mcp_session_close_status))
         .merge(oauth::identity_routes())
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -317,6 +318,19 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
 
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// rmcp answers a session close (`DELETE /mcp`) with 202 Accepted; MCP clients such as the official
+/// Python SDK treat anything but 200/204 as a failed close ("Session termination failed: 202").
+/// The session is gone once the handler returns, so report it as 204 No Content.
+async fn mcp_session_close_status(req: Request, next: Next) -> Response {
+    let is_close = req.method() == axum::http::Method::DELETE && req.uri().path().starts_with("/mcp");
+    let mut res = next.run(req).await;
+    if is_close && res.status() == StatusCode::ACCEPTED {
+        *res.status_mut() = StatusCode::NO_CONTENT;
+        *res.body_mut() = axum::body::Body::empty();
+    }
+    res
 }
 
 /// Resolve the caller and attach an [`Identity`] to the request (REST
