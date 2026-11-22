@@ -12,6 +12,7 @@ pub mod redact;
 pub mod retention;
 pub mod review;
 pub mod store;
+pub mod sync;
 pub mod transfer;
 
 pub use brief::Brief;

@@ -58,6 +58,11 @@ impl Remote {
 struct ConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<Remote>,
+    /// One stable id per server, used to mark pushed changes so the pusher can
+    /// skip its own echo on pull. Kept here (not just in `sync_state`) so a
+    /// removed and re-added project keeps the same id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sync_ids: BTreeMap<String, String>,
 }
 
 /// The user's home directory (`HOME`, or `USERPROFILE` on Windows).
@@ -117,6 +122,18 @@ fn write_private(path: &Path, text: &str) -> anyhow::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// This machine's stable sync id for `url`, creating it on first use.
+/// The id is only written to the private config file, never sent as a
+/// credential; the server echoes it back on changes this client pushed.
+pub fn sync_id(url: &str) -> anyhow::Result<String> {
+    let url = Remote::new(url, None)?.url;
+    let p = path()?;
+    let mut cfg = load_file()?;
+    let id = cfg.sync_ids.entry(url.clone()).or_insert_with(memdusa_core::model::new_id).clone();
+    write_private(&p, &(serde_json::to_string_pretty(&cfg)? + "\n"))?;
+    Ok(id)
 }
 
 pub fn save_remote(remote: Option<Remote>) -> anyhow::Result<PathBuf> {

@@ -20,6 +20,7 @@ mod proxy;
 mod remote;
 mod self_update;
 mod spool;
+mod sync;
 mod transcripts;
 
 use std::path::{Path, PathBuf};
@@ -160,8 +161,17 @@ enum Cmd {
     Logout,
     /// Show whether this machine uses a local database or a remote server, and check it.
     Status,
-    /// Send hook events queued while the server was unreachable.
-    Sync,
+    /// Replicate opted-in projects between the local database and the team server.
+    /// Without a subcommand: push local changes, then pull remote ones (one shot).
+    Sync {
+        #[command(subcommand)]
+        cmd: Option<sync::SyncCmd>,
+    },
+    /// Inspect memories (superseded versions kept by sync conflicts).
+    Memories {
+        #[command(subcommand)]
+        cmd: MemoriesCmd,
+    },
     /// Write all data as JSON Lines (memories, events, checkpoints, runs; not users or keys).
     Export {
         /// Only this project (default: everything).
@@ -472,6 +482,12 @@ enum KeyCmd {
 }
 
 #[derive(Subcommand)]
+enum MemoriesCmd {
+    /// Show superseded versions of a memory, newest first.
+    Revisions { id: String },
+}
+
+#[derive(Subcommand)]
 enum SessionCmd {
     /// List active sign-in sessions (your own, or everyone's with --user).
     List {
@@ -616,6 +632,16 @@ async fn run() -> anyhow::Result<()> {
         _ => {}
     }
 
+    // Sync needs both sides at once: the local database (the queue) and the
+    // logged-in server. Handle it before mode selection picks just one.
+    if let Cmd::Sync { cmd } = &cli.cmd {
+        let url = cli.database_url.clone().map_or_else(default_db_url, Ok)?;
+        let local = open_store(&url, false).await.with_context(|| format!("connecting to {url}"))?;
+        let remote = config::remote()?.context("sync needs a remote server; run `memdusa login <url>`")?;
+        let origin = config::sync_id(&remote.url)?;
+        return sync::run(cmd.clone(), &local, &remote, &origin).await;
+    }
+
     let project = cli.project.clone().or_else(project::detect_cwd);
     if let Cmd::Project = cli.cmd {
         println!("{}", project.as_deref().unwrap_or("<none>"));
@@ -653,7 +679,13 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Embed { all, only_project, .. } => {
             print_backfill(&store.embeddings_backfill(all, only_project.as_deref()).await?)
         }
-        Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
+        Cmd::Memories { cmd } => match cmd {
+            MemoriesCmd::Revisions { id } => {
+                for m in store.memory_revisions(&id).await? {
+                    print_revision(&m);
+                }
+            }
+        },
         Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
             let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
             transcripts::run(opts, transcripts::Backend::Local(&store)).await?;
@@ -843,6 +875,7 @@ async fn run() -> anyhow::Result<()> {
             print!("{}", review.markdown(&project, memdusa_core::model::now_ms()));
         }
         Cmd::Project
+        | Cmd::Sync { .. }
         | Cmd::Hook { .. }
         | Cmd::GitHook { .. }
         | Cmd::Install { .. }
@@ -921,11 +954,13 @@ async fn run_remote(
             print_backfill(&client()?.embeddings_backfill(all, only_project.as_deref()).await?)
         }
         Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
-        Cmd::Sync => {
-            let spool = spool::Spool::open()?;
-            let n = spool.flush(&client()?, &r.url).await?;
-            println!("synced {n} event(s); {} still queued", spool.len());
-        }
+        Cmd::Memories { cmd } => match cmd {
+            MemoriesCmd::Revisions { id } => {
+                for m in client()?.memory_revisions(&id).await? {
+                    print_revision(&m);
+                }
+            }
+        },
         Cmd::User { cmd } => {
             let c = client()?;
             match cmd {
@@ -1468,6 +1503,16 @@ fn print_created(k: &CreatedKey) {
 
 fn print_grant(g: &ProjectGrant) {
     println!("{:<36} {:<20} {:<6} created by {}  id {}", g.pattern, g.user, g.role.as_str(), g.created_by, g.id);
+}
+
+fn print_revision(m: &model::Memory) {
+    println!(
+        "{:<12} {:<12} {:<26} {}",
+        m.kind.as_str(),
+        ts(m.updated_at),
+        m.id,
+        m.content.chars().take(120).collect::<String>()
+    );
 }
 
 fn print_identity(i: &memdusa_core::oauth::UserIdentity) {

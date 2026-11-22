@@ -426,7 +426,7 @@ After `login`, everything on that machine uses the server:
 
 **When the server is unreachable**, nothing is lost:
 - Prompts, tool use, compaction and session end are queued in `~/.memdusa/spool/` and replayed (sorted by when they
-  happened, with their original timestamps) by the next hook that reaches the server, or by `memdusa sync`.
+  happened, with their original timestamps) by the next hook that reaches the server.
 - SessionStart serves the last cached brief, marked as possibly out of date.
 - `memdusa status` shows whether the server is reachable and how many events are queued.
 - Rejected requests (revoked key, bad input) are not queued, and delivery is at-least-once.
@@ -668,6 +668,52 @@ Test-only overrides for the upstream endpoints (`MEMDUSA_TEST_GITHUB_AUTH_URL`, 
 `MEMDUSA_TEST_GITHUB_API_URL`, `MEMDUSA_TEST_GOOGLE_DISCOVERY_URL`, `MEMDUSA_TEST_GOOGLE_JWKS_URL`,
 `MEMDUSA_TEST_GOOGLE_USERINFO_URL`) point the server at an in-process mock and are used by the test suite; do not
 set them in production.
+
+## Team server: sync
+
+Offline-first agents can keep working against a local database and replicate chosen projects to a team server with a
+one-shot `memdusa sync`. The local side is the logged-in server's opposite number: the local database is given by
+`--database-url` (default `~/.memdusa/memdusa.db`), the remote by `memdusa login` (API key **or** OAuth). Nothing
+leaves an opted-out project.
+
+```sh
+memdusa login https://memdusa.example.com --token mdk_…   # or --browser / --device (see above)
+memdusa sync add github.com/acme/shop                     # opt in; first run does a full push+pull
+memdusa sync add --all                                    # every project you can read on the server
+memdusa sync add --globals                                # opt in your private global memories (separate)
+memdusa sync                                              # push local changes, then pull remote ones
+memdusa sync list                                         # opted-in projects and cursors
+memdusa sync status                                       # last ok, pending changes, last error, conflicts
+memdusa sync remove github.com/acme/shop                  # stop syncing (local data is kept)
+memdusa memories revisions <id>                           # superseded versions of a memory
+```
+
+`memdusa sync add` is best effort: if the server is offline, the opt-in is still recorded and the next `memdusa sync`
+performs the initial full sync. Cursors live in the local `sync_state` table; a stable per-server client id in
+`~/.memdusa/config.json` marks changes you pushed, so your own echo comes back on pull but is skipped. Pushes are in
+batches of at most 500 changes and are idempotent (records have globally unique UUIDv7 ids). Pull pages have a cursor
+and `has_more`.
+
+**Conflict rules.** Every memory/event/checkpoint write appends a `changes` row in the same transaction, on both sides.
+- Events and checkpoints are insert-if-absent by id: no conflicts, no duplicates on re-push.
+- Memories are last-writer-wins by `updated_at`; ties go to the larger id (then larger content for an exact
+  millisecond race). The losing version is kept in `memory_revisions` on both sides and shown by `memdusa sync status`
+  / `memdusa memories revisions <id>`.
+- A delete wins unless the edit is **newer** than the tombstone's time. An older offline edit is ignored (and a stale
+  tombstone can't delete a newer edit). Ties favour the delete.
+- Push requires H1 write access, pull requires read access; both are audited as `sync.push` / `sync.pull` summaries
+  (counts only, never record bodies). A user can't push records attributed to another user; agent names are
+  re-qualified as `user/agent` on the server, like hooks are.
+
+**Retention and sync.** Prune deletes old events/checkpoints without writing tombstones. A pull of an `upsert` reads the
+current row and skips the change if the row was pruned, so a fresh client can't resurrect pruned data; real deletes
+(`op = delete`) need no row and always travel. A pruned local row is likewise skipped when pushing. The change log is
+append-only (seq cursors never reuse timestamps); the cursor advances past skipped changes.
+
+**Not synced:** runs/steps (server-authoritative), embeddings (each side embeds its own pulled memories if an embedder
+is configured), users/keys/grants/audit/OAuth. Global memories are private to their server-side owner and need their
+own opt-in. Background `--watch` (H3b) and a sync mode that redirects hooks to the local DB are not part of this
+one-shot implementation.
 
 ## MCP tools
 

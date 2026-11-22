@@ -782,7 +782,7 @@ async fn v3_database_migrates_to_v4_and_backfills() {
     raw.close().await;
 
     let s = Store::connect(&url).await.unwrap();
-    assert_eq!(s.migrate().await.unwrap(), 10);
+    assert_eq!(s.migrate().await.unwrap(), 11);
     // v5: steps can be delegated and leased
     let run = s.run_delegate(&p, "after migration", vec!["t".into()], None).await.unwrap();
     assert!(matches!(
