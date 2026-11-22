@@ -154,11 +154,13 @@ pub fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The terms a full-text query is built from: [`words`], at most 24. This is
-/// the only form user text takes in a query, so FTS5/tsquery syntax characters
-/// can't get through.
+/// The terms a full-text query is built from: the [`significant_words`] of the text, at most 24.
+/// This is the only form user text takes in a query, so FTS5/tsquery syntax characters can't get
+/// through. Stopwords and short words are dropped here (not from the index): matching "the" or
+/// "is" says nothing about relevance. A query made only of those yields no terms and matches
+/// nothing — falling back to the raw words is exactly the bug this avoids.
 pub fn search_terms(text: &str) -> Vec<String> {
-    let mut w = words(text);
+    let mut w = significant_words(text);
     w.truncate(MAX_SEARCH_TERMS);
     w
 }
@@ -167,14 +169,22 @@ pub fn search_terms(text: &str) -> Vec<String> {
 pub(crate) const NEAR_DUPLICATE: f64 = 0.75;
 /// How many full-text candidates are compared when looking for a near-duplicate.
 const NEAR_DUPLICATE_CANDIDATES: i64 = 10;
+/// Common English glue and question words. Shared by near-duplicate detection and full-text query
+/// building, so neither hinges on "the"/"is" matching. Words shorter than 3 chars are filtered
+/// separately by [`significant_words`] (many of the glues below are already covered by that rule,
+/// but listing the recognizable ones keeps the intent explicit).
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "has", "have", "had", "its", "not",
     "but", "you", "all", "can", "will", "our", "their", "they", "them", "into", "also", "any", "than", "then", "when",
-    "which",
+    "which", "what", "how", "why", "who", "where", "is", "be", "do", "does", "did", "of", "to", "in", "on", "at", "by",
+    "it", "as", "an", "or", "if", "so", "we", "us", "me", "my", "your", "there", "here", "about", "should", "would",
+    "could", "just", "some", "more", "most", "very", "need", "want", "please", "lets",
+    "let", // "let's" tokenizes to "let" + "s"
 ];
 
-/// The words that carry a memory's meaning: [`words`] without short words and stopwords.
-fn significant_words(text: &str) -> Vec<String> {
+/// The words that carry a text's meaning: [`words`] without short words and stopwords.
+/// This is the single filter behind both near-duplicate detection and [`search_terms`].
+pub fn significant_words(text: &str) -> Vec<String> {
     words(text).into_iter().filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str())).collect()
 }
 
@@ -675,7 +685,8 @@ impl Store {
         let terms = f.query.as_deref().map(search_terms);
         let limit = f.limit.unwrap_or(20).clamp(1, 200);
         let ranked = match &terms {
-            // a query with nothing searchable in it (only punctuation) matches nothing
+            // a query with nothing searchable in it (only punctuation, stopwords or short words)
+            // matches nothing; using the raw words instead is what made "the"/"is" match everything
             Some(t) if t.is_empty() && f.query.as_deref().is_some_and(|s| !s.trim().is_empty()) => return Ok(vec![]),
             Some(t) if !t.is_empty() => Some(t),
             _ => None,
@@ -1483,5 +1494,22 @@ mod tests {
             super::sqlite_url(Path::new(r"C:\Users\a\.memdusa\memdusa.db")),
             "sqlite:C:/Users/a/.memdusa/memdusa.db"
         );
+    }
+
+    #[test]
+    fn search_terms_drop_stopwords_and_short_words() {
+        use super::{search_terms, significant_words};
+        assert_eq!(search_terms("what color is the sky"), ["color", "sky"]);
+        assert_eq!(search_terms("release docker"), ["release", "docker"]);
+        // queries with no searchable terms match nothing (no fallback to the raw words)
+        assert!(search_terms("is it").is_empty());
+        assert!(search_terms("do it").is_empty());
+        assert!(search_terms("a an").is_empty());
+        assert!(search_terms("!!!").is_empty());
+        assert!(search_terms("   ").is_empty());
+        // `let's` tokenizes to "let" + "s"; both are dropped
+        assert_eq!(search_terms("let's ship it"), ["ship"]);
+        // full-text queries and near-duplicate detection use the same filter
+        assert_eq!(search_terms("the release workflow"), significant_words("the release workflow"));
     }
 }
