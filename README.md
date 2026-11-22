@@ -394,6 +394,15 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
 - [x] Ranked full-text memory search
 - [x] Relevant memories injected on each prompt
+- [ ] **Easy installation on every platform** (today: download a release archive, `cargo install`, or Docker)
+  - macOS/Linux: a Homebrew tap (`brew install krishnacore/tap/memdusa`) whose formula the release workflow updates
+    automatically (version, URLs, SHA-256 per platform); later, a homebrew-core submission
+  - one-line install script (`curl -fsSL …/install.sh | sh`) that picks the right archive, verifies its checksum and
+    installs to `~/.local/bin`, plus a PowerShell equivalent for Windows
+  - Windows: Scoop bucket and winget manifest, generated per release
+  - `cargo binstall memdusa` (metadata pointing at the release archives) and publishing to crates.io
+  - Linux packages (`.deb`/`.rpm`) and an AUR package; container images are already published to GHCR
+  - `memdusa self-update` that uses the same release archives and checksums
 - [ ] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
       OpenCode or Codex workers via `hc`, or a harness's own subagents). Observed while building memdusa itself:
       when a worker hit its usage limit, its replacement in another harness started from scratch. Ideas:
