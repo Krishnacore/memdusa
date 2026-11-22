@@ -8,6 +8,8 @@
 //!   checkpointed for a while.
 //! * `PreCompact` / `SessionEnd`: write an automatic fallback checkpoint if the
 //!   agent didn't save one, so nothing is lost.
+//! * `Git`: journal commits, branch switches and merges collected by
+//!   `memdusa git-hook` (whoever made them).
 //!
 //! A hook must never break the session: every failure is logged to stderr and
 //! the process exits 0 with no output.
@@ -28,6 +30,8 @@ pub enum HookEvent {
     Stop,
     PreCompact,
     SessionEnd,
+    /// Commits, branch switches and merges, collected by `memdusa git-hook`.
+    Git,
 }
 
 impl HookEvent {
@@ -40,6 +44,7 @@ impl HookEvent {
             Self::Stop => "stop",
             Self::PreCompact => "pre-compact",
             Self::SessionEnd => "session-end",
+            Self::Git => "git",
         }
     }
 
@@ -48,6 +53,7 @@ impl HookEvent {
     pub fn timeout_secs(self) -> u64 {
         match self {
             Self::SessionStart | Self::SessionEnd | Self::PreCompact => 10,
+            Self::Git => 3,
             _ => 5,
         }
     }
@@ -87,6 +93,15 @@ pub struct HookInput {
     /// SessionEnd
     #[serde(default)]
     pub reason: Option<String>,
+    /// Git: `commit`, `checkout` or `merge`.
+    #[serde(default)]
+    pub git_event: Option<String>,
+    /// Git: one-line summary for the journal.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Git: structured facts (sha, branch, files, ...).
+    #[serde(default)]
+    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +153,7 @@ impl HookEvent {
     /// unreachable now. SessionStart and Stop produce output that is only
     /// useful in the moment, so they aren't queued.
     pub fn queueable(self) -> bool {
-        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd)
+        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd | Self::Git)
     }
 }
 
@@ -230,6 +245,16 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
             let reason = input.reason.as_deref().unwrap_or("other");
             auto_checkpoint(&ctx, &format!("session end ({reason})")).await?;
             log(&ctx, "session_end", format!("session ended ({reason})"), None).await?;
+            Ok(None)
+        }
+        HookEvent::Git => {
+            let git_event = input.git_event.as_deref().unwrap_or_default();
+            if !matches!(git_event, "commit" | "checkout" | "merge") {
+                return Err(memdusa_core::Error::Invalid(format!(
+                    "git_event must be commit, checkout or merge (got {git_event:?})"
+                )));
+            }
+            log(&ctx, git_event, input.content.unwrap_or_default(), input.data).await?;
             Ok(None)
         }
     }
@@ -501,5 +526,42 @@ mod tests {
             assert!(ctx_text.contains(needle), "missing {needle}:\n{ctx_text}");
         }
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    }
+
+    #[tokio::test]
+    async fn git_events_are_logged_and_validated() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let content = "a1b2c3d on main: Add refunds (3 files)";
+
+        assert!(HookEvent::Git.queueable());
+        assert!(!HookEvent::Git.needs_git());
+        assert_eq!(HookEvent::Git.timeout_secs(), 3);
+
+        let out = handle(
+            HookEvent::Git,
+            input(json!({
+                "git_event": "commit",
+                "content": content,
+                "data": {"sha": "a1b2c3d4e5f6", "branch": "main", "subject": "Add refunds", "files": 3},
+            })),
+            ctx(&store, &cfg),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none(), "git hooks produce no output");
+
+        let events = store.events_recent("p", None, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "commit");
+        assert_eq!(events[0].content, content);
+        assert_eq!(events[0].data.as_ref().unwrap()["files"], 3);
+        assert_eq!(events[0].source.as_deref(), Some("claude-code"));
+
+        let err = handle(HookEvent::Git, input(json!({"git_event": "push", "content": "nope"})), ctx(&store, &cfg))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, memdusa_core::Error::Invalid(_)), "unknown git_event rejected: {err}");
+        assert_eq!(store.events_recent("p", None, 10).await.unwrap().len(), 1, "nothing recorded");
     }
 }

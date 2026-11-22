@@ -33,6 +33,39 @@ pub struct InstallOptions {
     pub uninstall: bool,
 }
 
+/// Git's native hook names, installed by `memdusa install git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GitHookKind {
+    #[value(name = "post-commit")]
+    Commit,
+    #[value(name = "post-checkout")]
+    Checkout,
+    #[value(name = "post-merge")]
+    Merge,
+}
+
+impl GitHookKind {
+    pub const ALL: [Self; 3] = [Self::Commit, Self::Checkout, Self::Merge];
+
+    /// Native hook file name, also the `memdusa git-hook` argument.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Commit => "post-commit",
+            Self::Checkout => "post-checkout",
+            Self::Merge => "post-merge",
+        }
+    }
+
+    /// `git_event` value recorded in the journal.
+    pub fn event(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Checkout => "checkout",
+            Self::Merge => "merge",
+        }
+    }
+}
+
 /// Where a harness keeps its hooks (and, for some, MCP servers).
 fn hooks_path(h: Harness, scope: Scope) -> anyhow::Result<PathBuf> {
     let home = || home_dir();
@@ -48,7 +81,9 @@ fn hooks_path(h: Harness, scope: Scope) -> anyhow::Result<PathBuf> {
         (Harness::Gemini, _) => ".gemini/settings.json".into(),
         (Harness::Antigravity, Scope::User) => home()?.join(".gemini/config/hooks.json"),
         (Harness::Antigravity, _) => ".agents/hooks.json".into(),
-        (Harness::OpenCode | Harness::Pi | Harness::Hermes, _) => bail!("{} has no JSON hooks file", h.agent()),
+        (Harness::OpenCode | Harness::Pi | Harness::Hermes | Harness::Git, _) => {
+            bail!("{} has no JSON hooks file", h.agent())
+        }
     })
 }
 
@@ -64,7 +99,7 @@ fn mcp_json_path(h: Harness, scope: Scope) -> anyhow::Result<Option<PathBuf>> {
             ".agents/mcp_config.json".into()
         }),
         Harness::Pi => Some(if user { home_dir()?.join(".pi/agent/mcp.json") } else { ".pi/mcp.json".into() }),
-        Harness::ClaudeCode | Harness::Codex | Harness::OpenCode | Harness::Hermes => None,
+        Harness::ClaudeCode | Harness::Codex | Harness::OpenCode | Harness::Hermes | Harness::Git => None,
     })
 }
 
@@ -237,6 +272,102 @@ pub fn merge_codex_toml(text: &str, bin: &str, uninstall: bool) -> String {
     s
 }
 
+/// Add or remove memdusa's line in one git hook script. Returns the new file
+/// content, or `None` when the file should be deleted (uninstall left only a
+/// shebang and blank lines). The user's other lines are never changed.
+pub fn merge_git_hook(existing: &str, line: &str, uninstall: bool) -> Option<String> {
+    let is_ours = |l: &str| l.trim_end().ends_with("# memdusa");
+    let lines: Vec<&str> = existing.lines().collect();
+
+    if uninstall {
+        if lines.iter().all(|l| l.trim().is_empty()) {
+            return None;
+        }
+        let kept: Vec<&str> = lines.into_iter().filter(|l| !is_ours(l)).collect();
+        // Nothing left but a shebang (and blank lines): our line was the whole hook.
+        if kept.iter().all(|l| l.trim().is_empty() || l.trim_start().starts_with("#!")) {
+            return None;
+        }
+        return Some(join_hook_lines(&kept, existing));
+    }
+
+    if lines.iter().all(|l| l.trim().is_empty()) {
+        return Some(format!("#!/bin/sh\n{line}\n"));
+    }
+
+    // Replace the first memdusa line (an older bin path); drop any duplicates.
+    let mut replaced = false;
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
+    for l in lines {
+        if is_ours(l) {
+            if !replaced {
+                out.push(line);
+                replaced = true;
+            }
+        } else {
+            out.push(l);
+        }
+    }
+    if !replaced {
+        out.push(line);
+    }
+    Some(join_hook_lines(&out, existing))
+}
+
+fn join_hook_lines(lines: &[&str], existing: &str) -> String {
+    let mut text = lines.join("\n");
+    if existing.ends_with('\n') || !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// The line `memdusa install git` adds to each hook. It can never fail the git
+/// operation (`|| true`) and never prints (`>/dev/null 2>&1`).
+fn git_hook_line(bin: &str, hook: &str) -> String {
+    format!("{} git-hook {hook} \"$@\" >/dev/null 2>&1 || true  # memdusa", shell_quote(bin))
+}
+
+/// `git rev-parse --git-path hooks`: respects `core.hooksPath` (e.g. Husky).
+fn git_hooks_dir() -> anyhow::Result<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("running git (is git installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("not in a git repository: {}", err.trim());
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if path.as_os_str().is_empty() {
+        bail!("git did not report a hooks directory");
+    }
+    Ok(if path.is_absolute() { path } else { std::env::current_dir()?.join(path) })
+}
+
+fn make_executable(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Write a hook atomically (write-then-rename), without leaving a backup in
+/// the hooks directory. Our merge only touches memdusa's own line.
+fn write_hook(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("memdusa-tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn read_json(path: &Path) -> anyhow::Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => {
@@ -268,7 +399,7 @@ fn json_text(v: &Value) -> anyhow::Result<String> {
 
 pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     let h = opts.harness;
-    if opts.scope == Scope::Local && h != Harness::ClaudeCode {
+    if opts.scope == Scope::Local && !matches!(h, Harness::ClaudeCode | Harness::Git) {
         bail!("--scope local is only for Claude Code; use --scope project");
     }
     let bin = match &opts.bin {
@@ -278,6 +409,7 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     match h {
         Harness::OpenCode | Harness::Pi => return install_plugin(&opts, &bin),
         Harness::Hermes => return install_hermes(&opts, &bin),
+        Harness::Git => return install_git_hooks(&opts, &bin),
         _ => {}
     }
 
@@ -370,7 +502,7 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
              interactive session, or run with --accept-hooks."
                 .into(),
         ),
-        Harness::ClaudeCode => {}
+        Harness::Git | Harness::ClaudeCode => {}
     }
     Ok(n)
 }
@@ -555,6 +687,46 @@ fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
             println!("\nnote: {note}");
         }
         println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
+}
+
+/// `memdusa install git` / `uninstall git`: merge our line into the repo's
+/// `post-commit`, `post-checkout` and `post-merge` hooks.
+fn install_git_hooks(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    let dir = git_hooks_dir()?;
+    for hook in GitHookKind::ALL {
+        let path = dir.join(hook.name());
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = git_hook_line(bin, hook.name());
+        match merge_git_hook(&old, &line, opts.uninstall) {
+            None => {
+                if opts.dry_run {
+                    println!("# would remove {}", path.display());
+                } else if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    println!("removed memdusa git hook {}", path.display());
+                }
+            }
+            Some(text) if text == old => {
+                if !opts.dry_run {
+                    make_executable(&path)?;
+                }
+                println!("memdusa {} already up to date in {}", hook.name(), path.display());
+            }
+            Some(text) => {
+                if opts.dry_run {
+                    println!("# {} (dry run)\n{text}", path.display());
+                } else {
+                    write_hook(&path, &text)?;
+                    make_executable(&path)?;
+                    println!("installed memdusa {} hook in {}", hook.name(), path.display());
+                }
+            }
+        }
+    }
+    if !opts.uninstall && !opts.dry_run {
+        println!("\nDone. Commits, branch switches and merges in this repo will be recorded.");
     }
     Ok(())
 }
@@ -751,5 +923,58 @@ mod tests {
             merge_hermes_yaml("hooks:\n  on_session_start: []\n", BIN, true, false).is_err(),
             "won't clobber existing hooks"
         );
+    }
+
+    #[test]
+    fn git_hook_creates_appends_and_is_idempotent() {
+        let line = git_hook_line(BIN, "post-commit");
+
+        // new file: shebang plus our line
+        let fresh = merge_git_hook("", &line, false).unwrap();
+        assert_eq!(fresh, format!("#!/bin/sh\n{line}\n"));
+
+        // existing user hook: their lines are untouched, ours is appended
+        let user = "#!/bin/sh\nnpm test\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(added, format!("{user}{line}\n"));
+        assert!(added.starts_with(user), "user lines unchanged");
+
+        // re-installing does not duplicate
+        assert_eq!(merge_git_hook(&added, &line, false).unwrap(), added);
+    }
+
+    #[test]
+    fn git_hook_replaces_an_old_bin_path() {
+        let old = "/old/bin/memdusa git-hook post-commit \"$@\" >/dev/null 2>&1 || true  # memdusa";
+        let existing = format!("#!/bin/sh\necho user hook\n{old}\n");
+        let line = git_hook_line(BIN, "post-commit");
+        let merged = merge_git_hook(&existing, &line, false).unwrap();
+        assert_eq!(merged, format!("#!/bin/sh\necho user hook\n{line}\n"));
+        assert!(!merged.contains("/old/bin/memdusa"));
+        assert_eq!(merged.matches("# memdusa").count(), 1);
+    }
+
+    #[test]
+    fn git_hook_uninstall_restores_or_deletes() {
+        let line = git_hook_line(BIN, "post-merge");
+        let user = "#!/bin/sh\nmake check\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merge_git_hook(&added, &line, true).unwrap(), user, "user's file restored");
+
+        // a file that only existed for us is deleted
+        let ours = merge_git_hook("", &line, false).unwrap();
+        assert_eq!(merge_git_hook(&ours, &line, true), None);
+        assert_eq!(merge_git_hook("#!/bin/sh\n", &line, true), None);
+    }
+
+    #[test]
+    fn git_hook_quotes_bin_paths_and_names_the_event() {
+        let line = git_hook_line("/Users/me/my tools/memdusa", "post-checkout");
+        assert_eq!(
+            line,
+            "'/Users/me/my tools/memdusa' git-hook post-checkout \"$@\" >/dev/null 2>&1 || true  # memdusa"
+        );
+        assert_eq!(GitHookKind::Checkout.event(), "checkout");
+        assert_eq!(GitHookKind::Merge.name(), "post-merge");
     }
 }

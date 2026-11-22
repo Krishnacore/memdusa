@@ -10,7 +10,8 @@ mod proxy;
 mod remote;
 mod spool;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -153,6 +154,14 @@ enum Cmd {
         /// Ask for a checkpoint on Stop when files changed and the last one is older than N minutes (0 = off).
         #[arg(long, env = "MEMDUSA_STOP_GUARD_MINS", default_value_t = 15)]
         stop_guard_mins: i64,
+    },
+    /// Record a git hook event. Installed by `memdusa install git`.
+    GitHook {
+        #[arg(value_enum)]
+        hook: install::GitHookKind,
+        /// Arguments git passes to the hook (checkout: prev, new, flag; merge: squash).
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Wire memdusa into a harness: installs its hooks and registers the MCP server.
     Install {
@@ -347,6 +356,18 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Cmd::GitHook { hook, args } => {
+            // Git hooks must never fail a git operation or print to stdout.
+            let deadline = Duration::from_millis(2500);
+            let result =
+                tokio::time::timeout(deadline, run_git_hook(hook, &args, cli.project, cli.database_url, deadline))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
+            if let Err(e) = result {
+                eprintln!("memdusa git-hook {}: {e:#}", hook.name());
+            }
+            return Ok(());
+        }
         Cmd::Login { url, token } => {
             let r = config::Remote::new(&url, token)?;
             let info = remote::Client::new(r.clone(), Duration::from_secs(10))?
@@ -472,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Project
         | Cmd::Hook { .. }
+        | Cmd::GitHook { .. }
         | Cmd::Install { .. }
         | Cmd::Uninstall { .. }
         | Cmd::Login { .. }
@@ -607,6 +629,118 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
     Ok(())
 }
 
+/// Collect facts about a git hook event and send them through the hook pipeline.
+/// The git hook wrapper always exits 0, so any error here only reaches stderr.
+async fn run_git_hook(
+    kind: install::GitHookKind,
+    args: &[String],
+    project: Option<String>,
+    database_url: Option<String>,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let Some(input) = git_hook_input(kind, args, &cwd)? else { return Ok(()) };
+    let agent =
+        std::env::var("MEMDUSA_AGENT").ok().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| "git".to_owned());
+    let config = hooks::HookConfig { agent, journal_prompts: true, stop_guard_mins: 0 };
+    run_hook_input(hooks::HookEvent::Git, adapters::Harness::Git, config, input, project, database_url, deadline)
+        .await?;
+    Ok(())
+}
+
+/// Facts for one git hook, or `None` when the hook should record nothing
+/// (a file checkout, or a branch switch that stayed on the same branch).
+fn git_hook_input(
+    kind: install::GitHookKind,
+    args: &[String],
+    dir: &Path,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let root = git(dir, &["rev-parse", "--show-toplevel"])?;
+    let head_sha = || git(dir, &["rev-parse", "HEAD"]);
+    let short_sha =
+        |sha: &str| git(dir, &["rev-parse", "--short", sha]).unwrap_or_else(|_| sha.chars().take(7).collect());
+    let branch = |short: &str| {
+        git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .filter(|b| !b.is_empty() && b != "HEAD")
+            .unwrap_or_else(|| short.to_owned())
+    };
+
+    let (content, data) = match kind {
+        install::GitHookKind::Commit => {
+            let full = head_sha()?;
+            let short = short_sha(&full);
+            let subject = git(dir, &["log", "-1", "--pretty=%s"])?;
+            let branch = branch(&short);
+            let changed = git(dir, &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])?;
+            let files = changed.lines().filter(|l| !l.trim().is_empty()).count();
+            let content = format!("{short} on {branch}: {subject} ({files} files)");
+            (
+                content,
+                serde_json::json!({
+                    "sha": full, "branch": branch, "subject": subject, "files": files
+                }),
+            )
+        }
+        install::GitHookKind::Checkout => {
+            let (Some(prev), Some(new), Some(flag)) = (args.first(), args.get(1), args.get(2)) else {
+                return Ok(None);
+            };
+            // flag 1 = branch checkout; 0 is a file checkout, which is not an event.
+            if flag != "1" {
+                return Ok(None);
+            }
+            let to = branch(&short_sha(new));
+            let from = git(dir, &["rev-parse", "--abbrev-ref", "@{-1}"])
+                .ok()
+                .filter(|b| !b.is_empty() && b != "HEAD")
+                .unwrap_or_else(|| short_sha(prev));
+            // `git checkout -b x` keeps HEAD but changes the branch; `git checkout main`
+            // while already on main changes neither.
+            if prev == new && from == to {
+                return Ok(None);
+            }
+            let content = format!("switched from {from} to {to}");
+            (
+                content,
+                serde_json::json!({
+                    "from": from, "to": to, "prev": prev, "new": new
+                }),
+            )
+        }
+        install::GitHookKind::Merge => {
+            let squash = args.first().is_some_and(|a| a == "1");
+            let full = head_sha()?;
+            let short = short_sha(&full);
+            let subject = git(dir, &["log", "-1", "--pretty=%s"])?;
+            let branch = branch(&short);
+            let content = format!("merged into {branch}: {subject}");
+            (
+                content,
+                serde_json::json!({
+                    "branch": branch, "sha": full, "squash": squash
+                }),
+            )
+        }
+    };
+
+    Ok(Some(serde_json::json!({
+        "cwd": root,
+        "git_event": kind.event(),
+        "content": content,
+        "data": data,
+    })))
+}
+
+/// Run git in `dir`; stdout is trimmed. Non-zero exit is an error (with stderr).
+fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+    if !out.status.success() {
+        anyhow::bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 async fn run_hook(
     event: hooks::HookEvent,
     harness: adapters::Harness,
@@ -619,6 +753,20 @@ async fn run_hook(
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
     let native: serde_json::Value =
         if raw.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(&raw)? };
+    run_hook_input(event, harness, config, native, project, database_url, deadline).await
+}
+
+/// The rest of [`run_hook`], on an already-built payload. `memdusa git-hook`
+/// reuses it so git events go through exactly the same pipeline.
+async fn run_hook_input(
+    event: hooks::HookEvent,
+    harness: adapters::Harness,
+    config: hooks::HookConfig,
+    native: serde_json::Value,
+    project: Option<String>,
+    database_url: Option<String>,
+    deadline: Duration,
+) -> anyhow::Result<Option<String>> {
     // Translate the harness's payload into memdusa's canonical one (or ignore this event).
     let Some(mut input) = harness.normalize(event, native) else { return Ok(None) };
 
@@ -782,4 +930,46 @@ fn print_key(k: &ApiKey) {
 fn print_created(k: &CreatedKey) {
     println!("\nAPI key for {} ({}). Shown once, store it now:\n\n  {}\n", k.key.user, k.key.name, k.secret);
     println!("Use it on a machine with:  memdusa login <server-url> --token {}", k.secret);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real repository, so the collector is tested against real git output.
+    #[test]
+    fn git_hook_collects_commit_facts_from_a_real_repo() {
+        let dir = std::env::temp_dir().join(format!("memdusa-git-hook-{}", model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        git(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&dir, &["config", "user.name", "Test User"]).unwrap();
+        git(&dir, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::create_dir_all(dir.join(".git/empty-hooks")).unwrap();
+        git(&dir, &["config", "core.hooksPath", ".git/empty-hooks"]).unwrap();
+
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        git(&dir, &["add", "README.md"]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "Initial commit"]).unwrap();
+
+        std::fs::write(dir.join("refunds.rs"), "fn refunds() {}\n").unwrap();
+        std::fs::write(dir.join("refunds_test.rs"), "#[test] fn t() {}\n").unwrap();
+        git(&dir, &["add", "."]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "Add refunds"]).unwrap();
+
+        let input = git_hook_input(install::GitHookKind::Commit, &[], &dir).unwrap().expect("commit event");
+        let data = &input["data"];
+        assert_eq!(input["git_event"], "commit");
+        assert_eq!(data["subject"], "Add refunds");
+        assert_eq!(data["branch"], "main");
+        assert_eq!(data["files"], 2);
+        assert_eq!(data["sha"], git(&dir, &["rev-parse", "HEAD"]).unwrap());
+        let cwd = input["cwd"].as_str().expect("cwd is recorded");
+        assert_eq!(cwd, git(&dir, &["rev-parse", "--show-toplevel"]).unwrap());
+        assert!(Path::new(cwd).is_dir(), "cwd is the repo root");
+        assert!(input["content"].as_str().unwrap().contains("Add refunds"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -112,6 +112,18 @@ Things to know per tool:
 
 Any other MCP client can use memdusa as a plain MCP server (`memdusa mcp --agent <name>`), without hooks.
 
+### Git hooks
+
+```sh
+memdusa install git       # in the repo; per clone
+memdusa uninstall git
+```
+
+Commits, branch switches and merges are recorded as events in the journal, whoever made them (any agent or a human),
+through the same hook pipeline as the harness hooks (redaction, offline queue, remote mode). The hooks run in the
+background and never block or fail a git command. They are installed in `git rev-parse --git-path hooks`, so
+`core.hooksPath` (for example Husky) is respected. Existing user hooks are kept; memdusa only adds its own line.
+
 ## Retention
 
 History grows with every edit and command. To keep the database and the brief fast:
@@ -308,7 +320,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [ ] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
 - [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
 - [x] Handoff eval with real agents (`eval/`)
-- [ ] Git hooks (commits, branch switches) as events
+- [x] Git hooks (commits, branch switches) as events
 - [ ] Transcript import (Claude Code, Codex, pi, OpenCode sessions)
 - [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories

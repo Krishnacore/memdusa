@@ -28,6 +28,8 @@ pub enum Harness {
     Pi,
     /// Nous Research's Hermes Agent: shell hooks in ~/.hermes/config.yaml.
     Hermes,
+    /// Git hooks (post-commit, post-checkout, post-merge) in the repo's hooks directory.
+    Git,
 }
 
 /// One native hook the installer registers.
@@ -57,6 +59,7 @@ impl Harness {
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
             Self::Hermes => "hermes",
+            Self::Git => "git",
         }
     }
 
@@ -123,6 +126,8 @@ impl Harness {
             ],
             // Plugin-based: their plugins call `memdusa hook` directly with canonical payloads.
             Self::OpenCode | Self::Pi => vec![],
+            // Installed as git hooks, not harness hooks: `memdusa install git` writes them.
+            Self::Git => vec![],
         }
     }
 
@@ -131,7 +136,7 @@ impl Harness {
     pub fn normalize(self, event: HookEvent, input: Value) -> Option<Value> {
         let Value::Object(mut o) = input else { return Some(input) };
         match self {
-            Self::ClaudeCode => {}
+            Self::ClaudeCode | Self::Git => {}
             Self::Codex => {
                 if event == HookEvent::PostToolUse && o.get("tool_name").and_then(Value::as_str) == Some("apply_patch")
                 {
@@ -251,7 +256,7 @@ impl Harness {
         let reason = v.get("reason").and_then(Value::as_str);
         let rendered = match (self, event) {
             // Claude Code and Codex share the canonical format; OpenCode/pi plugins read it
-            (Self::ClaudeCode | Self::Codex | Self::OpenCode | Self::Pi, _) => return Some(out),
+            (Self::ClaudeCode | Self::Codex | Self::OpenCode | Self::Pi | Self::Git, _) => return Some(out),
             (Self::Gemini, HookEvent::SessionStart) => return Some(out), // same hookSpecificOutput shape
             (Self::Gemini, HookEvent::Stop) => json!({ "decision": "deny", "reason": reason? }),
             (Self::Cursor, HookEvent::SessionStart) => json!({ "additional_context": context? }),
