@@ -162,7 +162,7 @@ pub fn search_terms(text: &str) -> Vec<String> {
 }
 
 /// Jaccard similarity from which a saved memory counts as a near-duplicate of an existing one.
-const NEAR_DUPLICATE: f64 = 0.75;
+pub(crate) const NEAR_DUPLICATE: f64 = 0.75;
 /// How many full-text candidates are compared when looking for a near-duplicate.
 const NEAR_DUPLICATE_CANDIDATES: i64 = 10;
 const STOPWORDS: &[&str] = &[
@@ -183,7 +183,7 @@ fn same_word(a: &str, b: &str) -> bool {
 }
 
 /// Jaccard similarity (0..=1) of the significant word sets of two texts.
-fn similarity(a: &str, b: &str) -> f64 {
+pub(crate) fn similarity(a: &str, b: &str) -> f64 {
     let (wa, wb) = (significant_words(a), significant_words(b));
     if wa.is_empty() || wb.is_empty() {
         return 0.0;

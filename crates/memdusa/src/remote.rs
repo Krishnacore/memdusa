@@ -151,6 +151,10 @@ impl Client {
         Ok(self.send(self.request(Method::GET, "/v1/memories").query(&Query(q))).await?)
     }
 
+    pub async fn memory_review(&self, project: &str) -> anyhow::Result<memdusa_core::review::MemoryReview> {
+        Ok(self.send(self.request(Method::GET, "/v1/memories/review").query(&[("project", project)])).await?)
+    }
+
     pub async fn prune(
         &self,
         policy: &memdusa_core::retention::RetentionPolicy,

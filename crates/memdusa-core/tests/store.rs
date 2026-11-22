@@ -1188,3 +1188,102 @@ async fn coordinator_brief_shows_each_tasks_step_status() {
         assert!(w.delegated.is_empty() && !w.markdown.contains("Delegated work"), "{name}");
     }
 }
+
+#[tokio::test]
+async fn review_groups_related_memories_of_same_kind_and_scope() {
+    for (name, s) in stores().await {
+        let p = Some(project());
+        let save = |kind: MemoryKind, project: &Option<String>, content: &str| {
+            s.memory_save(NewMemory { kind, ..mem(project, content, &[]) })
+        };
+        let a = save(MemoryKind::Fact, &p, "Payments webhook retries use exponential backoff").await.unwrap();
+        let b = save(MemoryKind::Fact, &p, "Payments webhook retries use capped backoff delays").await.unwrap();
+        assert_ne!(a.id, b.id, "{name}: related, not near-duplicate");
+        // same words but another kind: not grouped
+        let other_kind =
+            save(MemoryKind::Note, &p, "Payments webhook retries use jittered backoff delays").await.unwrap();
+        // unrelated
+        let c = save(MemoryKind::Fact, &p, "Database migrations run at startup").await.unwrap();
+
+        let r = s.memory_review(p.as_deref().unwrap(), None).await.unwrap();
+        let groups: Vec<Vec<&str>> = r
+            .related
+            .iter()
+            .map(|g| g.iter().map(|m| m.id.as_str()).collect())
+            .filter(|g: &Vec<&str>| g.contains(&a.id.as_str()))
+            .collect();
+        assert_eq!(groups.len(), 1, "{name}");
+        assert!(groups[0].contains(&b.id.as_str()) && groups[0].len() == 2, "{name}: {groups:?}");
+        let grouped: Vec<&str> = r.related.iter().flatten().map(|m| m.id.as_str()).collect();
+        assert!(!grouped.contains(&other_kind.id.as_str()) && !grouped.contains(&c.id.as_str()), "{name}");
+
+        let md = r.markdown(p.as_deref().unwrap(), now_ms());
+        assert!(md.contains(&a.id) && md.contains("Related memories"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn review_flags_stale_memories_and_old_todos() {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    for (name, s) in stores().await {
+        let p = project();
+        let stale = s.memory_save(mem(&Some(p.clone()), "Auth lives in src/auth/jwt.rs", &[])).await.unwrap();
+        let todo = s
+            .memory_save(NewMemory { kind: MemoryKind::Todo, ..mem(&Some(p.clone()), "Rotate the signing keys", &[]) })
+            .await
+            .unwrap();
+        pause().await;
+        s.event_append(NewEvent {
+            project: p.clone(),
+            kind: "file_change".into(),
+            content: "/repo/src/auth/jwt.rs".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let r = s.memory_review(&p, None).await.unwrap();
+        assert_eq!(r.stale.len(), 1, "{name}");
+        assert_eq!((r.stale[0].memory.id.as_str(), r.stale[0].path.as_str()), (stale.id.as_str(), "src/auth/jwt.rs"));
+        assert!(r.old.is_empty(), "{name}: a fresh todo is not old");
+
+        // 29 days later the todo is still fine, 31 days later it is old
+        let day = 86_400_000;
+        let r = s.memory_review_at(&p, None, todo.updated_at + 29 * day).await.unwrap();
+        assert!(r.old.is_empty(), "{name}");
+        let r = s.memory_review_at(&p, None, todo.updated_at + 31 * day).await.unwrap();
+        assert_eq!(r.old.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec![todo.id.as_str()], "{name}");
+        // only todos get old
+        assert!(r.old.iter().all(|m| m.kind == MemoryKind::Todo), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn brief_nudges_to_review_from_three_flagged_memories() {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    const NUDGE: &str = "may need consolidation: run the memory_review tool";
+    for (name, s) in stores().await {
+        let p = project();
+        for text in [
+            "Billing totals are computed in src/a_mod.rs",
+            "Cache eviction follows an LRU policy, see src/b_mod.rs",
+            "Webhook signatures get verified by src/c_mod.rs",
+        ] {
+            s.memory_save(mem(&Some(p.clone()), text, &[])).await.unwrap();
+        }
+        pause().await;
+        let change = |f: &str| NewEvent {
+            project: p.clone(),
+            kind: "file_change".into(),
+            content: format!("src/{f}_mod.rs"),
+            ..Default::default()
+        };
+        s.event_append(change("a")).await.unwrap();
+        s.event_append(change("b")).await.unwrap();
+        let two = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(!two.markdown.contains(NUDGE), "{name}: only 2 flagged\n{}", two.markdown);
+        s.event_append(change("c")).await.unwrap();
+        let three = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(three.markdown.contains("3 memories may need consolidation"), "{name}\n{}", three.markdown);
+    }
+}

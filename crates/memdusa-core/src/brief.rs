@@ -6,6 +6,7 @@ use std::fmt::Write;
 
 use crate::Result;
 use crate::model::*;
+use crate::review::{self, stale_hit};
 use crate::store::Store;
 
 /// Event kinds written automatically by harness hooks.
@@ -32,6 +33,8 @@ const TASK_CHECKPOINTS: i64 = 3;
 const DELEGATED_NEXT: usize = 3;
 /// How much of a compaction summary the brief quotes.
 const SUMMARY_CHARS: usize = 1_500;
+/// Flagged memories from which the brief suggests running `memory_review`.
+const REVIEW_NUDGE: usize = 3;
 /// Default character budget of the brief's Memory section.
 pub const MEMORY_BUDGET: usize = 4_000;
 /// Memories loaded when there is nothing to rank them by.
@@ -410,7 +413,7 @@ pub async fn build_with_budget(
         recent_events.retain(|e| e.session.as_deref().is_none_or(|s| mine.contains(s)));
     }
     let focus = focus_text(store, project, checkpoints.first()).await?;
-    let (memories, omitted) =
+    let (memories, omitted, review_total) =
         select_memories(store, project, user, focus.as_deref(), memory_budget, &recent_events).await?;
 
     // Drift is compared with the checkpoint from the caller's own worktree when there is one.
@@ -451,6 +454,7 @@ pub async fn build_with_budget(
         runs: &active_runs,
         memories: &memories,
         omitted,
+        review_total,
         events: &recent_events,
         git_warnings: &git_warnings,
         other_worktree_note: other_worktree_note.as_deref(),
@@ -504,7 +508,7 @@ async fn select_memories(
     focus: Option<&str>,
     budget: usize,
     events: &[Event],
-) -> Result<(Vec<Memory>, usize)> {
+) -> Result<(Vec<Memory>, usize, usize)> {
     let query = |query: Option<String>, limit: i64| MemoryQuery {
         query,
         project: Some(project.into()),
@@ -539,7 +543,9 @@ async fn select_memories(
         shown.push((*m).clone());
     }
     let omitted = ordered.len() - shown.len();
-    Ok((shown, omitted))
+    // approximate: only the candidates and the recent events already loaded, no second scan
+    let review_total = review::review(&candidates, events, now_ms()).total();
+    Ok((shown, omitted, review_total))
 }
 
 fn ago(ts: Millis) -> String {
@@ -650,46 +656,10 @@ fn bullets(out: &mut String, title: &str, items: &[String]) {
     out.push('\n');
 }
 
-const PATH_EXTENSIONS: &[&str] =
-    &["rs", "py", "ts", "tsx", "js", "go", "java", "rb", "md", "toml", "json", "yaml", "yml", "sql"];
-
-/// Path-like tokens of a text: contain `/` or end in a common source extension.
-fn paths_in(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = vec![];
-    for raw in text.split_whitespace() {
-        let t = raw
-            .trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
-            .trim_start_matches("./");
-        let t = t.trim_end_matches('.');
-        if t.is_empty() || t.contains("://") || t.ends_with('/') {
-            continue;
-        }
-        let ext = t.rsplit_once('.').map(|(_, e)| e).filter(|e| PATH_EXTENSIONS.contains(e));
-        if (t.contains('/') || ext.is_some()) && !out.iter().any(|p| p == t) {
-            out.push(t.to_owned());
-        }
-    }
-    out
-}
-
-/// A changed file `changed` is the memory's `path` when equal or one is a path suffix of the other.
-fn same_path(path: &str, changed: &str) -> bool {
-    let (a, b) = (path.trim_start_matches('/'), changed.trim_start_matches('/'));
-    a == b || changed.ends_with(&format!("/{a}")) || path.ends_with(&format!("/{b}"))
-}
-
 /// ` _(may be outdated: <path> changed <age>)_` when a `file_change` event touched a file the
 /// memory mentions after the memory was last updated.
 fn stale_note(m: &Memory, events: &[Event]) -> String {
-    let hit = paths_in(&m.content).into_iter().find_map(|p| {
-        events
-            .iter()
-            .filter(|e| e.kind == FILE_CHANGE && e.created_at > m.updated_at && same_path(&p, &e.content))
-            .map(|e| e.created_at)
-            .max()
-            .map(|at| (p, at))
-    });
-    hit.map(|(p, at)| format!(" _(may be outdated: {p} changed {})_", ago(at))).unwrap_or_default()
+    stale_hit(m, events).map(|(p, at)| format!(" _(may be outdated: {p} changed {})_", ago(at))).unwrap_or_default()
 }
 
 /// Memories grouped by kind, as Markdown (the body of the brief's Memory section).
@@ -730,6 +700,8 @@ struct Parts<'a> {
     runs: &'a [RunWithSteps],
     memories: &'a [Memory],
     omitted: usize,
+    /// Memories that [`review::review`] flags (approximate); the nudge shows from [`REVIEW_NUDGE`].
+    review_total: usize,
     events: &'a [Event],
     git_warnings: &'a [String],
     other_worktree_note: Option<&'a str>,
@@ -748,6 +720,7 @@ fn render(parts: &Parts) -> String {
         runs,
         memories,
         omitted,
+        review_total,
         events,
         git_warnings,
         other_worktree_note,
@@ -896,6 +869,9 @@ fn render(parts: &Parts) -> String {
                 o,
                 "_{omitted} more memories not shown: use the memory_search tool or `memdusa recall <query>` to see them._"
             );
+        }
+        if review_total >= REVIEW_NUDGE {
+            let _ = writeln!(o, "_{review_total} memories may need consolidation: run the memory_review tool._");
         }
         o.push('\n');
     }
