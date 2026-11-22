@@ -124,6 +124,26 @@ through the same hook pipeline as the harness hooks (redaction, offline queue, r
 background and never block or fail a git command. They are installed in `git rev-parse --git-path hooks`, so
 `core.hooksPath` (for example Husky) is respected. Existing user hooks are kept; memdusa only adds its own line.
 
+## Importing past sessions
+
+Work done before memdusa was installed, or in a tool without hooks, can still reach memdusa:
+
+```sh
+memdusa import-transcript claude-code --latest          # newest session for this repo
+memdusa import-transcript codex ~/.codex/sessions/2026/03/02/rollout-….jsonl
+memdusa import-transcript pi session1.jsonl session2.jsonl --dry-run
+```
+
+Supported: `claude-code` (`~/.claude/projects/…`), `codex` (`~/.codex/sessions/…`; `.zst`-compressed files are skipped,
+decompress them first) and `pi` (`~/.pi/agent/sessions/…`). A transcript becomes the events its hooks would have
+recorded (prompts, file changes, commands, with their original timestamps), followed by a session end, so the usual
+fallback checkpoint is written if files changed. It goes through the same pipeline as live hooks (redaction, remote
+mode, project detection from the transcript's recorded directory, or `--project`).
+
+- `--latest` picks the most recent session for the current directory's repo; otherwise pass the files.
+- Idempotent: a session that already has events is skipped, unless you pass `--force`.
+- `--dry-run` prints what would be imported (counts and time range) and writes nothing.
+
 ## Retention
 
 History grows with every edit and command. To keep the database and the brief fast:
@@ -335,7 +355,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Handoff eval with real agents (`eval/`)
 - [x] Git hooks (commits, branch switches) as events
 - [x] MCP resources and prompts (brief, memories, /resume)
-- [ ] Transcript import (Claude Code, Codex, pi, OpenCode sessions)
+- [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
 - [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories
 - [x] Per-user API keys, server-side attribution, private global memories
@@ -343,4 +363,3 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)
 - [x] Local → hosted migration (`export | import`)
 - [ ] Continuous local ⇄ hosted sync
-- [ ] Transcript import from Claude Code / Codex session files

@@ -297,7 +297,7 @@ fn command_text(v: &Value) -> String {
 }
 
 /// Files touched by an `apply_patch` patch (`*** Add/Update/Delete File: path`, `*** Move to: path`).
-fn patch_files(patch: &str) -> Vec<String> {
+pub(crate) fn patch_files(patch: &str) -> Vec<String> {
     let mut files: Vec<String> = vec![];
     for line in patch.lines() {
         let path = ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "]

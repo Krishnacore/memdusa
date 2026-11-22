@@ -9,6 +9,7 @@ mod project;
 mod proxy;
 mod remote;
 mod spool;
+mod transcripts;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -162,6 +163,22 @@ enum Cmd {
         /// Arguments git passes to the hook (checkout: prev, new, flag; merge: squash).
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Import saved agent sessions (work done before memdusa was installed, or without hooks).
+    ImportTranscript {
+        #[arg(value_enum)]
+        harness: transcripts::TranscriptHarness,
+        /// Transcript files.
+        files: Vec<PathBuf>,
+        /// The most recent session for the current directory's repo.
+        #[arg(long)]
+        latest: bool,
+        /// Import sessions that were already imported (or recorded by hooks).
+        #[arg(long)]
+        force: bool,
+        /// Print what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Wire memdusa into a harness: installs its hooks and registers the MCP server.
     Install {
@@ -405,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
         _ => Mode::detect(cli.database_url.clone())?,
     };
     let store = match &mode {
-        Mode::Remote(r) => return run_remote(cli.cmd, r, project).await,
+        Mode::Remote(r) => return run_remote(cli.cmd, r, project, cli.project).await,
         Mode::Local(url) => open_store(url).await.with_context(|| format!("connecting to {url}"))?,
     };
 
@@ -416,6 +433,10 @@ async fn main() -> anyhow::Result<()> {
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
+        Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
+            let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
+            transcripts::run(opts, transcripts::Backend::Local(&store)).await?;
+        }
         Cmd::Export { only_project, output } => {
             write_export(&transfer::to_jsonl(&store.export(only_project.as_deref()).await?), output)?
         }
@@ -521,7 +542,12 @@ impl Mode {
     }
 }
 
-async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> anyhow::Result<()> {
+async fn run_remote(
+    cmd: Cmd,
+    r: &config::Remote,
+    project: Option<String>,
+    explicit_project: Option<String>,
+) -> anyhow::Result<()> {
     let client = || remote::Client::new(r.clone(), Duration::from_secs(15));
     match cmd {
         Cmd::Status => {
@@ -540,6 +566,11 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
             }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
             println!("offline queue: {} event(s)", spool::Spool::open()?.len());
+        }
+        Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
+            let client = client()?;
+            let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: explicit_project };
+            transcripts::run(opts, transcripts::Backend::Remote(&client)).await?;
         }
         Cmd::Prune { dry_run, only_project, policy } => {
             print_prune(&client()?.prune(&policy.into(), only_project.as_deref(), dry_run).await?);

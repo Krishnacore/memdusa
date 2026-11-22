@@ -1,0 +1,12 @@
+{"timestamp":"2026-03-02T09:00:00.000Z","type":"session_meta","payload":{"id":"sess-codex-1","cwd":"/work/demo","originator":"codex_cli_rs"}}
+{"timestamp":"2026-03-02T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/work/demo</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-03-02T09:00:05.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the flaky login test"}]}}
+{"timestamp":"2026-03-02T09:00:05.100Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the flaky login test"}}
+{"timestamp":"2026-03-02T09:00:06.000Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}
+{"timestamp":"2026-03-02T09:00:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Looking at it."}]}}
+{"timestamp":"2026-03-02T09:00:10.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"cargo test login\"],\"workdir\":\"/work/demo\"}","call_id":"c1"}}
+{"timestamp":"2026-03-02T09:00:11.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"{\"output\":\"ok\"}"}}
+this line is not json
+{"timestamp":"2026-03-02T09:00:15.000Z","type":"something_new","payload":{"x":1}}
+{"timestamp":"2026-03-02T09:00:20.000Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/login.rs\\n@@\\n-a\\n+b\\n*** Add File: tests/login.rs\\n+x\\n*** End Patch\"}","call_id":"c2"}}
+{"timestamp":"2026-03-02T09:00:30.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"apply_patch <<'EOF'\\n*** Begin Patch\\n*** Update File: src/db.rs\\n@@\\n-a\\n+b\\n*** End Patch\\nEOF\"]}","call_id":"c3"}}
