@@ -924,6 +924,14 @@ fn render(parts: &Parts) -> String {
             .collect();
 
         let _ = writeln!(o, "## Recent activity");
+        let team = team_lines(events);
+        if !team.is_empty() {
+            let _ = writeln!(o, "**Who did what:**");
+            for line in &team {
+                let _ = writeln!(o, "- {line}");
+            }
+            o.push('\n');
+        }
         if !files.is_empty() {
             let _ = writeln!(o, "**Files changed recently:** {}\n", files.join(", "));
         }
@@ -935,7 +943,10 @@ fn render(parts: &Parts) -> String {
         if !commands.is_empty() {
             let _ = writeln!(o, "**Last commands:**");
             for e in commands {
-                let _ = writeln!(o, "- `{}` ({})", e.content, ago(e.created_at));
+                // with several agents at work, say whose command it was
+                let by =
+                    e.source.as_deref().filter(|_| !team.is_empty()).map(|s| format!(" [{s}]")).unwrap_or_default();
+                let _ = writeln!(o, "- `{}` ({}){by}", e.content, ago(e.created_at));
             }
             o.push('\n');
         }
@@ -948,6 +959,56 @@ fn render(parts: &Parts) -> String {
         }
     }
     o
+}
+
+/// Files shown per agent in "Who did what".
+const TEAM_FILES: usize = 3;
+
+/// One line per agent (event `source`) when more than one worked on the project recently: what each
+/// changed and ran, its delegated task, and when it was last active. Empty for a single agent, where
+/// attribution would only be noise. `events` are newest first.
+fn team_lines(events: &[Event]) -> Vec<String> {
+    let mut agents: Vec<&str> = vec![];
+    for e in events.iter().filter(|e| !matches!(e.kind.as_str(), STOP_GUARD | MEMORY_RECALL)) {
+        if let Some(s) = e.source.as_deref()
+            && !agents.contains(&s)
+        {
+            agents.push(s);
+        }
+    }
+    if agents.len() < 2 {
+        return vec![];
+    }
+    agents
+        .into_iter()
+        .map(|agent| {
+            let mine: Vec<&Event> = events.iter().filter(|e| e.source.as_deref() == Some(agent)).collect();
+            let mut files: Vec<&str> = vec![];
+            for e in mine.iter().filter(|e| e.kind == FILE_CHANGE) {
+                if !files.contains(&e.content.as_str()) {
+                    files.push(&e.content);
+                }
+            }
+            let commands = mine.iter().filter(|e| e.kind == COMMAND).count();
+            let task = mine.iter().find(|e| e.kind == DELEGATED_SESSION).and_then(|e| event_str(e, "task"));
+            let mut parts = vec![];
+            if let Some(t) = task {
+                parts.push(format!("task {t}"));
+            }
+            if !files.is_empty() {
+                let shown = files.iter().take(TEAM_FILES).copied().collect::<Vec<_>>().join(", ");
+                let more = files.len().saturating_sub(TEAM_FILES);
+                let more = if more > 0 { format!(" +{more} more") } else { String::new() };
+                parts.push(format!("changed {shown}{more}"));
+            }
+            if commands > 0 {
+                parts.push(format!("{commands} command{}", if commands == 1 { "" } else { "s" }));
+            }
+            let last = mine.iter().map(|e| e.created_at).max().map(ago).unwrap_or_default();
+            parts.push(format!("last active {last}"));
+            format!("**{agent}**: {}", parts.join("; "))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1060,5 +1121,45 @@ mod tests {
         assert_eq!(others, vec![("../wta".to_owned(), 2)], "paths shown relative to the caller");
         assert_eq!(display_worktree("/work/wta", Some("/work/wtb")), "../wta");
         assert_eq!(display_worktree("/work/wtb", Some("/work/wtb")), ".");
+    }
+
+    fn ev(source: &str, kind: &str, content: &str, data: Option<serde_json::Value>) -> Event {
+        Event {
+            id: new_id(),
+            project: "p".into(),
+            session: Some(format!("s-{source}")),
+            source: Some(source.into()),
+            kind: kind.into(),
+            content: content.into(),
+            data,
+            created_at: now_ms(),
+        }
+    }
+
+    #[test]
+    fn team_lines_attribute_work_only_when_several_agents_worked() {
+        let solo = vec![ev("claude-code", FILE_CHANGE, "a.rs", None)];
+        assert!(team_lines(&solo).is_empty(), "one agent: no attribution noise");
+
+        let events = vec![
+            ev("opencode", FILE_CHANGE, "install.sh", None),
+            ev("claude-code", COMMAND, "cargo test", None),
+            ev("opencode", FILE_CHANGE, "install.ps1", None),
+            ev("opencode", FILE_CHANGE, "install.sh", None),
+            ev("claude-code", FILE_CHANGE, "src/a.rs", None),
+            ev("opencode", DELEGATED_SESSION, "install", Some(serde_json::json!({ "task": "install" }))),
+        ];
+        let lines = team_lines(&events);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("**opencode**: task install; changed install.sh, install.ps1; last active"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("**claude-code**: changed src/a.rs; 1 command; last active"), "{}", lines[1]);
+
+        let many: Vec<Event> =
+            (0..5).map(|i| ev("opencode", FILE_CHANGE, &format!("f{i}.rs"), None)).chain(solo).collect();
+        assert!(team_lines(&many)[0].contains("changed f0.rs, f1.rs, f2.rs +2 more"), "{:?}", team_lines(&many));
     }
 }

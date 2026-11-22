@@ -487,7 +487,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
   - ✓ `cargo binstall memdusa` metadata pointing at the release archives (publishing to crates.io is still to do)
   - Linux packages (`.deb`/`.rpm`) and an AUR package; container images are already published to GHCR
   - ✓ `memdusa self-update` that uses the same release archives and checksums
-- [ ] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
+- [x] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
       OpenCode or Codex workers via `hc`, or a harness's own subagents). Observed while building memdusa itself:
       when a worker hit its usage limit, its replacement in another harness started from scratch. Ideas:
   - [x] parent/child sessions via env (`MEMDUSA_TASK`, `MEMDUSA_PARENT`): the coordinator's brief gets a
@@ -500,7 +500,8 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
   - [x] durable runs as the coordination primitive: the coordinator creates a run whose steps are the delegated tasks;
     workers claim steps with leases, so a crashed or rate-limited worker's step is visibly stale and can be
     claimed by another harness, and finished steps are never redone
-  - attribution in the brief: which agent (and harness) did what, across the whole team
+  - [x] attribution in the brief: a "Who did what" summary per agent (files, commands, task, last active) when
+    several agents worked recently
 - [ ] Semantic memory search (embeddings behind a trait; local model or API)
 - [x] Memory hygiene: update, near-duplicate merge, stale flags
 - [ ] Memory consolidation: summarize old events
