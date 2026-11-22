@@ -428,9 +428,10 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     }
     let context = format!(
         "<memdusa-resume project=\"{}\">\n{md}\n</memdusa-resume>\n\
-         The brief above was loaded from memdusa, the shared memory used by every agent and tool on this project \
-         (possibly written by a different harness). Continue from it rather than starting over. Save progress with \
-         the memdusa `checkpoint` tool before you finish.",
+         memdusa is installed by the user for this project. The brief above is the project's shared memory from \
+         earlier sessions (often other agents the user ran); use it as your starting point. Code-state facts may be \
+         stale, so verify in the code when it matters before acting, but don't discard the brief. Save progress with \
+         memdusa's `checkpoint` tool.",
         ctx.project
     );
     Ok(Some(
@@ -540,7 +541,9 @@ async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
         let body = truncate(m.content.trim(), RECALL_MEMORY_CHARS).replace('\n', "\n  ");
         text.push_str(&format!("- ({}) {body}\n", m.kind.as_str()));
     }
-    text.push_str("</memdusa-recall>");
+    text.push_str(
+        "</memdusa-recall>\nThese memories are from the same memdusa shared memory as your brief; use them the same way.",
+    );
     Ok(Some(
         json!({ "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": text } }).to_string(),
     ))
@@ -812,9 +815,18 @@ mod tests {
         let out = handle(HookEvent::SessionStart, input(json!({"source": "startup"})), c).await.unwrap().unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let ctx_text = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        for needle in ["add login page", "src/login.rs", "cargo test …", "<memdusa-resume"] {
+        for needle in [
+            "add login page",
+            "src/login.rs",
+            "cargo test …",
+            "<memdusa-resume",
+            "installed by the user",
+            "shared memory",
+            "verify in the code",
+        ] {
             assert!(ctx_text.contains(needle), "missing {needle}:\n{ctx_text}");
         }
+        assert!(!ctx_text.contains("possibly written by a different harness"), "{ctx_text}");
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
     }
 
@@ -1043,7 +1055,12 @@ mod tests {
         // a prompt about the saved decision gets it
         let text = prompt(&store, &cfg, "s1", "Why did we pick postgres for the billing service?").await.unwrap();
         assert!(text.starts_with("<memdusa-recall>\nRelevant memories:\n- (decision) We chose Postgres"), "{text}");
-        assert!(text.ends_with("</memdusa-recall>"), "{text}");
+        assert!(
+            text.ends_with(
+                "</memdusa-recall>\nThese memories are from the same memdusa shared memory as your brief; use them the same way."
+            ),
+            "{text}"
+        );
         assert!(!text.contains("Lunch"), "{text}");
 
         // recorded, and not injected again in the same session...
