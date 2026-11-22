@@ -191,17 +191,16 @@ async fn embedding_follows_content_changes() {
 
 #[tokio::test]
 async fn backfill_fills_gaps_and_follows_model_changes() {
-    // Backfill embeds every memory in the database. On the shared Postgres test database it would
-    // re-embed other tests' memories with this test's models while they run, so only the private
-    // SQLite store runs it.
+    // Backfill is now project-scoped, but keep this model-migration test on the private SQLite
+    // store: its `up_to_date` / `embedded` counts are about this test's corpus only.
     for (name, base) in stores().await.into_iter().filter(|(name, _)| *name == "sqlite") {
         let p = project();
         let old = base.memory_save(fact(&p, "we ship the artifacts on friday")).await.unwrap();
         assert!(base.memory_embedding(&old.id).await.unwrap().is_none(), "{name}: no embedder, no vector");
-        assert!(base.embeddings_backfill(false).await.is_err(), "{name}: backfill needs an embedder");
+        assert!(base.embeddings_backfill(false, Some(&p)).await.is_err(), "{name}: backfill needs an embedder");
 
         let v1 = base.clone().with_embedder(Fake::new("model-1"));
-        let r = v1.embeddings_backfill(false).await.unwrap();
+        let r = v1.embeddings_backfill(false, Some(&p)).await.unwrap();
         assert!(r.embedded >= 1 && r.failed == 0 && r.model == "model-1", "{name}: {r:?}");
         assert_eq!(v1.memory_embedding(&old.id).await.unwrap().unwrap().model, "model-1", "{name}");
         let stats = v1.embedding_stats().await.unwrap();
@@ -210,11 +209,11 @@ async fn backfill_fills_gaps_and_follows_model_changes() {
         assert_eq!(base.embedding_stats().await.unwrap().model, None, "{name}");
 
         // nothing to do the second time
-        let again = v1.embeddings_backfill(false).await.unwrap();
+        let again = v1.embeddings_backfill(false, Some(&p)).await.unwrap();
         assert_eq!(again.embedded, 0, "{name}: {again:?}");
         assert!(again.up_to_date >= 1, "{name}");
         // `all` redoes everything
-        assert!(v1.embeddings_backfill(true).await.unwrap().embedded >= 1, "{name}");
+        assert!(v1.embeddings_backfill(true, Some(&p)).await.unwrap().embedded >= 1, "{name}");
 
         // another model: vectors of the old one are not used, and backfill re-embeds
         let v2 = base.clone().with_embedder(Fake::new("model-2"));
@@ -222,10 +221,25 @@ async fn backfill_fills_gaps_and_follows_model_changes() {
             mine(&p, v2.memory_search(q(&p, "deploy bundles")).await.unwrap()).is_empty(),
             "{name}: stale model ignored"
         );
-        let r = v2.embeddings_backfill(false).await.unwrap();
+        let r = v2.embeddings_backfill(false, Some(&p)).await.unwrap();
         assert!(r.embedded >= 1, "{name}: {r:?}");
         assert_eq!(v2.memory_embedding(&old.id).await.unwrap().unwrap().model, "model-2", "{name}");
         assert_eq!(mine(&p, v2.memory_search(q(&p, "deploy bundles")).await.unwrap()), vec![old.id.clone()], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn backfill_scope_only_embeds_one_project() {
+    for (name, base) in stores().await {
+        let (p, other) = (project(), project());
+        let s = base.clone().with_embedder(Fake::new("fake-1"));
+        let mine = base.memory_save(fact(&p, "we ship artifacts")).await.unwrap();
+        let theirs = base.memory_save(fact(&other, "deploy bundles")).await.unwrap();
+
+        let r = s.embeddings_backfill(false, Some(&p)).await.unwrap();
+        assert_eq!(r.embedded, 1, "{name}: {r:?}");
+        assert!(s.memory_embedding(&mine.id).await.unwrap().is_some(), "{name}");
+        assert!(s.memory_embedding(&theirs.id).await.unwrap().is_none(), "{name}: other project untouched");
     }
 }
 
@@ -268,11 +282,14 @@ async fn provider_failures_never_break_saves_or_searches() {
         assert_eq!(mine(&p, s.memory_search(q(&p, "rollbacks tag")).await.unwrap()), lexical, "{name}");
         assert_eq!(lexical, vec![m.id.clone()], "{name}");
         // backfill reports the failure instead of raising it
-        let r = s.embeddings_backfill(false).await.unwrap();
+        // Scope the backfill to this test's project: the shared Postgres database is used by other
+        // tests in parallel, and embedding their memories here both changes their expectations and
+        // can give us vectors we did not create.
+        let r = s.embeddings_backfill(false, Some(&p)).await.unwrap();
         assert!(r.failed >= 1 && r.embedded == 0, "{name}: {r:?}");
         // a provider that comes back is picked up by the next backfill
         fake.fail.store(false, Ordering::SeqCst);
-        assert!(s.embeddings_backfill(false).await.unwrap().embedded >= 2, "{name}");
+        assert!(s.embeddings_backfill(false, Some(&p)).await.unwrap().embedded >= 2, "{name}");
         assert!(s.memory_embedding(&m.id).await.unwrap().is_some(), "{name}");
     }
 }
@@ -336,7 +353,9 @@ async fn review_groups_memories_with_close_embeddings() {
         assert!(!grouped(&base.memory_review(&p, None).await.unwrap()), "{name}");
         assert!(!grouped(&s.memory_review(&p, None).await.unwrap()), "{name}: no vectors stored yet");
 
-        s.embeddings_backfill(false).await.unwrap();
+        // Only this project may be embedded: other tests run in parallel against the same Postgres
+        // database, and a global backfill would embed their memories (and let theirs embed ours).
+        s.embeddings_backfill(false, Some(&p)).await.unwrap();
         let r = s.memory_review(&p, None).await.unwrap();
         let group = r.related.iter().find(|g| g.iter().any(|i| i.id == a.id)).expect("a is grouped");
         assert!(group.iter().any(|i| i.id == b.id), "{name}: same meaning, grouped");

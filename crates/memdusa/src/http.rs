@@ -313,6 +313,8 @@ async fn whoami(State(s): State<AppState>, Extension(id): Extension<Identity>) -
 struct BackfillBody {
     #[serde(default)]
     all: bool,
+    /// Only this project; missing means the whole corpus.
+    project: Option<String>,
 }
 
 /// Embed memories that have no vector for the server's embedding model (admin).
@@ -322,8 +324,8 @@ async fn embeddings_backfill(
     body: Option<Json<BackfillBody>>,
 ) -> ApiResult<memdusa_core::embed::BackfillReport> {
     admin(&id)?;
-    let all = body.map(|Json(b)| b.all).unwrap_or_default();
-    Ok(Json(s.store.embeddings_backfill(all).await?))
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(s.store.embeddings_backfill(body.all, body.project.as_deref()).await?))
 }
 
 async fn hook(
