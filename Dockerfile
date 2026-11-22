@@ -1,5 +1,6 @@
 # memdusa server image:  docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa
-FROM rust:1-bookworm AS build
+# trixie (glibc 2.41): ONNX Runtime's prebuilt library for local-embed needs glibc 2.38+
+FROM rust:1-trixie AS build
 WORKDIR /src
 # Build dependencies first so source edits don't rebuild them.
 COPY Cargo.toml Cargo.lock ./
@@ -13,7 +14,7 @@ COPY crates crates
 RUN touch crates/memdusa-core/src/lib.rs crates/memdusa/src/main.rs \
  && cargo build --release --locked -p memdusa --features local-embed
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data memdusa \

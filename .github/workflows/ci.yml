@@ -48,8 +48,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # every release target's runner: the release binaries ship with local-embed
-        os: [ubuntu-latest, ubuntu-22.04-arm, macos-latest, macos-15-intel, windows-latest]
+        # macOS arm64 and Windows release binaries ship with local-embed; ubuntu-latest (glibc 2.39) covers the Docker
+        # image's toolchain. Linux release runners (glibc 2.35) and Intel macOS can't link ONNX Runtime's prebuilt library.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
