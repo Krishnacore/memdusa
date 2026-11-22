@@ -147,6 +147,12 @@ pub struct HookRequest {
     /// their original time.
     #[serde(default)]
     pub at: Option<Millis>,
+    /// `MEMDUSA_TASK` of the client's environment: this session is a worker delegated that task.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// `MEMDUSA_PARENT`: free text naming the coordinator that delegated it.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// One queued hook, replayed through `POST /v1/hooks/batch`.
@@ -215,6 +221,8 @@ pub async fn handle_request(
         user: identity.user.clone(),
         git: req.git.clone(),
         at: req.at.map_or_else(now_ms, |t| t.min(now_ms())),
+        task: req.task.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
+        parent: req.parent.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()),
         cfg: &req.config,
     };
     Ok(HookResponse { output: handle(event, input, ctx).await? })
@@ -243,6 +251,9 @@ pub struct Ctx<'a> {
     pub git: Option<GitState>,
     /// When the hook fired (what records are timestamped with).
     pub at: Millis,
+    /// The delegated task this session works on (`MEMDUSA_TASK`), if it is a worker.
+    pub task: Option<String>,
+    pub parent: Option<String>,
     pub cfg: &'a HookConfig,
 }
 
@@ -327,10 +338,14 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
 
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     // Build the brief before journaling, so it doesn't report its own start.
-    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref()).await?;
+    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref(), ctx.task.as_deref()).await?;
     log(ctx, "session_start", format!("session started ({source})"), None).await?;
+    if let Some(task) = &ctx.task {
+        let data = json!({ "task": task, "parent": ctx.parent, "harness": ctx.cfg.agent, "source": source });
+        log(ctx, brief::DELEGATED_SESSION, task.clone(), Some(data)).await?;
+    }
 
-    let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty();
+    let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty() && b.delegated.is_empty();
     if empty && b.recent_events.is_empty() {
         return Ok(None);
     }
@@ -490,12 +505,23 @@ async fn record_agent_message(ctx: &Ctx<'_>, message: &str) -> Result<()> {
     log(ctx, AGENT_MESSAGE, content, None).await
 }
 
+/// The newest checkpoint of this session's own scope: a worker's task, or (for everyone else)
+/// the project's newest checkpoint that isn't a delegated worker's.
+async fn scope_checkpoint(ctx: &Ctx<'_>) -> Result<Option<Checkpoint>> {
+    if let Some(task) = &ctx.task {
+        return Ok(ctx.store.checkpoints_for_task(&ctx.project, task, 1).await?.into_iter().next());
+    }
+    let delegated = brief::delegated_task_names(ctx.store, &ctx.project).await?;
+    let latest = ctx.store.checkpoints_latest(&ctx.project, 10 + delegated.len() as i64).await?;
+    Ok(latest.into_iter().find(|c| c.task.as_ref().is_none_or(|t| !delegated.contains(t))))
+}
+
 async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>> {
     let (Some(session), mins) = (&ctx.session, ctx.cfg.stop_guard_mins) else { return Ok(None) };
     if already_continuing || mins <= 0 {
         return Ok(None);
     }
-    let last = ctx.store.last_checkpoint_at(&ctx.project).await?;
+    let last = scope_checkpoint(ctx).await?.map(|c| c.created_at);
     if last.is_some_and(|t| now_ms() - t < mins * 60_000) {
         return Ok(None);
     }
@@ -523,7 +549,9 @@ async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>>
 /// the agent changed files without checkpointing: record what we know.
 async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
     let Some(session) = &ctx.session else { return Ok(()) };
-    let last = ctx.store.last_checkpoint_at(&ctx.project).await?.unwrap_or(0);
+    // Carry the previous checkpoint of this scope forward so its plan isn't lost.
+    let prev = scope_checkpoint(ctx).await?;
+    let last = prev.as_ref().map_or(0, |p| p.created_at);
     let events: Vec<_> = ctx
         .store
         .events_recent(&ctx.project, Some(session), 300)
@@ -549,8 +577,6 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
         .collect();
     let task_line = prompts.first().map(|p| truncate(p.lines().next().unwrap_or(p).trim(), 140));
 
-    // Carry the previous checkpoint forward so its plan isn't lost.
-    let prev = ctx.store.checkpoints_latest(&ctx.project, 1).await?.into_iter().next();
     let goal = prev
         .as_ref()
         .map(|p| p.goal.clone())
@@ -581,7 +607,7 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
     ctx.store
         .checkpoint_save(NewCheckpoint {
             project: ctx.project.clone(),
-            task: prev.as_ref().and_then(|p| p.task.clone()),
+            task: ctx.task.clone().or_else(|| prev.as_ref().and_then(|p| p.task.clone())),
             goal,
             done,
             next: prev.as_ref().map(|p| p.next.clone()).unwrap_or_default(),
@@ -634,6 +660,8 @@ mod tests {
             user: None,
             git: None,
             at: now_ms(),
+            task: None,
+            parent: None,
             cfg,
         }
     }
@@ -758,7 +786,7 @@ mod tests {
         let payload = json!({"compact_summary": "S".repeat(2000)});
         handle(HookEvent::PostCompact, input(payload), ctx(&store, &cfg)).await.unwrap();
 
-        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        let md = brief::build(&store, "p", None, None, None).await.unwrap().markdown;
         assert!(md.contains("## Last words from the previous session"), "{md}");
         assert!(md.contains("> Endpoint done, tests next."), "{md}");
         assert!(md.contains(&format!("{}…", "S".repeat(1500))) && !md.contains(&"S".repeat(1501)), "{md}");
@@ -776,7 +804,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        let md = brief::build(&store, "p", None, None, None).await.unwrap().markdown;
         assert!(md.contains("Where things stand") && !md.contains("Last words"), "{md}");
     }
 
@@ -795,7 +823,7 @@ mod tests {
         let cps = store.checkpoints_latest("p", 5).await.unwrap();
         assert_eq!(cps[0].source.as_deref(), Some("claude-code (auto)"));
 
-        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        let md = brief::build(&store, "p", None, None, None).await.unwrap().markdown;
         assert!(md.contains("## Last words from the previous session"), "{md}");
         assert!(md.contains("> Endpoint done, tests next."), "{md}");
         assert!(md.contains("> Refund endpoint built."), "{md}");
@@ -899,7 +927,7 @@ mod tests {
         assert!(prompt(&store, &cfg, "s2", "remind me why postgres for the billing ledger").await.is_some());
 
         // the brief doesn't show the bookkeeping
-        let b = memdusa_core::brief::build(&store, "p", None, None).await.unwrap();
+        let b = memdusa_core::brief::build(&store, "p", None, None, None).await.unwrap();
         assert!(!b.markdown.contains(MEMORY_RECALL), "{}", b.markdown);
     }
 

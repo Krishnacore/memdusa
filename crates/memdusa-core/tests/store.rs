@@ -188,7 +188,7 @@ async fn brief_contains_everything() {
     for (name, s) in stores().await {
         let p = project();
         // global memories from other tests may show up; project-scoped state must be empty
-        let empty = brief::build(&s, &p, None, None).await.unwrap();
+        let empty = brief::build(&s, &p, None, None, None).await.unwrap();
         assert!(
             empty.checkpoints.is_empty() && empty.active_runs.is_empty() && empty.recent_events.is_empty(),
             "{name}"
@@ -224,7 +224,7 @@ async fn brief_contains_everything() {
         .unwrap();
         s.run_start(NewRun { project: p.clone(), name: "refactor".into(), ..Default::default() }).await.unwrap();
 
-        let b = brief::build(&s, &p, None, None).await.unwrap();
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
         assert_eq!(b.checkpoints.len(), 1, "{name}: only latest checkpoint per task");
         assert_eq!(b.checkpoints[0].goal, "ship v2", "{name}");
         for needle in ["ship v2", "SQLite for local mode", "commit", "refactor"] {
@@ -304,7 +304,7 @@ async fn brief_warns_when_code_state_drifted() {
         .await
         .unwrap();
 
-        let same = brief::build(&s, &p, None, Some(&saved)).await.unwrap();
+        let same = brief::build(&s, &p, None, Some(&saved), None).await.unwrap();
         assert!(same.git_warnings.is_empty(), "{name}");
         assert!(
             same.markdown.contains("**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted"),
@@ -319,7 +319,7 @@ async fn brief_warns_when_code_state_drifted() {
             dirty_files: vec![],
             ..saved
         };
-        let b = brief::build(&s, &p, None, Some(&elsewhere)).await.unwrap();
+        let b = brief::build(&s, &p, None, Some(&elsewhere), None).await.unwrap();
         assert_eq!(b.git_warnings.len(), 2, "{name}: {:?}", b.git_warnings);
         let warn_at = b.markdown.find("⚠ Code state differs").expect("warning section");
         assert!(warn_at < b.markdown.find("Where things stand").unwrap(), "{name}: warnings come first");
@@ -786,7 +786,7 @@ async fn brief_flags_memories_about_files_changed_since() {
         pause().await;
         s.memory_save(mem(&Some(p.clone()), "Sessions are stored in src/auth/jwt.rs too", &["x"])).await.unwrap();
 
-        let b = brief::build(&s, &p, None, None).await.unwrap();
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
         let line = |needle: &str| b.markdown.lines().find(|l| l.contains(needle)).unwrap_or_default().to_owned();
         let flagged = line("Auth lives in");
         assert!(flagged.contains("may be outdated: src/auth/jwt.rs changed"), "{name}: {flagged}");
@@ -839,7 +839,7 @@ async fn brief_prefers_memories_relevant_to_the_checkpoint() {
         s.checkpoint_save(goal(&p, "finish the zebra migration")).await.unwrap();
         let (globals, room) = visible_globals(&s).await;
 
-        let b = brief::build_with_budget(&s, &p, None, None, 500 + room).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, None, 500 + room).await.unwrap();
         for needle in ["Zebra migration must keep ids stable", "Run zebra migration dry first"] {
             assert!(b.markdown.contains(needle), "{name}: missing {needle}:\n{}", b.markdown);
         }
@@ -858,7 +858,7 @@ async fn brief_prefers_memories_relevant_to_the_checkpoint() {
         })
         .await
         .unwrap();
-        let b = brief::build_with_budget(&s, &p, None, None, 500 + room).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, None, 500 + room).await.unwrap();
         assert!(b.memories.iter().any(|m| m.content.starts_with("filler7")), "{name}: prompt ignored");
     }
 }
@@ -876,11 +876,11 @@ async fn brief_always_keeps_preferences_and_respects_budget() {
         s.checkpoint_save(goal(&p, "finish the zebra migration")).await.unwrap();
 
         // the preference alone is bigger than the budget: it is still shown
-        let b = brief::build_with_budget(&s, &p, None, None, 100).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, None, 100).await.unwrap();
         assert!(b.memories.iter().any(|m| m.kind == MemoryKind::Preference), "{name}");
         assert_eq!(own(&b, &p).len(), 1, "{name}: nothing else fits");
 
-        let b = brief::build_with_budget(&s, &p, None, None, 1_000).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, None, 1_000).await.unwrap();
         let used: usize =
             own(&b, &p).iter().filter(|m| m.kind != MemoryKind::Preference).map(|m| m.content.len()).sum();
         assert!(used <= 1_000, "{name}: budget exceeded");
@@ -894,7 +894,7 @@ async fn brief_without_focus_lists_recent_memories() {
         let p = project();
         seed_many(&s, &p).await;
         // no checkpoint, no prompt: most recent first, nothing reordered, all fit a big budget
-        let b = brief::build_with_budget(&s, &p, None, None, 1_000_000).await.unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, None, 1_000_000).await.unwrap();
         let mine = own(&b, &p);
         assert_eq!(mine.len(), 30, "{name}");
         assert!(mine[0].content.starts_with("filler27"), "{name}");

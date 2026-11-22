@@ -552,6 +552,8 @@ impl Backend<'_> {
             input: input.clone(),
             git: None,
             at: Some(at),
+            task: None,
+            parent: None,
         };
         match self {
             Self::Local(store) => {

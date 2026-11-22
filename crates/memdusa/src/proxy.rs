@@ -119,6 +119,13 @@ impl ServerHandler for Proxy {
         {
             request.arguments.get_or_insert_with(Default::default).entry("git").or_insert(value);
         }
+        // A delegated worker's task (`MEMDUSA_TASK`) is this machine's environment too; an explicit argument wins.
+        if matches!(request.name.as_ref(), "checkpoint" | "resume")
+            && let Some(task) =
+                std::env::var("MEMDUSA_TASK").ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+        {
+            request.arguments.get_or_insert_with(Default::default).entry("task").or_insert(task.into());
+        }
         Ok(match self.upstream.call_tool(request).await {
             Ok(result) => result.into(),
             // Surface transport failures to the agent as a readable tool error.

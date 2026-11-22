@@ -480,8 +480,10 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
-            let server =
-                mcp::MemdusaMcp::new(store, mcp::Defaults { project, agent, cwd: std::env::current_dir().ok() });
+            let server = mcp::MemdusaMcp::new(
+                store,
+                mcp::Defaults { project, agent, cwd: std::env::current_dir().ok(), task: env_nonempty("MEMDUSA_TASK") },
+            );
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
@@ -495,7 +497,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = brief::build(&store, &project, None, project::git_state_for(&project).as_ref()).await?;
+            let task = env_nonempty("MEMDUSA_TASK");
+            let git = project::git_state_for(&project);
+            let b = brief::build(&store, &project, None, git.as_ref(), task.as_deref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -640,7 +644,9 @@ async fn run_remote(
         Cmd::Mcp { agent } => proxy::run(r, project, &agent).await?,
         Cmd::Resume { json } => {
             let project = project.context("could not detect project; pass --project")?;
-            let b = client()?.resume(&project, project::git_state_for(&project).as_ref()).await?;
+            let task = env_nonempty("MEMDUSA_TASK");
+            let git = project::git_state_for(&project);
+            let b = client()?.resume(&project, git.as_ref(), task.as_deref()).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
@@ -672,6 +678,11 @@ async fn run_remote(
         _ => unreachable!("handled before mode selection"),
     }
     Ok(())
+}
+
+/// An environment variable's trimmed value, if set and not blank.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
 /// Collect facts about a git hook event and send them through the hook pipeline.
@@ -835,7 +846,15 @@ async fn run_hook_input(
         .map(std::path::Path::new)
         .filter(|d| event.needs_git() && project::detect(d) == project)
         .and_then(project::git_state);
-    let mut req = hooks::HookRequest { project, config, input, git, at: Some(model::now_ms()) };
+    let mut req = hooks::HookRequest {
+        project,
+        config,
+        input,
+        git,
+        at: Some(model::now_ms()),
+        task: env_nonempty("MEMDUSA_TASK"),
+        parent: env_nonempty("MEMDUSA_PARENT"),
+    };
 
     let resp = match Mode::detect(database_url)? {
         Mode::Remote(r) => {

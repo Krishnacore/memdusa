@@ -1,6 +1,7 @@
 //! The hand-off brief: everything a fresh agent (possibly a different
 //! harness) needs to continue where the previous one stopped.
 
+use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::Result;
@@ -15,8 +16,20 @@ pub const COMMAND: &str = "command";
 pub const STOP_GUARD: &str = "stop_guard";
 /// Which memories were already shown to an agent in a session (`data: {"ids": [...]}`).
 pub const MEMORY_RECALL: &str = "memory_recall";
+/// A worker's session started under `MEMDUSA_TASK` (`data: {task, parent, harness, source}`).
+pub const DELEGATED_SESSION: &str = "delegated_session";
+pub const SESSION_END: &str = "session_end";
 /// Bookkeeping events that would only be noise in the brief.
-const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL];
+const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL, DELEGATED_SESSION];
+/// How far back the coordinator's "Delegated work" section looks, and how many tasks it lists.
+const DELEGATED_WINDOW_MS: Millis = 7 * 86_400_000;
+const DELEGATED_MAX: usize = 10;
+/// How much of a worker's last message the coordinator's brief quotes.
+const DELEGATED_MESSAGE_CHARS: usize = 300;
+/// Checkpoints of the task shown in a worker's brief.
+const TASK_CHECKPOINTS: i64 = 3;
+/// Next steps listed per delegated task.
+const DELEGATED_NEXT: usize = 3;
 /// How much of a compaction summary the brief quotes.
 const SUMMARY_CHARS: usize = 1_500;
 /// Default character budget of the brief's Memory section.
@@ -35,18 +48,148 @@ pub struct Brief {
     pub active_runs: Vec<RunWithSteps>,
     pub memories: Vec<Memory>,
     pub recent_events: Vec<Event>,
+    /// Recent tasks workers were delegated (coordinator view; empty in a worker's own brief).
+    pub delegated: Vec<DelegatedWork>,
     /// How the caller's code state differs from the latest checkpoint's.
     pub git_warnings: Vec<String>,
     /// The same content rendered as Markdown, ready to paste into a prompt.
     pub markdown: String,
 }
 
+/// One task a coordinator delegated to a worker, as the coordinator's brief shows it.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DelegatedWork {
+    pub task: String,
+    /// `MEMDUSA_PARENT` of the latest worker session, if it gave one.
+    pub parent: Option<String>,
+    /// The harness of the latest worker session.
+    pub harness: Option<String>,
+    /// The latest worker session has started and not ended.
+    pub active: bool,
+    pub started_at: Millis,
+    /// The task's newest checkpoint.
+    pub checkpoint: Option<Checkpoint>,
+    /// The last thing any worker of this task said (truncated).
+    pub last_message: Option<String>,
+}
+
+fn event_str<'a>(e: &'a Event, key: &str) -> Option<&'a str> {
+    e.data.as_ref()?.get(key)?.as_str()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
+/// Every `delegated_session` event of the project, newest first.
+async fn delegated_starts(store: &Store, project: &str) -> Result<Vec<Event>> {
+    store.events_recent_kind(project, None, DELEGATED_SESSION, 500).await
+}
+
+/// Names of every task ever delegated in the project (so a coordinator can tell workers' checkpoints from its own).
+pub async fn delegated_task_names(store: &Store, project: &str) -> Result<HashSet<String>> {
+    Ok(delegated_starts(store, project).await?.iter().filter_map(|e| event_str(e, "task").map(String::from)).collect())
+}
+
+/// The coordinator's view: recent delegated tasks (newest first) with status, checkpoint and last words.
+async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Result<Vec<DelegatedWork>> {
+    let since = now_ms() - DELEGATED_WINDOW_MS;
+    let recent: Vec<&Event> =
+        starts.iter().filter(|e| e.created_at >= since && event_str(e, "task").is_some()).collect();
+    if recent.is_empty() {
+        return Ok(vec![]);
+    }
+    let ended: HashSet<String> = store
+        .events_recent_kind(project, None, SESSION_END, 500)
+        .await?
+        .into_iter()
+        .filter_map(|e| e.session)
+        .collect();
+    let messages = store.events_recent_kind(project, None, AGENT_MESSAGE, 500).await?;
+    let mut out: Vec<DelegatedWork> = vec![];
+    for e in recent {
+        let task = event_str(e, "task").unwrap_or_default();
+        if out.iter().any(|d| d.task == task) {
+            continue;
+        }
+        if out.len() >= DELEGATED_MAX {
+            break;
+        }
+        let sessions = task_sessions(starts, Some(task));
+        let last = messages.iter().find(|m| m.session.as_deref().is_some_and(|s| sessions.contains(s)));
+        out.push(DelegatedWork {
+            task: task.to_owned(),
+            parent: event_str(e, "parent").map(String::from),
+            harness: event_str(e, "harness").or(e.source.as_deref()).map(String::from),
+            active: e.session.as_deref().is_none_or(|s| !ended.contains(s)),
+            started_at: e.created_at,
+            checkpoint: store.checkpoints_for_task(project, task, 1).await?.into_iter().next(),
+            last_message: last.map(|m| truncate(&m.content, DELEGATED_MESSAGE_CHARS)),
+        });
+    }
+    Ok(out)
+}
+
+/// Sessions that were delegated `task` (or any task, for `None`).
+fn task_sessions<'a>(starts: &'a [Event], task: Option<&str>) -> HashSet<&'a str> {
+    starts
+        .iter()
+        .filter(|s| task.is_none_or(|t| event_str(s, "task") == Some(t)))
+        .filter_map(|s| s.session.as_deref())
+        .collect()
+}
+
+/// Events of `kind` that count as the previous session's last words: for a worker, those of
+/// its task's sessions (whatever the harness); for the coordinator, any that did not come
+/// from a delegated worker session.
+async fn last_words_candidates(
+    store: &Store,
+    project: &str,
+    task: Option<&str>,
+    starts: &[Event],
+    recent: &[Event],
+    kind: &str,
+) -> Result<Vec<Event>> {
+    Ok(match task {
+        Some(t) => {
+            let mine = task_sessions(starts, Some(t));
+            store
+                .events_recent_kind(project, None, kind, 500)
+                .await?
+                .into_iter()
+                .filter(|e| e.session.as_deref().is_some_and(|s| mine.contains(s)))
+                .collect()
+        }
+        None => {
+            let workers = task_sessions(starts, None);
+            recent
+                .iter()
+                .filter(|e| e.kind == kind && !e.session.as_deref().is_some_and(|s| workers.contains(s)))
+                .cloned()
+                .collect()
+        }
+    })
+}
+
 /// `user` is the caller (on a multi-user server): it decides whose global
 /// memories are included.
 /// `current_git` is the caller's code state, compared against the latest
 /// checkpoint's to warn about a different branch, commit or machine.
-pub async fn build(store: &Store, project: &str, user: Option<&str>, current_git: Option<&GitState>) -> Result<Brief> {
-    build_with_budget(store, project, user, current_git, MEMORY_BUDGET).await
+/// `task` (a worker's `MEMDUSA_TASK`) makes the brief about that delegated task alone; without it the
+/// brief is the coordinator's and lists the delegated work.
+pub async fn build(
+    store: &Store,
+    project: &str,
+    user: Option<&str>,
+    current_git: Option<&GitState>,
+    task: Option<&str>,
+) -> Result<Brief> {
+    build_with_budget(store, project, user, current_git, task, MEMORY_BUDGET).await
 }
 
 /// [`build`] with an explicit character budget for the Memory section.
@@ -55,14 +198,32 @@ pub async fn build_with_budget(
     project: &str,
     user: Option<&str>,
     current_git: Option<&GitState>,
+    task: Option<&str>,
     memory_budget: usize,
 ) -> Result<Brief> {
-    let checkpoints = store.checkpoints_latest(project, 5).await?;
+    let starts = delegated_starts(store, project).await?;
+    let delegated = if task.is_none() { delegated_work(store, project, &starts).await? } else { vec![] };
+    let checkpoints = match task {
+        // A worker's brief is its task: other workstreams would only compete for "where things stand".
+        Some(t) => store.checkpoints_for_task(project, t, TASK_CHECKPOINTS).await?,
+        None => {
+            // Delegated tasks have their own section; keep them from crowding out the coordinator's checkpoints.
+            let mut cps = store.checkpoints_latest(project, 5 + delegated.len() as i64).await?;
+            cps.retain(|c| c.task.as_deref().is_none_or(|t| !delegated.iter().any(|d| d.task == t)));
+            cps.truncate(5);
+            cps
+        }
+    };
     let mut active_runs = vec![];
     for run in store.run_list(Some(project), Some(RunStatus::Running), 10).await? {
         active_runs.push(store.run_get(&run.id).await?);
     }
-    let recent_events = store.events_recent(project, None, 100).await?;
+    let mut recent_events = store.events_recent(project, None, 100).await?;
+    if let Some(t) = task {
+        // A worker's activity is its task's: other workers' prompts and edits are noise (git events have no session).
+        let mine = task_sessions(&starts, Some(t));
+        recent_events.retain(|e| e.session.as_deref().is_none_or(|s| mine.contains(s)));
+    }
     let focus = focus_text(store, project, checkpoints.first()).await?;
     let (memories, omitted) =
         select_memories(store, project, user, focus.as_deref(), memory_budget, &recent_events).await?;
@@ -71,8 +232,39 @@ pub async fn build_with_budget(
         (Some(saved), Some(current)) => saved.drift(current),
         _ => vec![],
     };
-    let markdown = render(project, &checkpoints, &active_runs, &memories, omitted, &recent_events, &git_warnings);
-    Ok(Brief { project: project.into(), checkpoints, active_runs, memories, recent_events, git_warnings, markdown })
+    // A checkpoint the agent wrote already says where things stand: only show what came after it.
+    // Automatic fallback checkpoints are written at session end, after the last words, so they don't count.
+    let since = checkpoints
+        .iter()
+        .find(|c| !c.source.as_deref().is_some_and(|s| s.ends_with(" (auto)")))
+        .map_or(0, |c| c.created_at);
+    let latest = |events: Vec<Event>| events.into_iter().filter(|e| e.created_at > since).max_by_key(|e| e.created_at);
+    let message = latest(last_words_candidates(store, project, task, &starts, &recent_events, AGENT_MESSAGE).await?);
+    let summary = latest(last_words_candidates(store, project, task, &starts, &recent_events, COMPACT_SUMMARY).await?);
+
+    let markdown = render(&Parts {
+        project,
+        task,
+        checkpoints: &checkpoints,
+        runs: &active_runs,
+        memories: &memories,
+        omitted,
+        events: &recent_events,
+        git_warnings: &git_warnings,
+        delegated: &delegated,
+        message: message.as_ref(),
+        summary: summary.as_ref(),
+    });
+    Ok(Brief {
+        project: project.into(),
+        checkpoints,
+        active_runs,
+        memories,
+        recent_events,
+        delegated,
+        git_warnings,
+        markdown,
+    })
 }
 
 /// What the current work is about: the latest checkpoint's goal, next steps, blockers and files, plus
@@ -238,17 +430,44 @@ pub fn memories_markdown(project: &str, memories: &[Memory]) -> String {
     o
 }
 
-fn render(
-    project: &str,
-    checkpoints: &[Checkpoint],
-    runs: &[RunWithSteps],
-    memories: &[Memory],
+/// Everything [`render`] shows.
+struct Parts<'a> {
+    project: &'a str,
+    task: Option<&'a str>,
+    checkpoints: &'a [Checkpoint],
+    runs: &'a [RunWithSteps],
+    memories: &'a [Memory],
     omitted: usize,
-    events: &[Event],
-    git_warnings: &[String],
-) -> String {
+    events: &'a [Event],
+    git_warnings: &'a [String],
+    delegated: &'a [DelegatedWork],
+    message: Option<&'a Event>,
+    summary: Option<&'a Event>,
+}
+
+fn render(parts: &Parts) -> String {
+    let Parts {
+        project,
+        task,
+        checkpoints,
+        runs,
+        memories,
+        omitted,
+        events,
+        git_warnings,
+        delegated,
+        message,
+        summary,
+    } = *parts;
     let mut o = String::new();
     let _ = writeln!(o, "# Resume brief: {project}\n");
+    if let Some(t) = task {
+        let _ = writeln!(
+            o,
+            "_You are a worker on the delegated task **{t}**: this brief covers that task only (its checkpoints and \
+             the last words of its previous workers)._\n"
+        );
+    }
     if !git_warnings.is_empty() {
         let _ = writeln!(o, "## ⚠ Code state differs from the last checkpoint");
         for w in git_warnings {
@@ -257,7 +476,7 @@ fn render(
         let _ = writeln!(o, "\nVerify the actual state of the code before trusting the notes below.\n");
     }
 
-    if checkpoints.is_empty() && runs.is_empty() && memories.is_empty() && events.is_empty() {
+    if checkpoints.is_empty() && runs.is_empty() && memories.is_empty() && events.is_empty() && delegated.is_empty() {
         let _ = writeln!(o, "_Nothing recorded yet for this project. Start fresh, and save checkpoints as you go._");
         return o;
     }
@@ -282,15 +501,6 @@ fn render(
         o.push('\n');
     }
 
-    // A checkpoint the agent wrote already says where things stand: only show what came after it.
-    // Automatic fallback checkpoints are written at session end, after the last words, so they don't count.
-    let since = checkpoints
-        .iter()
-        .find(|c| !c.source.as_deref().is_some_and(|s| s.ends_with(" (auto)")))
-        .map_or(0, |c| c.created_at);
-    let latest =
-        |kind: &str| events.iter().filter(|e| e.kind == kind && e.created_at > since).max_by_key(|e| e.created_at);
-    let (message, summary) = (latest(AGENT_MESSAGE), latest(COMPACT_SUMMARY));
     if message.is_some() || summary.is_some() {
         let _ = writeln!(o, "## Last words from the previous session");
         let quote = |t: &str| t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
@@ -308,6 +518,29 @@ fn render(
             };
             let by = s.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
             let _ = writeln!(o, "\n_compaction summary{by}, {}_\n\n{}", ago(s.created_at), quote(&text));
+        }
+        o.push('\n');
+    }
+
+    if !delegated.is_empty() {
+        let _ = writeln!(o, "## Delegated work");
+        for d in delegated {
+            let status = if d.active { "active" } else { "ended" };
+            let who = d.harness.as_deref().map(|h| format!(" by {h}")).unwrap_or_default();
+            let parent = d.parent.as_deref().map(|p| format!(" (for {p})")).unwrap_or_default();
+            let _ = writeln!(o, "- **{}**{who}{parent}: {status}, started {}", d.task, ago(d.started_at));
+            if let Some(c) = &d.checkpoint {
+                let _ = writeln!(o, "  - goal: {} (checkpoint {})", c.goal, ago(c.created_at));
+                if !c.next.is_empty() {
+                    let next: Vec<&str> = c.next.iter().take(DELEGATED_NEXT).map(String::as_str).collect();
+                    let more = c.next.len().saturating_sub(DELEGATED_NEXT);
+                    let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                    let _ = writeln!(o, "  - next: {}{more}", next.join("; "));
+                }
+            }
+            if let Some(m) = &d.last_message {
+                let _ = writeln!(o, "  - last message: {}", m.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
         }
         o.push('\n');
     }
