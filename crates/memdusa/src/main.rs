@@ -672,7 +672,7 @@ fn git_hook_input(
             let short = short_sha(&full);
             let subject = git(dir, &["log", "-1", "--pretty=%s"])?;
             let branch = branch(&short);
-            let changed = git(dir, &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])?;
+            let changed = git(dir, &["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"])?;
             let files = changed.lines().filter(|l| !l.trim().is_empty()).count();
             let content = format!("{short} on {branch}: {subject} ({files} files)");
             (
@@ -952,6 +952,12 @@ mod tests {
         std::fs::write(dir.join("README.md"), "hi\n").unwrap();
         git(&dir, &["add", "README.md"]).unwrap();
         git(&dir, &["commit", "-q", "-m", "Initial commit"]).unwrap();
+
+        // The root commit has no parent: --root must still count its files.
+        let root = git_hook_input(install::GitHookKind::Commit, &[], &dir).unwrap().expect("root commit event");
+        assert_eq!(root["data"]["subject"], "Initial commit");
+        assert_eq!(root["data"]["files"], 1);
+        assert_eq!(root["data"]["sha"], git(&dir, &["rev-parse", "HEAD"]).unwrap());
 
         std::fs::write(dir.join("refunds.rs"), "fn refunds() {}\n").unwrap();
         std::fs::write(dir.join("refunds_test.rs"), "#[test] fn t() {}\n").unwrap();

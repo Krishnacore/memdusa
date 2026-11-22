@@ -295,22 +295,36 @@ pub fn merge_git_hook(existing: &str, line: &str, uninstall: bool) -> Option<Str
         return Some(format!("#!/bin/sh\n{line}\n"));
     }
 
-    // Replace the first memdusa line (an older bin path); drop any duplicates.
-    let mut replaced = false;
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
-    for l in lines {
-        if is_ours(l) {
-            if !replaced {
-                out.push(line);
-                replaced = true;
+    // Replace the first memdusa line (an older bin path) in place; drop any duplicates.
+    if lines.iter().any(|l| is_ours(l)) {
+        let mut replaced = false;
+        let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+        for l in lines {
+            if is_ours(l) {
+                if !replaced {
+                    out.push(line);
+                    replaced = true;
+                }
+            } else {
+                out.push(l);
             }
-        } else {
-            out.push(l);
         }
+        return Some(join_hook_lines(&out, existing));
     }
-    if !replaced {
-        out.push(line);
-    }
+
+    // A trailing `exit` would skip anything after it, so insert our line before
+    // the last meaningful line when that line is an exit statement. Otherwise
+    // append as usual.
+    let last_meaningful = lines.iter().rposition(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#')
+    });
+    let insert_at = match last_meaningful {
+        Some(i) if lines[i].trim_start().starts_with("exit") => i,
+        _ => lines.len(),
+    };
+    let mut out = lines;
+    out.insert(insert_at, line);
     Some(join_hook_lines(&out, existing))
 }
 
@@ -952,6 +966,38 @@ mod tests {
         assert_eq!(merged, format!("#!/bin/sh\necho user hook\n{line}\n"));
         assert!(!merged.contains("/old/bin/memdusa"));
         assert_eq!(merged.matches("# memdusa").count(), 1);
+    }
+
+    #[test]
+    fn git_hook_goes_before_a_trailing_exit() {
+        let line = git_hook_line(BIN, "post-commit");
+
+        let user = "#!/bin/sh\nnpm test\nexit 0\n";
+        let merged = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merged, format!("#!/bin/sh\nnpm test\n{line}\nexit 0\n"));
+        assert!(merged.find(&line).unwrap() < merged.find("exit 0").unwrap());
+
+        // trailing blank lines stay after the exit statement
+        let user_blank = "#!/bin/sh\nexit $?\n\n";
+        let merged_blank = merge_git_hook(user_blank, &line, false).unwrap();
+        assert_eq!(merged_blank, format!("#!/bin/sh\n{line}\nexit $?\n\n"));
+    }
+
+    #[test]
+    fn git_hook_appends_when_exit_is_not_the_last_statement() {
+        let line = git_hook_line(BIN, "post-commit");
+        let user = "#!/bin/sh\nif [ -n \"$CI\" ]; then\n  exit 0\nfi\necho done\n";
+        let merged = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merged, format!("{user}{line}\n"), "the if-block's exit is not trailing");
+        assert!(merged.ends_with(&format!("echo done\n{line}\n")));
+    }
+
+    #[test]
+    fn git_hook_uninstall_restores_an_exit_hook_exactly() {
+        let line = git_hook_line(BIN, "post-merge");
+        let user = "#!/bin/sh\nmake check\nexit $?\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merge_git_hook(&added, &line, true).unwrap(), user);
     }
 
     #[test]
