@@ -171,7 +171,11 @@ impl Harness {
                     HookEvent::Stop => {
                         let looping = o.get("loop_count").and_then(Value::as_i64).unwrap_or(0) > 0;
                         o.insert("stop_hook_active".into(), json!(looping));
+                        cursor_transcript_fields(&mut o, false);
                     }
+                    // `cursor-agent -p` fires neither beforeSubmitPrompt, afterAgentResponse nor stop: the
+                    // session end is the only place left to pick up the prompt and the agent's last words.
+                    HookEvent::SessionEnd => cursor_transcript_fields(&mut o, true),
                     _ => {}
                 }
             }
@@ -290,6 +294,67 @@ impl Harness {
         };
         Some(rendered.to_string())
     }
+}
+
+/// Cursor hands hooks the path of the session's transcript (JSONL, one message per line). Fill
+/// `last_assistant_message` from it (and `prompt` when `with_prompt`), unless the payload has them.
+fn cursor_transcript_fields(o: &mut Map<String, Value>, with_prompt: bool) {
+    const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
+    let Some(path) = o.get("transcript_path").and_then(Value::as_str).filter(|p| !p.is_empty()) else { return };
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let (prompt, last) = cursor_transcript_texts(&text);
+    if let Some(last) = last
+        && !o.contains_key("last_assistant_message")
+    {
+        o.insert("last_assistant_message".into(), json!(last));
+    }
+    if with_prompt
+        && let Some(prompt) = prompt
+        && !o.contains_key("prompt")
+    {
+        o.insert("prompt".into(), json!(prompt));
+    }
+}
+
+/// The user's newest request and the agent's newest message that has text, from a Cursor transcript.
+fn cursor_transcript_texts(transcript: &str) -> (Option<String>, Option<String>) {
+    let (mut prompt, mut last) = (None, None);
+    for line in transcript.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(role) = v.get("role").and_then(Value::as_str) else { continue };
+        let text = v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match role {
+            // the request sits between <user_query> tags, after a timestamp line
+            "user" => {
+                let query = text
+                    .split_once("<user_query>")
+                    .map_or(text, |(_, rest)| rest.split_once("</user_query>").map_or(rest, |(q, _)| q));
+                prompt = Some(query.trim().to_owned()).filter(|q| !q.is_empty());
+                last = None; // only what the agent said after this request counts
+            }
+            "assistant" => last = Some(text.to_owned()),
+            _ => {}
+        }
+    }
+    (prompt, last)
 }
 
 /// Nested lookup in a JSON object: `at(o, &["toolCall", "name"])`.
@@ -515,5 +580,50 @@ mod tests {
             Harness::Hermes.render(HookEvent::Stop, Some(block.into())).unwrap(),
             r#"{"action":"continue","message":"checkpoint"}"#
         );
+    }
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/harness");
+
+    /// Real `cursor-agent -p` sessionEnd payload (Cursor 2026.11.22): its transcript holds the prompt and last words.
+    #[test]
+    fn cursor_session_end_reads_prompt_and_last_words_from_the_transcript() {
+        let payload = include_str!("../tests/fixtures/harness/cursor-session-end.json")
+            .replace("__TRANSCRIPT__", &format!("{FIXTURES}/cursor-transcript.jsonl"));
+        let input: Value = serde_json::from_str(&payload).unwrap();
+        let v = Harness::Cursor.normalize(HookEvent::SessionEnd, input.clone()).unwrap();
+        assert_eq!(v["last_assistant_message"], "ok", "text of the final assistant message only");
+        assert_eq!(v["prompt"], "Run the shell command echo hi then reply with just: ok");
+        assert_eq!(v["session_id"], "d6c39eb6-3ad6-49e7-add5-6842d178a32b");
+        assert_eq!(v["cwd"], "/work/repo");
+        assert_eq!(v["reason"], "completed");
+
+        // stop (interactive sessions) gets the last words but never the prompt: beforeSubmitPrompt covers that
+        let stop = Harness::Cursor.normalize(HookEvent::Stop, input.clone()).unwrap();
+        assert_eq!(stop["last_assistant_message"], "ok");
+        assert!(stop.get("prompt").is_none());
+
+        // an unreadable transcript is not an error
+        let mut gone = input;
+        gone["transcript_path"] = json!("/nonexistent/transcript.jsonl");
+        let v = Harness::Cursor.normalize(HookEvent::SessionEnd, gone).unwrap();
+        assert!(v.get("last_assistant_message").is_none() && v.get("prompt").is_none());
+    }
+
+    #[test]
+    fn cursor_transcript_keeps_the_last_message_after_the_newest_request() {
+        let t = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nfirst\n</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"answer one"}]}}"#,
+            "\n",
+            "not json\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"plain second request"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{}}]}}"#,
+            "\n",
+        );
+        let (prompt, last) = cursor_transcript_texts(t);
+        assert_eq!(prompt.as_deref(), Some("plain second request"));
+        assert_eq!(last, None, "answer one belongs to the previous request");
     }
 }

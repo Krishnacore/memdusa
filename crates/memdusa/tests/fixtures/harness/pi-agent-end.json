@@ -1,0 +1,1 @@
+{"type":"agent_end","messages":[{"role":"system","content":"(system prompt, trimmed)"},{"role":"user","content":[{"type":"text","text":"say ok"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"The user is asking me to say \"ok\"."},{"type":"text","text":"ok"}]}]}

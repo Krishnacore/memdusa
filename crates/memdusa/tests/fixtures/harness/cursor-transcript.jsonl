@@ -1,0 +1,5 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Sunday, Nov 22, 2026, 11:20 AM (UTC-5)</timestamp>\n<user_query>\nRun the shell command echo hi then reply with just: ok\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I'll run that echo command now."},{"type":"tool_use","name":"Shell","input":{"command":"echo hi","description":"Echo hi to stdout"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Retrying the echo command."},{"type":"tool_use","name":"Shell","input":{"command":"echo hi","description":"Echo hi to stdout"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}
+{"type":"turn_ended","status":"success"}
