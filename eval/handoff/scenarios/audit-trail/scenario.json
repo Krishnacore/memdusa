@@ -1,0 +1,22 @@
+{
+  "name": "audit-trail",
+  "description": "A finishes only the event queue (part 1) and stops. B must add the audit trail (part 2) using decisions from A's last message and a project convention that exists only as a seeded memory.",
+  "a_mode": "complete",
+  "seed_memories": [
+    {
+      "content": "Project convention: every timestamp in feature code is an integer epoch-milliseconds value obtained from app.clock.now_ms() (create that module if it does not exist yet). Never call time.time() or datetime.now() directly in feature code.",
+      "kind": "convention",
+      "scope": "project"
+    }
+  ],
+  "task_prompt": "Please add an in-memory event queue to this repo, in two parts. Do only part 1 now.\n\nPart 1 (implement this now):\n- Create `app/queue.py` with `enqueue(item: str) -> dict`: append one item to an in-memory queue and return `{\"id\": <int>, \"item\": item}`, with ids starting at 1 and increasing by 1.\n- Add `pending() -> list[dict]` (all queued items in insertion order) and `reset()` (empty the queue).\n- Add tests in `tests/test_queue.py` covering part 1. Run `python3 -m pytest -q` as you go.\n\nPart 2 (do NOT implement it now — we will do it in a later session):\nAdd an audit trail so that every `enqueue` also records an audit entry. Keep these decisions in mind for part 2, repeat them in your summary of what is left, but write no part-2 code yet:\n- The audit level for an enqueued item is the uppercase string \"INFO\".\n- Put the audit API in a new module `app/audit.py`: `log_event(level, message, ts_ms)` stores `{\"level\": ..., \"message\": ..., \"ts_ms\": ...}` in a module-level list; `entries()` returns that list. `queue.enqueue` should call it.\n- Leave the root `README.md` exactly as it is; do not edit it.\n\nDo only part 1 now, then stop and tell me what's left for part 2.",
+  "resume_prompt": "Continue the work in this repository where the previous session left off, and finish the task.",
+  "checks": {
+    "hidden_tests": "hidden_test.py",
+    "forbidden_patterns": [
+      {"path": "app/audit.py", "regex": "time\\.time\\(|datetime\\.now\\(|from datetime|import time", "why": "timestamps must be integer epoch ms from app.clock.now_ms()"},
+      {"path": "app/queue.py", "regex": "time\\.time\\(|datetime\\.now\\(|from datetime|import time", "why": "timestamps must be integer epoch ms from app.clock.now_ms()"}
+    ],
+    "unchanged_files": ["README.md", "pyproject.toml"]
+  }
+}
