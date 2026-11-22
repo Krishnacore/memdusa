@@ -207,7 +207,9 @@ mod tests {
         assert!(e.embed(&texts(2)).await.unwrap_err().contains("got 0 embedding"));
 
         let e = HttpEmbedder::new("http://127.0.0.1:1/v1", "m", None, Duration::from_secs(2)).unwrap();
-        assert!(e.embed(&texts(1)).await.unwrap_err().starts_with("request failed"));
+        // unreachable: refused at once on Unix; Windows retries a refused connection for ~2s, so it may time out
+        let err = e.embed(&texts(1)).await.unwrap_err();
+        assert!(err.starts_with("request failed") || err == "request timed out", "{err}");
     }
 
     #[tokio::test]
