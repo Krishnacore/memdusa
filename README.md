@@ -280,6 +280,47 @@ Not redacted on purpose: variable references (`TOKEN=$GH_TOKEN`), numbers (`max_
 - `MEMDUSA_REDACT=off` stores everything verbatim.
 - Step outputs are redacted too, so a replayed step returns the redacted output. Don't pass secrets through runs.
 
+## Semantic search
+
+Search is lexical by default (full-text, any word may match). That misses memories worded differently: "how do we
+ship releases" won't find "the release workflow pushes binaries on tag". Turn on **semantic search** and memdusa also
+compares meaning, using embeddings from any OpenAI-compatible `/embeddings` API. It is **off unless you set
+`MEMDUSA_EMBED_URL`**.
+
+```sh
+# OpenAI
+export MEMDUSA_EMBED_URL=https://api.openai.com/v1      # uses OPENAI_API_KEY (only for api.openai.com)
+# fully local with Ollama (ollama pull nomic-embed-text)
+export MEMDUSA_EMBED_URL=http://localhost:11434/v1
+export MEMDUSA_EMBED_MODEL=nomic-embed-text
+
+memdusa embed          # embed the memories you already have (new and edited ones are embedded when saved)
+memdusa status         # "semantic search: on (model ..., 12/12 memories embedded)"
+```
+
+| Variable | Meaning |
+|---|---|
+| `MEMDUSA_EMBED_URL` | Base URL of the API (`POST {url}/embeddings`). Unset = semantic search off |
+| `MEMDUSA_EMBED_MODEL` | Model name (default `text-embedding-3-small`). Changing it re-embeds on the next `memdusa embed` |
+| `MEMDUSA_EMBED_API_KEY` | Bearer token. Falls back to `OPENAI_API_KEY`, but only when the URL host is `api.openai.com` |
+
+How it works:
+
+- One vector per memory (content and tags), stored in the database next to it (SQLite and Postgres alike; no
+  extension needed). A memory is re-embedded when its text changes; vectors of another model are ignored until
+  `memdusa embed` redoes them (`--all` redoes everything).
+- A search embeds the query (one API call) and ranks the 1000 most recent visible memories by
+  `0.6 × cosine similarity + 0.4 × lexical relevance`; memories without a vector rank by lexical relevance alone.
+  This feeds the `memory_search` tool, `memdusa recall`, the relevant memories shown with each prompt, and the brief.
+- `memory_review` also groups memories whose embeddings are very close (cosine ≥ 0.80), not only those sharing words.
+  Merging on save stays lexical.
+- It never gets in the way: if the API fails or is slow (10 s per request; 3 s for prompt recall and the brief),
+  memdusa logs one warning line and uses lexical search; a save or hook never fails because of embedding.
+- **Privacy:** memory text (already redacted before it is stored) and search queries are sent to the configured
+  provider. Use a local server such as Ollama to keep everything on your machine.
+- **Hosted mode:** the server's environment decides. Set the variables where `memdusa serve` runs; clients just call
+  the API and need nothing. Backfill a server with `memdusa embed` (admin).
+
 ## Hosted mode (any machine, cloud agents)
 
 **On the server**
@@ -416,6 +457,7 @@ with `attempt: 2`.
 | POST | `/v1/admin/users/{name}/disable`, `/enable`, `/keys` `{name}` |
 | GET | `/v1/admin/keys?user=`, DELETE `/v1/admin/keys/{id-or-prefix}` |
 | POST | `/v1/admin/prune` `{policy?, project?, dry_run?}` |
+| POST | `/v1/embeddings/backfill` `{all?}`: embed memories that lack a vector (admin; the server's embedding config) |
 | GET | `/v1/admin/export?project=` (JSON Lines), POST `/v1/admin/import` (JSON Lines body) |
 | GET | `/metrics` (Prometheus, no auth), `/health` |
 | POST | `/v1/hooks/{event}` `{project, agent, journal_prompts, stop_guard_mins, input}` |
@@ -502,7 +544,8 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
     claimed by another harness, and finished steps are never redone
   - [x] attribution in the brief: a "Who did what" summary per agent (files, commands, task, last active) when
     several agents worked recently
-- [ ] Semantic memory search (embeddings behind a trait; local model or API)
+- [x] Semantic memory search (embeddings behind a trait): API provider (OpenAI-compatible, so Ollama works too); a
+  built-in local model provider later
 - [x] Memory hygiene: update, near-duplicate merge, stale flags
 - [x] Memory consolidation: agent-driven review. `memory_review` (or `memdusa review`) finds related memories to merge, memories that mention files changed since, and old todos; the agent merges them with `memory_update` / `memory_forget`, and the brief nudges when there is enough to review. Old events are already summarized by retention.
 - [x] Per-user API keys, server-side attribution, private global memories

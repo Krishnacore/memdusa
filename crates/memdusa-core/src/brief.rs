@@ -520,7 +520,13 @@ async fn select_memories(
         None => (store.memory_search(query(None, RECENT_LIMIT)).await?, vec![]),
         Some(f) => (
             store.memory_search(query(None, CANDIDATES)).await?,
-            store.memory_search_ranked(query(Some(f.into()), CANDIDATES)).await?,
+            // semantic when configured; capped so a slow embedding API can't stall a session start
+            store
+                .memory_search_scored(query(Some(f.into()), CANDIDATES), Some(std::time::Duration::from_secs(3)))
+                .await?
+                .into_iter()
+                .map(|s| (s.memory, s.score))
+                .collect::<Vec<_>>(),
         ),
     };
     let mut ordered: Vec<&Memory> = candidates.iter().filter(|m| m.kind == MemoryKind::Preference).collect();

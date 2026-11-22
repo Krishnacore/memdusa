@@ -44,6 +44,8 @@ pub struct Store {
     backend: Backend,
     /// Applied to every piece of user/agent text before it is written.
     redactor: Arc<Redactor>,
+    /// Semantic search provider; `None` = lexical search only (the default).
+    pub(crate) embedder: Option<Arc<dyn crate::embed::Embedder>>,
 }
 
 // ---------------------------------------------------------------- tiny query builder
@@ -134,7 +136,7 @@ impl Migration {
 /// `search` tsvector column that `sqlx::Any` can't decode.
 pub(crate) const MEMORY_COLS: &str = "id, project, kind, content, tags, source, user_name, created_at, updated_at";
 /// [`MEMORY_COLS`] qualified with the `m` alias (searches join the FTS table, which has its own `id`/`content`).
-const MEMORY_COLS_M: &str =
+pub(crate) const MEMORY_COLS_M: &str =
     "m.id, m.project, m.kind, m.content, m.tags, m.source, m.user_name, m.created_at, m.updated_at";
 
 /// Most distinct terms a search considers.
@@ -190,6 +192,22 @@ pub(crate) fn similarity(a: &str, b: &str) -> f64 {
     }
     let common = wa.iter().filter(|x| wb.iter().any(|y| same_word(x, y))).count();
     common as f64 / (wa.len() + wb.len() - common) as f64
+}
+
+/// Append the visibility and kind conditions of a memory search (the SQL must alias `memories` as `m`).
+pub(crate) fn push_scope(q: &mut Q, f: &MemoryQuery) {
+    let globals = Store::global_visible(q, f.user.as_deref());
+    match &f.project {
+        Some(p) => {
+            let p = q.text(p.as_str());
+            q.push(&format!("(m.project = {p} OR {globals})"))
+        }
+        None => q.push(&format!("(m.project IS NOT NULL OR {globals})")),
+    };
+    if let Some(k) = f.kind {
+        let k = q.text(k.as_str());
+        q.push(&format!(" AND m.kind = {k}"));
+    }
 }
 
 /// Ordered, append-only list of migrations. Never edit a released entry:
@@ -312,6 +330,14 @@ const MIGRATIONS: &[Migration] = &[
         "ALTER TABLE steps ADD COLUMN owner TEXT",
         "ALTER TABLE steps ADD COLUMN lease_until BIGINT",
     ]),
+    // 6: semantic search. Vectors as base64 text (little-endian f32) so both backends share the code.
+    Migration::Portable(&["CREATE TABLE IF NOT EXISTS memory_embeddings (
+        memory_id TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        dim BIGINT NOT NULL,
+        vector TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at BIGINT NOT NULL)"]),
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -355,7 +381,7 @@ impl Store {
             .connect(&url)
             .await?;
 
-        let store = Self { pool, backend, redactor: Arc::new(Redactor::new(&[])?) };
+        let store = Self { pool, backend, redactor: Arc::new(Redactor::new(&[])?), embedder: None };
         store.migrate().await?;
         Ok(store)
     }
@@ -413,7 +439,7 @@ impl Store {
 
     // ------------------------------------------------------------ memory
 
-    fn row_to_memory(r: &AnyRow) -> Result<Memory> {
+    pub(crate) fn row_to_memory(r: &AnyRow) -> Result<Memory> {
         Ok(Memory {
             id: r.try_get("id")?,
             project: r.try_get("project")?,
@@ -479,16 +505,20 @@ impl Store {
             return Ok(existing);
         }
 
-        // a near-duplicate (same kind and scope) is updated in place: newer wording wins, tags merge
-        let candidates = self
-            .memory_search(MemoryQuery {
+        // a near-duplicate (same kind and scope) is updated in place: newer wording wins, tags merge.
+        // Always lexical: auto-merge must not depend on (or call) an embedding provider.
+        let candidates: Vec<Memory> = self
+            .lexical_ranked(MemoryQuery {
                 query: Some(content.clone()),
                 project: m.project.clone(),
                 kind: Some(m.kind),
                 limit: Some(NEAR_DUPLICATE_CANDIDATES),
                 user: m.user.clone(),
             })
-            .await?;
+            .await?
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         if let Some(mut near) = candidates
             .into_iter()
             .find(|c| c.project == m.project && similarity(&c.content, &content) >= NEAR_DUPLICATE)
@@ -499,6 +529,7 @@ impl Store {
                 }
             }
             self.memory_write(&near.id, &content, near.kind, &near.tags, m.source.as_deref(), now).await?;
+            self.embed_memory_best_effort(&near.id, &content, &near.tags).await;
             near.content = content;
             near.updated_at = now;
             if m.source.is_some() {
@@ -536,6 +567,7 @@ impl Store {
         ];
         q.push(&vals.join(", ")).push(")");
         q.build().execute(&self.pool).await?;
+        self.embed_memory_best_effort(&mem.id, &mem.content, &mem.tags).await;
         Ok(mem)
     }
 
@@ -618,6 +650,7 @@ impl Store {
         }
         mem.updated_at = now_ms();
         self.memory_write(id, &mem.content, mem.kind, &mem.tags, mem.source.as_deref(), mem.updated_at).await?;
+        self.embed_memory_best_effort(id, &mem.content, &mem.tags).await;
         Ok(mem)
     }
 
@@ -630,7 +663,15 @@ impl Store {
     /// Like [`Store::memory_search`], with each memory's relevance score
     /// (higher is better, comparable within one result set only; 0 when there
     /// was no query).
+    ///
+    /// With an embedder configured and a query, the search is semantic + lexical, see
+    /// [`Store::memory_search_scored`]; otherwise (or when the provider fails) it is purely lexical.
     pub async fn memory_search_ranked(&self, f: MemoryQuery) -> Result<Vec<(Memory, f64)>> {
+        Ok(self.memory_search_scored(f, None).await?.into_iter().map(|s| (s.memory, s.score)).collect())
+    }
+
+    /// Full-text search only (FTS5 / tsvector): the behaviour without an embedder.
+    pub(crate) async fn lexical_ranked(&self, f: MemoryQuery) -> Result<Vec<(Memory, f64)>> {
         let terms = f.query.as_deref().map(search_terms);
         let limit = f.limit.unwrap_or(20).clamp(1, 200);
         let ranked = match &terms {
@@ -671,18 +712,7 @@ impl Store {
             }
         }
 
-        let globals = Self::global_visible(&mut q, f.user.as_deref());
-        match f.project {
-            Some(p) => {
-                let p = q.text(p);
-                q.push(&format!("(m.project = {p} OR {globals})"))
-            }
-            None => q.push(&format!("(m.project IS NOT NULL OR {globals})")),
-        };
-        if let Some(k) = f.kind {
-            let k = q.text(k.as_str());
-            q.push(&format!(" AND m.kind = {k}"));
-        }
+        push_scope(&mut q, &f);
         let limit = q.int(limit);
         if ranked.is_some() {
             q.push(&format!(" ORDER BY score DESC, m.updated_at DESC LIMIT {limit}"));
@@ -707,6 +737,7 @@ impl Store {
         if q.build().execute(&self.pool).await?.rows_affected() == 0 {
             return Err(Error::NotFound(format!("memory {id}")));
         }
+        self.embedding_delete(id).await?;
         Ok(())
     }
 

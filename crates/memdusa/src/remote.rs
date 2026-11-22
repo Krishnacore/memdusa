@@ -155,6 +155,14 @@ impl Client {
         Ok(self.send(self.request(Method::GET, "/v1/memories/review").query(&[("project", project)])).await?)
     }
 
+    /// Embed memories missing a vector on the server (admin); the server's embedding config decides.
+    pub async fn embeddings_backfill(&self, all: bool) -> anyhow::Result<memdusa_core::embed::BackfillReport> {
+        let body = json!({ "all": all });
+        // embedding a big backlog takes a while
+        let req = self.request(Method::POST, "/v1/embeddings/backfill").json(&body).timeout(Duration::from_secs(600));
+        Ok(self.send(req).await?)
+    }
+
     pub async fn prune(
         &self,
         policy: &memdusa_core::retention::RetentionPolicy,
