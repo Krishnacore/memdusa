@@ -64,6 +64,64 @@ fn err(e: memdusa_core::Error) -> String {
     e.to_string()
 }
 
+// ---------------------------------------------------------------- lenient list params
+
+/// Deserialize a `Vec<String>` from either a JSON array of strings or a single string. A string is
+/// split on newlines, trimmed and has empty items dropped, so a model that sends multiline plain
+/// text instead of an array still works. Schemars reads the Rust type, so the advertised JSON schema
+/// stays an array.
+fn string_list<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of strings or a single string")
+        }
+        fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Self::Value, E> {
+            Ok(split_lines(s))
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// [`string_list`] for `Option<Vec<String>>` fields (null stays `None`).
+fn opt_string_list<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<Vec<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of strings, a single string, or null")
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<Self::Value, D::Error> {
+            string_list(d).map(Some)
+        }
+    }
+    d.deserialize_option(V)
+}
+
+fn split_lines(s: &str) -> Vec<String> {
+    s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
 // ---------------------------------------------------------------- params
 
 #[derive(Deserialize, JsonSchema)]
@@ -88,7 +146,7 @@ pub struct MemorySaveArgs {
     /// fact | preference | decision | todo | note
     #[serde(default)]
     pub kind: MemoryKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub tags: Vec<String>,
     /// Make this memory visible from every project (e.g. personal preferences).
     #[serde(default)]
@@ -108,7 +166,7 @@ pub struct MemoryUpdateArgs {
     #[serde(default)]
     pub kind: Option<MemoryKind>,
     /// Replaces the tags.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_string_list")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -140,15 +198,15 @@ pub struct IdArg {
 pub struct CheckpointArgs {
     /// What we're trying to achieve overall.
     pub goal: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub done: Vec<String>,
     /// Concrete next actions, in order.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub next: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub blockers: Vec<String>,
     /// Files a successor should look at first.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub files: Vec<String>,
     #[serde(default)]
     pub notes: Option<String>,
@@ -242,6 +300,7 @@ pub struct DelegateArgs {
     /// Name of the piece of work being split up, e.g. "windows release".
     pub name: String,
     /// One short, stable name per task (e.g. "install-scripts"): it becomes the worker's `MEMDUSA_TASK`.
+    #[serde(deserialize_with = "string_list")]
     pub tasks: Vec<String>,
     /// Calling again with the same key (or, without one, the same name) reuses the run and adds missing tasks.
     #[serde(default)]
@@ -913,6 +972,35 @@ mod tests {
         let (ok, text) = call(&c, "memory_review", serde_json::json!({})).await;
         assert!(ok, "{text}");
         assert!(text.contains("Related memories") && ids.iter().all(|id| text.contains(id)), "{text}");
+    }
+
+    #[tokio::test]
+    async fn list_args_accept_a_string_or_an_array() {
+        let c = client().await;
+        let (ok, r) = call(
+            &c,
+            "checkpoint",
+            serde_json::json!({
+                "goal": "lenient lists",
+                "done": "a\nb",
+                "next": ["x", "y"],
+                "blockers": "blocked",
+                "files": "\n src/a.rs \n\n src/b.rs\n"
+            }),
+        )
+        .await;
+        assert!(ok, "{r}");
+        let (_, md) = call(&c, "resume", serde_json::json!({})).await;
+        assert!(md.contains("**Done:**\n- a\n- b\n"), "{md}");
+        assert!(md.contains("**Next:**\n- x\n- y\n"), "{md}");
+        assert!(md.contains("**Blockers:**\n- blocked\n"), "{md}");
+        assert!(md.contains("**Key files:**\n- src/a.rs\n- src/b.rs\n"), "{md}");
+
+        // tags on memory_save use the same lenient deserializer
+        let (ok, saved) =
+            call(&c, "memory_save", serde_json::json!({ "content": "lenient tags", "tags": "alpha\nbeta" })).await;
+        assert!(ok, "{saved}");
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap()["tags"], serde_json::json!(["alpha", "beta"]));
     }
 
     #[tokio::test]
