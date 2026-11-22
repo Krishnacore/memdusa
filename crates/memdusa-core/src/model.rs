@@ -121,6 +121,10 @@ pub struct MemoryQuery {
     /// Caller identity, set by the server: whose global memories are visible.
     #[serde(skip)]
     pub user: Option<String>,
+    /// Project keys the caller may read; set by the server for cross-project
+    /// listings. `None` means no filtering (local/root mode).
+    #[serde(skip)]
+    pub allowed_projects: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------- users & API keys
@@ -180,6 +184,237 @@ impl Identity {
             None => agent.to_owned(),
         }
     }
+
+    /// Name used in the audit log for the caller (`root` for the shared token,
+    /// an open server or local/direct database access).
+    pub fn actor(&self) -> &str {
+        self.user.as_deref().unwrap_or("root")
+    }
+}
+
+// ---------------------------------------------------------------- access control & audit
+
+/// Access level a project operation needs, and the level a caller has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    None,
+    Read,
+    Write,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" => Self::Read,
+            "write" => Self::Write,
+            _ => Self::None,
+        }
+    }
+    /// Whether having `self` is enough for `needed`. Write implies read.
+    pub fn satisfies(self, needed: Self) -> bool {
+        self >= needed
+    }
+}
+
+/// Role of a project grant. `None` carves a project out of a broader grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Read,
+    Write,
+    None,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::None => "none",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+    pub fn access(self) -> Access {
+        match self {
+            Self::Read => Access::Read,
+            Self::Write => Access::Write,
+            Self::None => Access::None,
+        }
+    }
+}
+
+/// Server-wide fallback for users with no matching grant (`MEMDUSA_DEFAULT_ACCESS`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultPolicy {
+    /// Backward compatible: no grant means today's full access.
+    #[default]
+    Write,
+    /// Everyone may read; writing needs a grant.
+    Read,
+    /// Nothing without a grant.
+    None,
+}
+
+impl DefaultPolicy {
+    pub const ENV: &str = "MEMDUSA_DEFAULT_ACCESS";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::None => "none",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "write" => Some(Self::Write),
+            "read" => Some(Self::Read),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+    /// The server setting, defaulting to `write` (no behaviour change).
+    pub fn from_env() -> Self {
+        std::env::var(Self::ENV).ok().and_then(|v| Self::parse(&v)).unwrap_or_default()
+    }
+    pub fn access(self) -> Access {
+        match self {
+            Self::Write => Access::Write,
+            Self::Read => Access::Read,
+            Self::None => Access::None,
+        }
+    }
+}
+
+/// A user's grant on one project or a project prefix (`github.com/acme/*`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectGrant {
+    pub id: String,
+    /// Exact project key or a prefix ending in `/*`.
+    pub pattern: String,
+    /// User name the grant applies to.
+    pub user: String,
+    pub role: Role,
+    /// Identity that created the grant (`root` for local mode).
+    pub created_by: String,
+    pub created_at: Millis,
+}
+
+/// An audit log record. `outcome` distinguishes a denied request from a
+/// successful privileged action.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuditEvent {
+    pub id: String,
+    pub at: Millis,
+    pub actor: String,
+    /// Dotted action name, e.g. `grant.create`, `memory.forget`, `denied`.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Redacted structured detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
+    pub outcome: AuditOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditOutcome {
+    Ok,
+    Denied,
+}
+
+impl AuditOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Denied => "denied",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        if s == "denied" { Self::Denied } else { Self::Ok }
+    }
+}
+
+/// Input to [`crate::Store::audit`] (id and timestamp are assigned by the store).
+#[derive(Debug, Clone)]
+pub struct NewAuditEvent {
+    pub actor: String,
+    pub action: String,
+    pub project: Option<String>,
+    pub target: Option<String>,
+    pub detail: Option<Value>,
+    pub outcome: AuditOutcome,
+}
+
+impl NewAuditEvent {
+    pub fn ok(actor: impl Into<String>, action: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            action: action.into(),
+            project: None,
+            target: None,
+            detail: None,
+            outcome: AuditOutcome::Ok,
+        }
+    }
+
+    pub fn denied(actor: impl Into<String>, action: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            action: action.into(),
+            project: None,
+            target: None,
+            detail: None,
+            outcome: AuditOutcome::Denied,
+        }
+    }
+
+    pub fn project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
+    }
+
+    pub fn target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+
+    pub fn detail(mut self, detail: Value) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+}
+
+/// Filters for `GET /v1/admin/audit` and `memdusa audit`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AuditQuery {
+    #[serde(default)]
+    pub since: Option<Millis>,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 // ---------------------------------------------------------------- journal

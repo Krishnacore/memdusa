@@ -2,6 +2,7 @@
 //! execution service. Transport-agnostic; used by the HTTP API, the MCP
 //! server and the CLI.
 
+pub mod access;
 pub mod auth;
 pub mod brief;
 pub mod embed;

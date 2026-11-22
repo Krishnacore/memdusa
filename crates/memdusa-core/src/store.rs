@@ -210,13 +210,24 @@ pub(crate) fn similarity(a: &str, b: &str) -> f64 {
 /// Append the visibility and kind conditions of a memory search (the SQL must alias `memories` as `m`).
 pub(crate) fn push_scope(q: &mut Q, f: &MemoryQuery) {
     let globals = Store::global_visible(q, f.user.as_deref());
-    match &f.project {
+    let mut scope = match &f.project {
         Some(p) => {
             let p = q.text(p.as_str());
-            q.push(&format!("(m.project = {p} OR {globals})"))
+            format!("m.project = {p}")
         }
-        None => q.push(&format!("(m.project IS NOT NULL OR {globals})")),
+        None => "m.project IS NOT NULL".into(),
     };
+    // Cross-project listings only include projects the caller can read. An
+    // empty allowlist keeps global memories (private to their owner) only.
+    if let Some(allowed) = &f.allowed_projects {
+        scope = if allowed.is_empty() {
+            "1=0".into()
+        } else {
+            let ps: Vec<String> = allowed.iter().map(|p| q.text(p.as_str())).collect();
+            format!("({scope} AND m.project IN ({}))", ps.join(", "))
+        };
+    }
+    q.push(&format!("({scope} OR {globals})"));
     if let Some(k) = f.kind {
         let k = q.text(k.as_str());
         q.push(&format!(" AND m.kind = {k}"));
@@ -351,6 +362,31 @@ const MIGRATIONS: &[Migration] = &[
         vector TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         updated_at BIGINT NOT NULL)"]),
+    // 7: per-project access control and the audit log. No data changes: the
+    // default policy (`write`) keeps existing servers behaving as before.
+    Migration::Portable(&[
+        "CREATE TABLE IF NOT EXISTS project_grants (
+            id TEXT PRIMARY KEY,
+            pattern TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS project_grants_user ON project_grants (user_name)",
+        "CREATE INDEX IF NOT EXISTS project_grants_pattern ON project_grants (pattern)",
+        "CREATE TABLE IF NOT EXISTS audit_events (
+            id TEXT PRIMARY KEY,
+            at BIGINT NOT NULL,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            project TEXT,
+            target TEXT,
+            detail TEXT,
+            outcome TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS audit_events_at ON audit_events (at)",
+        "CREATE INDEX IF NOT EXISTS audit_events_actor ON audit_events (actor, at)",
+        "CREATE INDEX IF NOT EXISTS audit_events_project ON audit_events (project, at)",
+    ]),
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -527,6 +563,7 @@ impl Store {
                 kind: Some(m.kind),
                 limit: Some(NEAR_DUPLICATE_CANDIDATES),
                 user: m.user.clone(),
+                allowed_projects: None,
             })
             .await?
             .into_iter()
@@ -1472,10 +1509,29 @@ impl Store {
     }
 
     pub async fn run_list(&self, project: Option<&str>, status: Option<RunStatus>, limit: i64) -> Result<Vec<Run>> {
+        self.run_list_visible(project, None, status, limit).await
+    }
+
+    /// Like [`Self::run_list`], but restricted to `allowed` projects (used by
+    /// cross-project listings on a multi-user server).
+    pub async fn run_list_visible(
+        &self,
+        project: Option<&str>,
+        allowed: Option<&[String]>,
+        status: Option<RunStatus>,
+        limit: i64,
+    ) -> Result<Vec<Run>> {
         let mut q = Q::new("SELECT * FROM runs WHERE 1=1");
         if let Some(p) = project {
             let p = q.text(p);
             q.push(&format!(" AND project = {p}"));
+        }
+        if let Some(allowed) = allowed {
+            if allowed.is_empty() {
+                return Ok(vec![]);
+            }
+            let ps: Vec<String> = allowed.iter().map(|p| q.text(p.as_str())).collect();
+            q.push(&format!(" AND project IN ({})", ps.join(", ")));
         }
         if let Some(s) = status {
             let s = q.text(s.as_str());

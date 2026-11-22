@@ -439,7 +439,7 @@ hooks give up and exit quietly (in about 50 ms when the connection is refused).
 | **Keys** | `mdk_` + 256 random bits. Only a SHA-256 hash is stored, and each key is shown once. Keys are named (`laptop`, `ci`) and record when they were last used |
 | **Auth** | Turns on automatically once the first user exists, even if that user was created by the CLI while the server is running. Before that the server is open (fine for localhost only; it logs a warning) |
 | **Attribution** | Set by the server from the key: records and leases belong to `alice/claude-code`. Two users' agents with the same name never share a lease, and a client can't claim to be someone else |
-| **Global memories** | Private to their author: alice's "prefers small PRs" isn't in bob's brief. Project memories, checkpoints and runs are shared by everyone on the server |
+| **Global memories** | Private to their author: alice's "prefers small PRs" isn't in bob's brief. Project data is shared by users with access to that project (see below) |
 | **Shared `--token`** | Still accepted, as an admin credential not tied to a user (bootstrap or break-glass) |
 
 ```sh
@@ -453,7 +453,55 @@ memdusa key revoke mdk_1a2b3c4d           # by prefix or id; admins can revoke a
 Each command works directly against the database on the server, or through the API from any logged-in machine.
 `memdusa status` shows who you are.
 
-> Not yet: per-project access control. Every authenticated user can read and write every project on the server.
+### Team server: access control
+
+Authenticated users only reach the projects they're granted. Admins, the shared `--token` and an open server are root
+and bypass grants; global memories (project `NULL`) stay private to their author as before.
+
+| Default (`MEMDUSA_DEFAULT_ACCESS`) | User without a matching grant |
+|---|---|
+| `write` (default, backward compatible) | full read/write, as today |
+| `read` | may read every project; writing needs a grant |
+| `none` (recommended for multi-team servers) | nothing without a grant |
+
+The server prints the effective default next to its auth mode at startup. Set it on the server, e.g.
+`MEMDUSA_DEFAULT_ACCESS=none memdusa serve --addr 0.0.0.0:7077`. Grants take effect on the next request (one grants
+query per request).
+
+**Grants** match an exact project key or a prefix ending in `/*`:
+
+```sh
+memdusa grant alice 'github.com/acme/*' --role write
+memdusa grant alice 'github.com/acme/payroll' --role none   # carve out one project
+memdusa grants [--user alice]
+memdusa revoke-grant <id>                                   # by id, from `grants`
+```
+
+Rules: an exact grant beats any prefix; among prefixes the longest wins; `none` removes access even when the default
+would allow it. `write` implies read, `read` is read-only, `none` denies. All project-scoped REST endpoints and every
+remote MCP tool call enforce the same check (memories, checkpoints, events, resume, hooks and hooks batch, delegate,
+runs/steps/claims, review, project export). Run/step endpoints authorize against the run's stored project, not one
+supplied by the caller; cross-project listings and exports without `only_project` are admin-only (a single-project
+export only needs read). Denials return **403** with the project and the access needed. `memdusa status` /
+`GET /v1/whoami` show your effective grants and the server's default policy.
+
+The admin API mirrors the CLI: `POST /v1/admin/grants {pattern, user, role}`,
+`GET /v1/admin/grants[?user=]`, `DELETE /v1/admin/grants/{id}`.
+
+**Audit log.** The server records grant/user/key changes, memory forgets, prune, import, export, backfill, runs
+finished by someone other than their owner, and every denied request (not ordinary reads or hook writes — those are
+already attributed in the data). Each event has an actor, action, project, target, redacted detail JSON and an
+`ok`/`denied` outcome.
+
+```sh
+memdusa audit                                  # newest 100 events
+memdusa audit --since 7d --actor alice --project github.com/acme/shop --limit 50
+```
+
+`--since` accepts unix milliseconds or a relative `24h` / `7d` / `2w`. Equivalent API:
+`GET /v1/admin/audit?since=&actor=&project=&limit=` (admin only). Events are kept for 365 days by default
+(`MEMDUSA_AUDIT_DAYS`, `0` = keep forever) and pruned by the same job that handles data retention. Detail text is
+redacted with the same rules as memories.
 
 **Connecting a harness straight to the URL** also works. The optional headers save the agent from passing `project`
 on every call:
@@ -623,7 +671,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Memory hygiene: update, near-duplicate merge, stale flags
 - [x] Memory consolidation: agent-driven review. `memory_review` (or `memdusa review`) finds related memories to merge, memories that mention files changed since, and old todos; the agent merges them with `memory_update` / `memory_forget`, and the brief nudges when there is enough to review. Old events are already summarized by retention.
 - [x] Per-user API keys, server-side attribution, private global memories
-- [ ] Per-project access control (who can read/write which projects), audit log
+- [x] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)
 - [x] Local → hosted migration (`export | import`)
 - [ ] Continuous local ⇄ hosted sync
