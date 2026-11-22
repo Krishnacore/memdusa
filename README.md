@@ -337,8 +337,14 @@ memdusa status         # "semantic search: on (model ..., 12/12 memories embedde
 ### Built-in local model (no server, no API key)
 
 The `local-embed` cargo feature compiles in a retrieval-trained sentence transformer (`all-MiniLM-L6-v2`, 384 dims)
-running on ONNX Runtime. Release binaries, the Homebrew formula and the Docker image include it (it stays off until
-you select it); building from source needs `--features local-embed`. Nothing leaves your machine:
+running on ONNX Runtime. Nothing leaves your machine. It stays off until you select it. Where it's included:
+
+| | Built-in local model |
+|---|---|
+| macOS Apple Silicon (release binary, Homebrew) | ✓ |
+| Windows x64 (release binary) | ✓ |
+| Docker image (`ghcr.io/krishnacore/memdusa`) | ✓ |
+| Linux release binaries, Intel macOS | ✗: ONNX Runtime's prebuilt library needs glibc 2.38+ (the release binaries keep supporting Ubuntu 22.04 / Debian 12 / RHEL 9) and has no Intel-Mac build. Use Ollama (above), or build with `--features local-embed` on a glibc 2.38+ system |
 
 ```sh
 export MEMDUSA_EMBED_URL=local                    # or MEMDUSA_EMBED_PROVIDER=local

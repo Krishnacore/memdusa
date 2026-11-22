@@ -21,11 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-15-intel }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          # local-embed (built-in semantic search) only where ONNX Runtime's prebuilt library works without raising
+          # requirements: it has no x86_64-apple-darwin build, and on Linux it needs glibc 2.38+ (ubuntu-22.04 has 2.35;
+          # building on a newer distro would stop the binary running on Ubuntu 22.04 / Debian 12 / RHEL 9).
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, features: "" }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, features: "" }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, features: "" }
+          - { target: aarch64-apple-darwin, os: macos-latest, features: local-embed }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, features: local-embed }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -35,8 +38,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        # local-embed: built-in semantic search (off until MEMDUSA_EMBED_URL=local); ONNX Runtime is linked in statically
-        run: cargo build --release --locked --target ${{ matrix.target }} -p memdusa --features local-embed
+        # local-embed (where enabled above) stays off until MEMDUSA_EMBED_URL=local; ONNX Runtime is linked in statically
+        run: cargo build --release --locked --target ${{ matrix.target }} -p memdusa --features "${{ matrix.features }}"
       - name: Package
         shell: bash
         env:

@@ -117,8 +117,10 @@ pub async fn from_env(allow_download: bool) -> anyhow::Result<Option<Arc<dyn Emb
         {
             let _ = (&allow_download, &model);
             anyhow::bail!(
-                "local embeddings need a memdusa built with the `local-embed` cargo feature \
-                 (MEMDUSA_EMBED_URL=local)"
+                "this memdusa build has no built-in local embeddings (MEMDUSA_EMBED_URL=local). Release binaries \
+                 include them on macOS Apple Silicon and Windows, and in the Docker image; elsewhere use Ollama \
+                 (MEMDUSA_EMBED_URL=http://localhost:11434/v1) or build with `--features local-embed` on a system \
+                 with glibc 2.38+"
             );
         }
     }
