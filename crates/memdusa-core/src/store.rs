@@ -19,6 +19,19 @@ use crate::{Error, Result};
 
 const DEFAULT_LEASE_SECS: i64 = 600;
 
+/// Lease a worker holds on its step of a delegated run (15 minutes); every hook event of the worker renews it.
+pub const DEFAULT_STEP_LEASE_SECS: i64 = 900;
+
+/// The step lease length: `MEMDUSA_STEP_LEASE_SECS` (a test/ops override, read where the claim happens, so on the
+/// server in remote mode) or [`DEFAULT_STEP_LEASE_SECS`].
+pub fn step_lease_secs() -> i64 {
+    std::env::var("MEMDUSA_STEP_LEASE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|s| *s >= 0)
+        .unwrap_or(DEFAULT_STEP_LEASE_SECS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Sqlite,
@@ -294,6 +307,11 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS memories_search ON memories USING GIN (search)",
         ],
     },
+    // 5: per-step leases for delegated runs (steps can be `pending`, claimed by a worker, and go stale)
+    Migration::Portable(&[
+        "ALTER TABLE steps ADD COLUMN owner TEXT",
+        "ALTER TABLE steps ADD COLUMN lease_until BIGINT",
+    ]),
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -889,35 +907,46 @@ impl Store {
     fn row_to_run(r: &AnyRow) -> Result<Run> {
         let status = RunStatus::parse(&r.try_get::<String, _>("status")?);
         let lease_until: Option<i64> = r.try_get("lease_until")?;
+        let input = from_json(r.try_get("input")?);
+        // a delegated run has no run-level lease: its steps carry the leases
+        let stale = status == RunStatus::Running
+            && !is_delegated_input(input.as_ref())
+            && lease_until.is_none_or(|l| l <= now_ms());
         Ok(Run {
             id: r.try_get("id")?,
             project: r.try_get("project")?,
             name: r.try_get("name")?,
             idempotency_key: r.try_get("idempotency_key")?,
             status,
-            input: from_json(r.try_get("input")?),
+            input,
             output: from_json(r.try_get("output")?),
             error: r.try_get("error")?,
             owner: r.try_get("owner")?,
             lease_until,
             created_at: r.try_get("created_at")?,
             updated_at: r.try_get("updated_at")?,
-            stale: status == RunStatus::Running && lease_until.is_none_or(|l| l <= now_ms()),
+            stale,
         })
     }
 
     fn row_to_step(r: &AnyRow) -> Result<Step> {
+        let status = StepStatus::parse(&r.try_get::<String, _>("status")?);
+        let lease_until: Option<i64> = r.try_get("lease_until")?;
         Ok(Step {
             run_id: r.try_get("run_id")?,
             key: r.try_get("step_key")?,
             seq: r.try_get("seq")?,
-            status: StepStatus::parse(&r.try_get::<String, _>("status")?),
+            status,
             input: from_json(r.try_get("input")?),
             output: from_json(r.try_get("output")?),
             error: r.try_get("error")?,
             attempts: r.try_get("attempts")?,
             started_at: r.try_get("started_at")?,
             completed_at: r.try_get("completed_at")?,
+            owner: r.try_get("owner")?,
+            lease_until,
+            // a running step without a lease belongs to a single-agent run, whose run-level lease governs it
+            stale: status == StepStatus::Running && lease_until.is_some_and(|l| l < now_ms()),
         })
     }
 
@@ -1083,9 +1112,11 @@ impl Store {
             q.text(StepStatus::Completed.as_str()),
         );
         q.push(&format!(
-            "status = {s}, output = {o}, error = NULL, completed_at = {n} WHERE run_id = {r} AND step_key = {k} AND status <> {done}"
+            "status = {s}, output = {o}, error = NULL, completed_at = {n}, lease_until = NULL \
+             WHERE run_id = {r} AND step_key = {k} AND status <> {done}"
         ));
         q.build().execute(&self.pool).await?;
+        self.touch_run(run_id).await?;
         self.step_get(run_id, key).await
     }
 
@@ -1100,9 +1131,195 @@ impl Store {
             q.text(key),
             q.text(StepStatus::Completed.as_str()),
         );
-        q.push(&format!("status = {s}, error = {e} WHERE run_id = {r} AND step_key = {k} AND status <> {done}"));
+        q.push(&format!(
+            "status = {s}, error = {e}, lease_until = NULL WHERE run_id = {r} AND step_key = {k} AND status <> {done}"
+        ));
         q.build().execute(&self.pool).await?;
+        self.touch_run(run_id).await?;
         self.step_get(run_id, key).await
+    }
+
+    /// Bump a run's `updated_at` (steps changed), without touching its lease.
+    async fn touch_run(&self, run_id: &str) -> Result<()> {
+        let mut q = Q::new("UPDATE runs SET ");
+        let (n, r) = (q.int(now_ms()), q.text(run_id));
+        q.push(&format!("updated_at = {n} WHERE id = {r}"));
+        q.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ delegated runs
+
+    /// Delegate `tasks` as one durable run: each task is a `pending` step (its key is the task name) that a
+    /// worker later claims with [`Store::step_claim`]. Returns the existing *running* run with the same
+    /// idempotency key (or, without a key, the same name), adding the tasks it lacks.
+    pub async fn run_delegate(
+        &self,
+        project: &str,
+        name: &str,
+        tasks: Vec<String>,
+        idempotency_key: Option<String>,
+    ) -> Result<RunWithSteps> {
+        let mut keys: Vec<String> = vec![];
+        for t in tasks {
+            let t = self.redactor.string(t.trim().to_owned());
+            if !t.is_empty() && !keys.contains(&t) {
+                keys.push(t);
+            }
+        }
+        if keys.is_empty() {
+            return Err(Error::Invalid("delegate at least one task".into()));
+        }
+        let name = self.redactor.string(name.trim().to_owned());
+        if name.is_empty() {
+            return Err(Error::Invalid("a delegated run needs a name".into()));
+        }
+
+        let existing = match &idempotency_key {
+            Some(k) => {
+                let mut q = Q::new("SELECT id FROM runs WHERE project = ");
+                let (p, k) = (q.text(project), q.text(k));
+                q.push(&format!("{p} AND idempotency_key = {k}"));
+                q.build().fetch_optional(&self.pool).await?
+            }
+            None => {
+                let mut q = Q::new("SELECT id, input FROM runs WHERE project = ");
+                let (p, n, s) = (q.text(project), q.text(&name), q.text(RunStatus::Running.as_str()));
+                q.push(&format!("{p} AND name = {n} AND status = {s} ORDER BY created_at DESC LIMIT 20"));
+                q.build().fetch_all(&self.pool).await?.into_iter().find(|r| {
+                    r.try_get::<Option<String>, _>("input")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|i| is_delegated_input(from_json(Some(i)).as_ref()))
+                })
+            }
+        };
+        let id = match existing {
+            Some(row) => row.try_get::<String, _>("id")?,
+            None => {
+                let now = now_ms();
+                let id = new_id();
+                let input = serde_json::json!({ DELEGATED_MARKER: true });
+                let mut q = Q::new(
+                    "INSERT INTO runs (id, project, name, idempotency_key, status, input, lease_secs, created_at, updated_at) VALUES (",
+                );
+                let vals = [
+                    q.text(&id),
+                    q.text(project),
+                    q.text(&name),
+                    q.opt_text(idempotency_key.clone()),
+                    q.text(RunStatus::Running.as_str()),
+                    q.text(input.to_string()),
+                    q.int(DEFAULT_LEASE_SECS),
+                    q.int(now),
+                    q.int(now),
+                ];
+                q.push(&vals.join(", ")).push(")");
+                match q.build().execute(&self.pool).await {
+                    Ok(_) => id,
+                    // lost a race on the idempotency key: the winner's run is the one
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                        return Box::pin(self.run_delegate(project, &name, keys, idempotency_key)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+
+        let run = self.run_find(&id).await?;
+        if run.status == RunStatus::Running {
+            for key in &keys {
+                let mut q = Q::new("INSERT INTO steps (run_id, step_key, seq, status, attempts, started_at) VALUES (");
+                let r = q.text(&id);
+                let vals = [
+                    r.clone(),
+                    q.text(key),
+                    format!("(SELECT COUNT(*) + 1 FROM steps WHERE run_id = {r})"),
+                    q.text(StepStatus::Pending.as_str()),
+                    q.int(0),
+                    q.int(now_ms()),
+                ];
+                q.push(&vals.join(", ")).push(") ON CONFLICT (run_id, step_key) DO NOTHING");
+                q.build().execute(&self.pool).await?;
+            }
+            self.touch_run(&id).await?;
+        }
+        self.run_get(&id).await
+    }
+
+    /// A worker claims its step of a delegated run: `Claimed` (pending, failed, stale, or already the caller's),
+    /// `AlreadyDone` (never redo it), or `HeldBy` another worker's live lease, which `force` takes anyway.
+    pub async fn step_claim(
+        &self,
+        run_id: &str,
+        key: &str,
+        owner: &str,
+        lease_secs: i64,
+        force: bool,
+    ) -> Result<ClaimResult> {
+        let before = self.step_get(run_id, key).await?;
+        if before.status == StepStatus::Completed {
+            return Ok(ClaimResult::AlreadyDone { output: before.output });
+        }
+        let run = self.run_find(run_id).await?;
+        if run.status.is_terminal() {
+            return Err(Error::Conflict(format!("run {run_id} is already {}", run.status.as_str())));
+        }
+
+        let now = now_ms();
+        let ours = before.status == StepStatus::Running && before.owner.as_deref() == Some(owner);
+        let mut q = Q::new("UPDATE steps SET ");
+        let (s, o, n, secs, running, done) = (
+            q.text(StepStatus::Running.as_str()),
+            q.text(owner),
+            q.int(now),
+            q.int(lease_secs.max(0)),
+            q.text(StepStatus::Running.as_str()),
+            q.text(StepStatus::Completed.as_str()),
+        );
+        // renewing our own lease isn't a new attempt
+        q.push(&format!(
+            "status = {s}, owner = {o}, lease_until = {n} + {secs} * 1000, \
+             attempts = attempts + (CASE WHEN status = {running} AND owner = {o} THEN 0 ELSE 1 END), \
+             started_at = (CASE WHEN status = {running} AND owner = {o} THEN started_at ELSE {n} END)"
+        ));
+        let (r, k) = (q.text(run_id), q.text(key));
+        q.push(&format!(" WHERE run_id = {r} AND step_key = {k} AND status <> {done}"));
+        if !force {
+            q.push(&format!(
+                " AND (status <> {running} OR owner IS NULL OR owner = {o} OR lease_until IS NULL OR lease_until <= {n})"
+            ));
+        }
+        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+            // someone else got there first
+            let now_step = self.step_get(run_id, key).await?;
+            return Ok(match now_step.status {
+                StepStatus::Completed => ClaimResult::AlreadyDone { output: now_step.output },
+                _ => ClaimResult::HeldBy {
+                    owner: now_step.owner.unwrap_or_default(),
+                    lease_until: now_step.lease_until.unwrap_or(now),
+                },
+            });
+        }
+        self.touch_run(run_id).await?;
+        let took_over = before.status == StepStatus::Running && !ours;
+        Ok(ClaimResult::Claimed {
+            attempt: if ours { before.attempts } else { before.attempts + 1 },
+            previous_owner: if took_over { before.owner } else { None },
+            stale: took_over && before.lease_until.is_none_or(|l| l <= now),
+            previous_error: before.error,
+        })
+    }
+
+    /// Extend the lease of a step the caller still owns. `false` when it doesn't (taken over, finished, unknown).
+    pub async fn step_heartbeat(&self, run_id: &str, key: &str, owner: &str, lease_secs: i64) -> Result<bool> {
+        let mut q = Q::new("UPDATE steps SET ");
+        let (n, secs) = (q.int(now_ms()), q.int(lease_secs.max(0)));
+        let (r, k, o, running) = (q.text(run_id), q.text(key), q.text(owner), q.text(StepStatus::Running.as_str()));
+        q.push(&format!(
+            "lease_until = {n} + {secs} * 1000 WHERE run_id = {r} AND step_key = {k} AND owner = {o} AND status = {running}"
+        ));
+        Ok(q.build().execute(&self.pool).await?.rows_affected() > 0)
     }
 
     async fn step_get(&self, run_id: &str, key: &str) -> Result<Step> {
@@ -1146,9 +1363,13 @@ impl Store {
 
     /// (running, stale) run counts, for metrics.
     pub async fn run_counts(&self) -> Result<(i64, i64)> {
-        let mut q = Q::new("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN lease_until IS NULL OR lease_until <= ");
+        // delegated runs hold no run-level lease (their steps do), so they can't go stale as a whole
+        let mut q = Q::new(&format!(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN (input IS NULL OR input NOT LIKE '%{DELEGATED_MARKER}%') \
+             AND (lease_until IS NULL OR lease_until <= "
+        ));
         let (now, running) = (q.int(now_ms()), q.text(RunStatus::Running.as_str()));
-        q.push(&format!("{now} THEN 1 ELSE 0 END), 0) AS stale FROM runs WHERE status = {running}"));
+        q.push(&format!("{now}) THEN 1 ELSE 0 END), 0) AS stale FROM runs WHERE status = {running}"));
         let row = q.build().fetch_one(&self.pool).await?;
         Ok((row.try_get("n")?, row.try_get("stale")?))
     }

@@ -126,6 +126,14 @@ impl ServerHandler for Proxy {
         {
             request.arguments.get_or_insert_with(Default::default).entry("task").or_insert(task.into());
         }
+        // Likewise a worker's finishing tools: its run and task come from this machine's environment.
+        if matches!(request.name.as_ref(), "task_complete" | "task_fail") {
+            for (arg, var) in [("task", "MEMDUSA_TASK"), ("run", "MEMDUSA_RUN")] {
+                if let Some(v) = std::env::var(var).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()) {
+                    request.arguments.get_or_insert_with(Default::default).entry(arg).or_insert(v.into());
+                }
+            }
+        }
         Ok(match self.upstream.call_tool(request).await {
             Ok(result) => result.into(),
             // Surface transport failures to the agent as a readable tool error.

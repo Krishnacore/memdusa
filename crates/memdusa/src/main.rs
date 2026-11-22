@@ -86,6 +86,22 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Coordinator: delegate tasks as one durable run and print the env line to launch each worker with.
+    Delegate {
+        /// Name of the piece of work, e.g. "windows release".
+        name: String,
+        /// One short, stable name per task (becomes the worker's MEMDUSA_TASK).
+        #[arg(required = true)]
+        tasks: Vec<String>,
+        /// Reuse the run with this idempotency key (default: the running run with the same name).
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Worker: finish the task this agent was launched with (MEMDUSA_RUN + MEMDUSA_TASK).
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
     /// Save a memory from the command line.
     Remember {
         content: String,
@@ -301,6 +317,36 @@ fn print_prune(r: &memdusa_core::retention::PruneReport) {
 }
 
 #[derive(Subcommand)]
+enum TaskCmd {
+    /// Mark the task done (it is never redone: a worker started on it later is told so).
+    Done {
+        /// What was done and where to find it; shown to the coordinator.
+        #[arg(long)]
+        summary: Option<String>,
+    },
+    /// Give the task up; a replacement worker can claim it again.
+    Fail {
+        /// Why it can't be finished.
+        reason: String,
+    },
+}
+
+impl TaskCmd {
+    /// The (run, task) from the worker's environment, and the outcome to record.
+    fn outcome(self) -> anyhow::Result<(String, String, Result<Option<serde_json::Value>, String>)> {
+        let run = env_nonempty("MEMDUSA_RUN").context("MEMDUSA_RUN is not set: this isn't a delegated worker")?;
+        let task = env_nonempty("MEMDUSA_TASK").context("MEMDUSA_TASK is not set: this isn't a delegated worker")?;
+        let outcome = match self {
+            Self::Done { summary } => {
+                Ok(summary.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).map(serde_json::Value::String))
+            }
+            Self::Fail { reason } => Err(reason),
+        };
+        Ok((run, task, outcome))
+    }
+}
+
+#[derive(Subcommand)]
 enum UserCmd {
     /// Create a user and their first API key (printed once).
     Add {
@@ -495,7 +541,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
             let server = mcp::MemdusaMcp::new(
                 store,
-                mcp::Defaults { project, agent, cwd: std::env::current_dir().ok(), task: env_nonempty("MEMDUSA_TASK") },
+                mcp::Defaults {
+                    project,
+                    agent,
+                    cwd: std::env::current_dir().ok(),
+                    task: env_nonempty("MEMDUSA_TASK"),
+                    run: env_nonempty("MEMDUSA_RUN"),
+                },
             );
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
@@ -518,6 +570,18 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print!("{}", b.markdown);
             }
+        }
+        Cmd::Delegate { name, tasks, key } => {
+            let project = project.context("could not detect project; pass --project")?;
+            print!("{}", brief::delegate_report(&store.run_delegate(&project, &name, tasks, key).await?));
+        }
+        Cmd::Task { cmd } => {
+            let (run, task, outcome) = cmd.outcome()?;
+            match outcome {
+                Ok(output) => store.step_complete(&run, &task, output).await?,
+                Err(reason) => store.step_fail(&run, &task, &reason).await?,
+            };
+            println!("task {task}: recorded");
         }
         Cmd::Remember { content, kind, global } => {
             let project = if global {
@@ -666,6 +730,16 @@ async fn run_remote(
             } else {
                 print!("{}", b["markdown"].as_str().unwrap_or_default());
             }
+        }
+        Cmd::Delegate { name, tasks, key } => {
+            let project = project.context("could not detect project; pass --project")?;
+            let run = client()?.delegate(&project, &name, &tasks, key.as_deref()).await?;
+            print!("{}", brief::delegate_report(&run));
+        }
+        Cmd::Task { cmd } => {
+            let (run, task, outcome) = cmd.outcome()?;
+            client()?.task_finish(&run, &task, outcome).await?;
+            println!("task {task}: recorded");
         }
         Cmd::Remember { content, kind, global } => {
             let project = if global {
@@ -869,6 +943,7 @@ async fn run_hook_input(
         at: Some(model::now_ms()),
         task: env_nonempty("MEMDUSA_TASK"),
         parent: env_nonempty("MEMDUSA_PARENT"),
+        run: env_nonempty("MEMDUSA_RUN"),
     };
 
     let resp = match Mode::detect(database_url)? {
