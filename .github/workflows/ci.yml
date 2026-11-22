@@ -64,6 +64,37 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --locked
 
+  homebrew:
+    name: homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck packaging/homebrew/render-formula.sh
+      - name: Render and check the formula
+        run: |
+          script="$PWD/packaging/homebrew/render-formula.sh"
+          dir="$(mktemp -d)"
+          targets="aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
+          i=0
+          for t in $targets; do
+            i=$((i + 1))
+            printf '%064x  memdusa-v1.2.3-%s.tar.gz\n' "$i" "$t" > "$dir/memdusa-v1.2.3-$t.tar.gz.sha256"
+          done
+          "$script" v1.2.3 "$dir" owner/repo > "$dir/memdusa.rb"
+          ruby -c "$dir/memdusa.rb"
+          i=0
+          for t in $targets; do
+            i=$((i + 1))
+            grep -qF "https://github.com/owner/repo/releases/download/v1.2.3/memdusa-v1.2.3-$t.tar.gz\"" "$dir/memdusa.rb"
+            grep -qF "$(printf '%064x' "$i")" "$dir/memdusa.rb"
+          done
+          # a missing checksum file must fail
+          rm "$dir/memdusa-v1.2.3-x86_64-apple-darwin.tar.gz.sha256"
+          if "$script" v1.2.3 "$dir" owner/repo > /dev/null; then echo "missing checksum was accepted"; exit 1; fi
+          # so must a malformed one
+          echo "nothex  file" > "$dir/memdusa-v1.2.3-x86_64-apple-darwin.tar.gz.sha256"
+          if "$script" v1.2.3 "$dir" owner/repo > /dev/null; then echo "malformed checksum was accepted"; exit 1; fi
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

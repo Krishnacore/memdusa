@@ -31,6 +31,7 @@ machine and in every harness. Without a remote it falls back to the git root pat
 
 ## Install
 
+- **Homebrew** (macOS and Linux, arm64 and x86_64): `brew install krishnacore/tap/memdusa`
 - **Prebuilt binaries** (Linux x86_64/arm64, macOS Intel/Apple Silicon, Windows): download from the GitHub release
   for each `v*` tag, unpack, and put `memdusa` on your `PATH`.
 - **Server image**: `docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa` (SQLite in the `/data`
@@ -375,6 +376,11 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and W
 Postgres 15 and 17, and a Docker build. Pushing a `v*` tag runs `release.yml`: binaries for five targets with
 SHA-256 checksums attached to a GitHub release, and a multi-arch image pushed to GHCR.
 
+The release workflow also updates the formula in the `homebrew-tap` repository automatically (rendered by
+`packaging/homebrew/render-formula.sh`, skipped for pre-release tags). It needs the repository secret
+`HOMEBREW_TAP_DEPLOY_KEY`: the private half of a deploy key with write access on the tap repo. Without it the job
+only prints a warning.
+
 ```sh
 cargo test                                                      # SQLite
 MEMDUSA_TEST_POSTGRES_URL=postgres://localhost/memdusa_test cargo test   # + Postgres
@@ -395,8 +401,8 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Ranked full-text memory search
 - [x] Relevant memories injected on each prompt
 - [ ] **Easy installation on every platform** (today: download a release archive, `cargo install`, or Docker)
-  - macOS/Linux: a Homebrew tap (`brew install krishnacore/tap/memdusa`) whose formula the release workflow updates
-    automatically (version, URLs, SHA-256 per platform); later, a homebrew-core submission
+  - ✓ macOS/Linux: a Homebrew tap (`brew install krishnacore/tap/memdusa`) whose formula the release workflow updates
+    automatically (version, URLs, SHA-256 per platform); later, a homebrew-core submission (not done yet)
   - one-line install script (`curl -fsSL …/install.sh | sh`) that picks the right archive, verifies its checksum and
     installs to `~/.local/bin`, plus a PowerShell equivalent for Windows
   - Windows: Scoop bucket and winget manifest, generated per release
