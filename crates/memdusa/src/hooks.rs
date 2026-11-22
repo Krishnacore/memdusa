@@ -16,8 +16,9 @@
 
 use std::path::Path;
 
-use memdusa_core::brief::{self, COMMAND, FILE_CHANGE, STOP_GUARD};
+use memdusa_core::brief::{self, AGENT_MESSAGE, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, MEMORY_RECALL, STOP_GUARD};
 use memdusa_core::model::*;
+use memdusa_core::store::words;
 use memdusa_core::{Result, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +30,8 @@ pub enum HookEvent {
     PostToolUse,
     Stop,
     PreCompact,
+    /// Claude Code: after compaction, with the summary the harness generated.
+    PostCompact,
     SessionEnd,
     /// Commits, branch switches and merges, collected by `memdusa git-hook`.
     Git,
@@ -43,6 +46,7 @@ impl HookEvent {
             Self::PostToolUse => "post-tool-use",
             Self::Stop => "stop",
             Self::PreCompact => "pre-compact",
+            Self::PostCompact => "post-compact",
             Self::SessionEnd => "session-end",
             Self::Git => "git",
         }
@@ -52,7 +56,7 @@ impl HookEvent {
     /// explicit timeout raises that budget.
     pub fn timeout_secs(self) -> u64 {
         match self {
-            Self::SessionStart | Self::SessionEnd | Self::PreCompact => 10,
+            Self::SessionStart | Self::SessionEnd | Self::PreCompact | Self::PostCompact => 10,
             Self::Git => 3,
             _ => 5,
         }
@@ -87,7 +91,13 @@ pub struct HookInput {
     /// Stop: true when Claude is already continuing because of a Stop hook.
     #[serde(default)]
     pub stop_hook_active: Option<bool>,
-    /// PreCompact: manual | auto
+    /// Stop: the agent's final message of the turn (Claude Code, Codex; adapters normalize others).
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// PostCompact: the summary the harness generated.
+    #[serde(default)]
+    pub compact_summary: Option<String>,
+    /// PreCompact / PostCompact: manual | auto
     #[serde(default)]
     pub trigger: Option<String>,
     /// SessionEnd
@@ -112,6 +122,13 @@ pub struct HookConfig {
     /// Stop guard: ask for a checkpoint when files changed and the last
     /// checkpoint is older than this many minutes. 0 disables the guard.
     pub stop_guard_mins: i64,
+    /// Inject the memories relevant to each prompt (UserPromptSubmit). `MEMDUSA_RECALL=off` disables it.
+    #[serde(default = "default_recall")]
+    pub recall: bool,
+}
+
+fn default_recall() -> bool {
+    true
 }
 
 /// One hook invocation, as sent to `POST /v1/hooks/{event}` in remote mode.
@@ -153,7 +170,15 @@ impl HookEvent {
     /// unreachable now. SessionStart and Stop produce output that is only
     /// useful in the moment, so they aren't queued.
     pub fn queueable(self) -> bool {
-        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd | Self::Git)
+        matches!(
+            self,
+            Self::UserPromptSubmit
+                | Self::PostToolUse
+                | Self::PreCompact
+                | Self::PostCompact
+                | Self::SessionEnd
+                | Self::Git
+        )
     }
 }
 
@@ -197,6 +222,11 @@ pub async fn handle_request(
 
 /// How much of a user's request is kept verbatim.
 const MAX_PROMPT_CHARS: usize = 4_000;
+/// The agent's last message and a compaction summary, as stored.
+const MAX_MESSAGE_CHARS: usize = 1_500;
+const MAX_SUMMARY_CHARS: usize = 4_000;
+/// How much of the last message goes into a fallback checkpoint's notes.
+const MAX_NOTE_MESSAGE_CHARS: usize = 800;
 
 /// Claude Code caps `additionalContext` at 10,000 chars (beyond that it only
 /// shows a preview); keep the brief plus wrapper safely under it.
@@ -228,13 +258,33 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
                 // (The handoff eval caught this: a 400-char cut dropped half of a task's requirements.)
                 log(&ctx, "prompt", truncate(p, 200), Some(json!({ "text": truncate(p, MAX_PROMPT_CHARS) }))).await?;
             }
-            Ok(None)
+            // Best effort: a failed recall must never fail the hook.
+            let prompt = input.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty());
+            match prompt {
+                Some(p) if ctx.cfg.recall => recall(&ctx, p).await.or_else(|e| {
+                    eprintln!("memdusa: recall failed: {e}");
+                    Ok(None)
+                }),
+                _ => Ok(None),
+            }
         }
         HookEvent::PostToolUse => {
             post_tool_use(&ctx, input.tool_name.as_deref().unwrap_or_default(), input.tool_input.as_ref()).await?;
             Ok(None)
         }
-        HookEvent::Stop => stop(&ctx, input.stop_hook_active.unwrap_or(false)).await,
+        HookEvent::Stop => {
+            if let Some(m) = input.last_assistant_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                record_agent_message(&ctx, m).await?;
+            }
+            stop(&ctx, input.stop_hook_active.unwrap_or(false)).await
+        }
+        HookEvent::PostCompact => {
+            if let Some(s) = input.compact_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let trigger = input.trigger.as_deref().unwrap_or("auto");
+                log(&ctx, COMPACT_SUMMARY, truncate(s, MAX_SUMMARY_CHARS), Some(json!({ "trigger": trigger }))).await?;
+            }
+            Ok(None)
+        }
         HookEvent::PreCompact => {
             let trigger = input.trigger.as_deref().unwrap_or("auto");
             auto_checkpoint(&ctx, &format!("context compaction ({trigger})")).await?;
@@ -290,6 +340,16 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
         md.truncate(cut);
         md.push_str("\n\n…(truncated; call the memdusa `resume` tool for the full brief)");
     }
+    // The memories in the brief count as already shown: don't recall them again this session.
+    let shown: Vec<&str> = b.memories.iter().filter(|m| md.contains(&m.content)).map(|m| m.id.as_str()).collect();
+    if ctx.session.is_some() && !shown.is_empty() {
+        let n = shown.len();
+        if let Err(e) =
+            log(ctx, MEMORY_RECALL, format!("{n} memories in the session brief"), Some(json!({ "ids": shown }))).await
+        {
+            eprintln!("memdusa: could not record the brief's memories: {e}");
+        }
+    }
     let context = format!(
         "<memdusa-resume project=\"{}\">\n{md}\n</memdusa-resume>\n\
          The brief above was loaded from memdusa, the shared memory used by every agent and tool on this project \
@@ -299,6 +359,93 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     );
     Ok(Some(
         json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context } }).to_string(),
+    ))
+}
+
+/// Memories injected per prompt, at most.
+const RECALL_MAX: usize = 5;
+/// Ranked candidates fetched (some are dropped as weak matches or already shown).
+const RECALL_CANDIDATES: i64 = 25;
+/// Prompt terms searched for.
+const RECALL_TERMS: usize = 16;
+/// Longest memory shown, in characters.
+const RECALL_MEMORY_CHARS: usize = 500;
+
+/// Words too common to say anything about what a prompt is about.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was", "one", "our", "out",
+    "has", "him", "his", "how", "its", "may", "new", "now", "old", "see", "two", "way", "who", "did", "get", "got",
+    "let", "put", "say", "she", "too", "use", "that", "with", "have", "this", "will", "your", "from", "they", "been",
+    "were", "what", "when", "where", "which", "while", "would", "could", "should", "there", "their", "about", "into",
+    "than", "then", "them", "these", "those", "some", "such", "only", "also", "just", "like", "make", "does", "dont",
+    "want", "need", "please", "thanks", "thank", "here", "more", "most", "very", "much", "each", "other", "over",
+    "after", "before", "again", "still", "work", "code", "file", "files",
+];
+
+/// Memories relevant to the user's prompt, as `additionalContext`. Needs a
+/// session (to remember what it already showed); returns `None` when nothing
+/// matches well enough or everything relevant was shown before.
+async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
+    let Some(session) = &ctx.session else { return Ok(None) };
+    let terms: Vec<String> = words(prompt)
+        .into_iter()
+        .filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str()))
+        .take(RECALL_TERMS)
+        .collect();
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    // "Meaningful": at least two of the prompt's terms (one, if it only has one).
+    let need = terms.len().min(2);
+
+    let candidates = ctx
+        .store
+        .memory_search_ranked(MemoryQuery {
+            query: Some(terms.join(" ")),
+            project: Some(ctx.project.clone()),
+            limit: Some(RECALL_CANDIDATES),
+            user: ctx.user.clone(),
+            ..Default::default()
+        })
+        .await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut shown = std::collections::HashSet::new();
+    for e in ctx.store.events_recent_kind(&ctx.project, Some(session), MEMORY_RECALL, 200).await? {
+        for id in e.data.as_ref().and_then(|d| d["ids"].as_array()).into_iter().flatten().filter_map(Value::as_str) {
+            shown.insert(id.to_owned());
+        }
+    }
+
+    let picked: Vec<&Memory> = candidates
+        .iter()
+        .map(|(m, _)| m)
+        .filter(|m| !shown.contains(&m.id))
+        .filter(|m| {
+            let have: std::collections::HashSet<String> =
+                words(&format!("{} {}", m.content, m.tags.join(" "))).into_iter().collect();
+            terms.iter().filter(|t| have.contains(*t)).count() >= need
+        })
+        .take(RECALL_MAX)
+        .collect();
+    if picked.is_empty() {
+        return Ok(None);
+    }
+
+    let ids: Vec<&str> = picked.iter().map(|m| m.id.as_str()).collect();
+    log(ctx, MEMORY_RECALL, format!("recalled {} memories for the prompt", ids.len()), Some(json!({ "ids": ids })))
+        .await?;
+
+    let mut text = String::from("<memdusa-recall>\nRelevant memories:\n");
+    for m in picked {
+        let body = truncate(m.content.trim(), RECALL_MEMORY_CHARS).replace('\n', "\n  ");
+        text.push_str(&format!("- ({}) {body}\n", m.kind.as_str()));
+    }
+    text.push_str("</memdusa-recall>");
+    Ok(Some(
+        json!({ "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": text } }).to_string(),
     ))
 }
 
@@ -327,6 +474,20 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
         _ => {}
     }
     Ok(())
+}
+
+/// Journal the agent's last words, unless they repeat the session's previous message.
+async fn record_agent_message(ctx: &Ctx<'_>, message: &str) -> Result<()> {
+    let content = truncate(message, MAX_MESSAGE_CHARS);
+    if let Some(session) = &ctx.session {
+        // Stored content is redacted (after truncation), so compare it in that form.
+        let redacted = ctx.store.redactor().text(&content).into_owned();
+        let recent = ctx.store.events_recent(&ctx.project, Some(session), 300).await?;
+        if recent.iter().find(|e| e.kind == AGENT_MESSAGE).is_some_and(|e| e.content == redacted) {
+            return Ok(());
+        }
+    }
+    log(ctx, AGENT_MESSAGE, content, None).await
 }
 
 async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>> {
@@ -411,6 +572,12 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
             quote(last)
         )),
     }
+    if let Some(m) = events.iter().find(|e| e.kind == AGENT_MESSAGE) {
+        notes.push_str(&format!(
+            "\n\nThe agent's last message:\n\n{}",
+            quote(&truncate(&m.content, MAX_NOTE_MESSAGE_CHARS))
+        ));
+    }
     ctx.store
         .checkpoint_save(NewCheckpoint {
             project: ctx.project.clone(),
@@ -455,7 +622,7 @@ mod tests {
     }
 
     fn cfg() -> HookConfig {
-        HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 }
+        HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15, recall: true }
     }
 
     fn ctx<'a>(store: &'a Store, cfg: &'a HookConfig) -> Ctx<'a> {
@@ -529,6 +696,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_records_last_message_once_and_guard_still_fires() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+
+        let stop = json!({"last_assistant_message": "  Done with the endpoint; next: partial refunds.  "});
+        let out = handle(HookEvent::Stop, input(stop.clone()), ctx(&store, &cfg)).await.unwrap();
+        assert!(out.is_some(), "guard fires regardless of the message");
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 1, "identical repeated stop doesn't duplicate");
+        assert_eq!(msgs[0].content, "Done with the endpoint; next: partial refunds.");
+
+        let next = json!({"last_assistant_message": "x".repeat(2000)});
+        handle(HookEvent::Stop, input(next), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content.chars().count(), MAX_MESSAGE_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_with_a_secret_doesnt_duplicate() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4).get(..36).unwrap());
+        let stop = json!({"last_assistant_message": format!("Deployed using {token}, tests next.")});
+        handle(HookEvent::Stop, input(stop.clone()), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(!msgs[0].content.contains(&token), "secret was redacted: {}", msgs[0].content);
+    }
+
+    #[tokio::test]
+    async fn post_compact_records_summary() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        assert!(HookEvent::PostCompact.queueable());
+        assert!(!HookEvent::PostCompact.needs_git());
+        assert_eq!(HookEvent::PostCompact.timeout_secs(), 10);
+        assert_eq!(HookEvent::PostCompact.arg(), "post-compact");
+        let payload = json!({"trigger": "manual", "compact_summary": "We built refunds."});
+        let out = handle(HookEvent::PostCompact, input(payload), ctx(&store, &cfg)).await.unwrap();
+        assert!(out.is_none());
+        let events = store.events_recent("p", None, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind.as_str(), events[0].content.as_str()), (COMPACT_SUMMARY, "We built refunds."));
+    }
+
+    #[tokio::test]
+    async fn brief_shows_last_words_and_hides_them_from_events() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let stop = json!({"last_assistant_message": "Endpoint done, tests next."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let payload = json!({"compact_summary": "S".repeat(2000)});
+        handle(HookEvent::PostCompact, input(payload), ctx(&store, &cfg)).await.unwrap();
+
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("## Last words from the previous session"), "{md}");
+        assert!(md.contains("> Endpoint done, tests next."), "{md}");
+        assert!(md.contains(&format!("{}…", "S".repeat(1500))) && !md.contains(&"S".repeat(1501)), "{md}");
+        assert!(!md.contains("agent_message") && !md.contains("compact_summary"), "hidden from Events:\n{md}");
+
+        // a checkpoint newer than the message makes it redundant
+        let mut c = ctx(&store, &cfg);
+        c.at = now_ms() + 10_000;
+        store
+            .checkpoint_save(NewCheckpoint {
+                project: "p".into(),
+                goal: "refunds".into(),
+                created_at: Some(c.at),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("Where things stand") && !md.contains("Last words"), "{md}");
+    }
+
+    #[tokio::test]
+    async fn auto_checkpoint_at_session_end_doesnt_hide_last_words() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        handle(HookEvent::UserPromptSubmit, input(json!({"prompt": "add refunds"})), ctx(&store, &cfg)).await.unwrap();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+        let stop = json!({"last_assistant_message": "Endpoint done, tests next."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let compact = json!({"trigger": "auto", "compact_summary": "Refund endpoint built."});
+        handle(HookEvent::PostCompact, input(compact), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::SessionEnd, input(json!({"reason": "logout"})), ctx(&store, &cfg)).await.unwrap();
+        let cps = store.checkpoints_latest("p", 5).await.unwrap();
+        assert_eq!(cps[0].source.as_deref(), Some("claude-code (auto)"));
+
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("## Last words from the previous session"), "{md}");
+        assert!(md.contains("> Endpoint done, tests next."), "{md}");
+        assert!(md.contains("> Refund endpoint built."), "{md}");
+    }
+
+    #[tokio::test]
+    async fn fallback_checkpoint_includes_last_message() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+        let stop = json!({"last_assistant_message": "Left off at the refund validation."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::SessionEnd, input(json!({})), ctx(&store, &cfg)).await.unwrap();
+        let notes = store.checkpoints_latest("p", 1).await.unwrap()[0].notes.clone().unwrap();
+        assert!(notes.contains("The agent's last message:\n\n> Left off at the refund validation."), "{notes}");
+    }
+
+    #[tokio::test]
     async fn git_events_are_logged_and_validated() {
         let store = ctx_store().await;
         let cfg = cfg();
@@ -563,5 +849,81 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, memdusa_core::Error::Invalid(_)), "unknown git_event rejected: {err}");
         assert_eq!(store.events_recent("p", None, 10).await.unwrap().len(), 1, "nothing recorded");
+    }
+
+    fn recalled(out: Option<String>) -> Option<String> {
+        let v: Value = serde_json::from_str(&out?).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+        Some(v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_owned())
+    }
+
+    async fn prompt(store: &Store, cfg: &HookConfig, session: &str, text: &str) -> Option<String> {
+        let mut c = ctx(store, cfg);
+        c.session = Some(session.into());
+        recalled(handle(HookEvent::UserPromptSubmit, input(json!({ "prompt": text })), c).await.unwrap())
+    }
+
+    async fn save(store: &Store, kind: MemoryKind, content: &str) -> Memory {
+        store
+            .memory_save(NewMemory { project: Some("p".into()), kind, content: content.into(), ..Default::default() })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prompts_recall_relevant_memories_once_per_session() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let decision = save(&store, MemoryKind::Decision, "We chose Postgres over MySQL for the billing ledger").await;
+        save(&store, MemoryKind::Note, "Lunch is at noon on fridays").await;
+        for i in 0..6 {
+            save(&store, MemoryKind::Fact, &format!("filler fact {i} about gardening")).await;
+        }
+
+        // unrelated prompts, and one with a single stray word, inject nothing
+        assert!(prompt(&store, &cfg, "s1", "please rename the button").await.is_none());
+        assert!(prompt(&store, &cfg, "s1", "the and for with").await.is_none(), "only stopwords");
+        assert!(prompt(&store, &cfg, "s1", "which database should hold wombats").await.is_none());
+
+        // a prompt about the saved decision gets it
+        let text = prompt(&store, &cfg, "s1", "Why did we pick postgres for the billing service?").await.unwrap();
+        assert!(text.starts_with("<memdusa-recall>\nRelevant memories:\n- (decision) We chose Postgres"), "{text}");
+        assert!(text.ends_with("</memdusa-recall>"), "{text}");
+        assert!(!text.contains("Lunch"), "{text}");
+
+        // recorded, and not injected again in the same session...
+        let events = store.events_recent_kind("p", Some("s1"), MEMORY_RECALL, 10).await.unwrap();
+        assert_eq!(events[0].data.as_ref().unwrap()["ids"], json!([decision.id]));
+        assert!(prompt(&store, &cfg, "s1", "remind me why postgres for the billing ledger").await.is_none());
+        // ...but a different session still gets it
+        assert!(prompt(&store, &cfg, "s2", "remind me why postgres for the billing ledger").await.is_some());
+
+        // the brief doesn't show the bookkeeping
+        let b = memdusa_core::brief::build(&store, "p", None, None).await.unwrap();
+        assert!(!b.markdown.contains(MEMORY_RECALL), "{}", b.markdown);
+    }
+
+    #[tokio::test]
+    async fn memories_in_the_session_brief_are_not_recalled() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        save(&store, MemoryKind::Decision, "We chose Postgres over MySQL for the billing ledger").await;
+        let mut c = ctx(&store, &cfg);
+        c.session = Some("s1".into());
+        let out = handle(HookEvent::SessionStart, input(json!({"source": "startup"})), c).await.unwrap();
+        assert!(out.unwrap().contains("billing ledger"), "brief carries the memory");
+        assert!(prompt(&store, &cfg, "s1", "why postgres for the billing ledger").await.is_none());
+        assert!(prompt(&store, &cfg, "other", "why postgres for the billing ledger").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_can_be_switched_off() {
+        let store = ctx_store().await;
+        let cfg = HookConfig { recall: false, ..cfg() };
+        save(&store, MemoryKind::Decision, "We chose Postgres over MySQL for the billing ledger").await;
+        assert!(prompt(&store, &cfg, "s1", "why postgres for the billing ledger").await.is_none());
+        assert!(store.events_recent_kind("p", Some("s1"), MEMORY_RECALL, 10).await.unwrap().is_empty());
+        // still journaled
+        assert_eq!(store.events_recent("p", Some("s1"), 10).await.unwrap()[0].kind, "prompt");
     }
 }

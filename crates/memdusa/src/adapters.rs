@@ -72,6 +72,7 @@ impl Harness {
                 hook("PostToolUse", PostToolUse, Some(crate::hooks::JOURNALED_TOOLS), 5),
                 hook("Stop", Stop, None, 5),
                 hook("PreCompact", PreCompact, None, 10),
+                hook("PostCompact", PostCompact, None, 10),
                 hook("SessionEnd", SessionEnd, None, 10),
             ],
             // SessionStart re-fires with source "compact" after compaction: the brief is re-injected.
@@ -228,11 +229,19 @@ impl Harness {
                     HookEvent::SessionEnd => {
                         o.insert("reason".into(), extra.get("reason").cloned().unwrap_or(json!("other")));
                     }
+                    HookEvent::Stop => {
+                        if let Some(m) = extra.get("assistant_response").filter(|m| m.is_string()) {
+                            o.insert("last_assistant_message".into(), m.clone());
+                        }
+                    }
                     _ => {}
                 }
             }
             Self::OpenCode | Self::Pi => {} // their plugins already send canonical payloads
             Self::Gemini => {
+                if event == HookEvent::Stop {
+                    rename(&mut o, "prompt_response", "last_assistant_message");
+                }
                 if event == HookEvent::PostToolUse {
                     let canonical = match o.get("tool_name").and_then(Value::as_str) {
                         Some("write_file" | "replace") => Some("Edit"),
@@ -258,8 +267,18 @@ impl Harness {
             // Claude Code and Codex share the canonical format; OpenCode/pi plugins read it
             (Self::ClaudeCode | Self::Codex | Self::OpenCode | Self::Pi | Self::Git, _) => return Some(out),
             (Self::Gemini, HookEvent::SessionStart) => return Some(out), // same hookSpecificOutput shape
+            // BeforeAgent takes the same hookSpecificOutput.additionalContext, named for its event
+            (Self::Gemini, HookEvent::UserPromptSubmit) => {
+                json!({ "hookSpecificOutput": { "hookEventName": "BeforeAgent", "additionalContext": context? } })
+            }
             (Self::Gemini, HookEvent::Stop) => json!({ "decision": "deny", "reason": reason? }),
+            // beforeSubmitPrompt can't inject context
+            (Self::Cursor, HookEvent::UserPromptSubmit) => return None,
             (Self::Cursor, HookEvent::SessionStart) => json!({ "additional_context": context? }),
+            (Self::Antigravity, HookEvent::UserPromptSubmit) => {
+                json!({ "injectSteps": [{ "systemMessage": { "systemMessage": context? } }] })
+            }
+            (Self::Hermes, HookEvent::UserPromptSubmit) => json!({ "context": context? }),
             (Self::Cursor, HookEvent::Stop) => json!({ "followup_message": reason? }),
             (Self::Antigravity, HookEvent::SessionStart) => {
                 json!({ "injectSteps": [{ "systemMessage": { "systemMessage": context? } }] })
@@ -374,6 +393,26 @@ mod tests {
     }
 
     #[test]
+    fn recall_output_per_harness() {
+        let out = r#"{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"recall"}}"#;
+        let render = |h: Harness| h.render(HookEvent::UserPromptSubmit, Some(out.into()));
+        for h in [Harness::ClaudeCode, Harness::Codex, Harness::OpenCode, Harness::Pi] {
+            assert_eq!(render(h).unwrap(), out);
+        }
+        assert_eq!(
+            render(Harness::Gemini).unwrap(),
+            r#"{"hookSpecificOutput":{"additionalContext":"recall","hookEventName":"BeforeAgent"}}"#
+        );
+        assert_eq!(
+            render(Harness::Antigravity).unwrap(),
+            r#"{"injectSteps":[{"systemMessage":{"systemMessage":"recall"}}]}"#
+        );
+        assert_eq!(render(Harness::Hermes).unwrap(), r#"{"context":"recall"}"#);
+        assert_eq!(render(Harness::Cursor), None);
+        assert_eq!(Harness::Hermes.render(HookEvent::UserPromptSubmit, None), None);
+    }
+
+    #[test]
     fn gemini_tool_names() {
         let v = Harness::Gemini
             .normalize(
@@ -389,6 +428,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["tool_name"], "Bash");
+    }
+
+    #[test]
+    fn gemini_and_hermes_last_message() {
+        let v = Harness::Gemini
+            .normalize(HookEvent::Stop, json!({"session_id": "g", "prompt": "q", "prompt_response": "All done."}))
+            .unwrap();
+        assert_eq!(v["last_assistant_message"], "All done.");
+        let v = Harness::Hermes
+            .normalize(HookEvent::Stop, json!({"session_id": "h", "extra": {"assistant_response": "Fixed it."}}))
+            .unwrap();
+        assert_eq!(v["last_assistant_message"], "Fixed it.");
+        let v = Harness::Hermes.normalize(HookEvent::Stop, json!({"session_id": "h", "extra": {}})).unwrap();
+        assert!(v.get("last_assistant_message").is_none());
+    }
+
+    #[test]
+    fn claude_code_registers_post_compact_but_codex_does_not() {
+        let has =
+            |h: Harness| h.events().iter().any(|e| e.native == "PostCompact" && e.event == HookEvent::PostCompact);
+        assert!(has(Harness::ClaudeCode));
+        assert!(!has(Harness::Codex));
     }
 
     #[test]

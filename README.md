@@ -66,10 +66,16 @@ your other hooks, and backs the file up to `settings.json.memdusa-backup` first:
 | Hook | What memdusa does |
 |---|---|
 | `SessionStart` | Injects the resume brief, on startup, `--resume`, `/clear`, after compaction and on fork, so Claude continues where *any* agent left off |
-| `UserPromptSubmit` | Journals what you asked for (turn off with `MEMDUSA_NO_PROMPTS=1`) |
+| `UserPromptSubmit` | Journals what you asked for (turn off with `MEMDUSA_NO_PROMPTS=1`), and injects up to 5 memories relevant to the prompt (`MEMDUSA_RECALL=off` disables) |
 | `PostToolUse` (`Edit\|MultiEdit\|Write\|NotebookEdit\|Bash`) | Journals changed files and shell commands |
 | `Stop` | If files changed and the last checkpoint is >15 min old, asks Claude once to save a `checkpoint` before finishing (`MEMDUSA_STOP_GUARD_MINS`, 0 = off) |
-| `PreCompact`, `SessionEnd` | Fallback: if files changed but no checkpoint was saved, writes an automatic one (last request, changed files, previous plan carried forward) |
+| `PreCompact`, `SessionEnd` | Fallback: if files changed but no checkpoint was saved, writes an automatic one (last request, changed files, previous plan carried forward, the agent's last message) |
+| `PostCompact` | Records the compaction summary Claude Code generated (`compact_summary`, up to 4000 chars) |
+
+`Stop` also records the agent's **last words** (`last_assistant_message`, up to 1500 chars, skipped if identical to the
+session's previous one) as an `agent_message` event. Gemini (`AfterAgent`) and Hermes (`pre_verify`) supply it too.
+The resume brief shows the latest message and compaction summary under "Last words from the previous session", but
+only when they are newer than the latest checkpoint.
 
 Hooks never break a session. Any error is logged to stderr, the hook exits 0, and it gives up well inside Claude
 Code's timeout. A hook takes about 15 ms. In remote mode they call the server instead (see below).
@@ -89,7 +95,7 @@ in that tool's dialect. Remote mode, the offline queue, redaction and code state
 
 | Harness | How memdusa plugs in | Brief at start | Prompts | Edits / commands | Checkpoint reminder | Fallback checkpoint |
 |---|---|---|---|---|---|---|
-| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, SessionEnd |
+| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, PostCompact (summary), SessionEnd |
 | Codex CLI | `~/.codex/hooks.json` + `config.toml` | ✓ (also after compaction) | ✓ | ✓ (patch → files) | Stop | PreCompact, SessionEnd |
 | Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
 | Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | (no such hooks) |
@@ -266,8 +272,31 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 
 ## MCP tools
 
-`resume`, `memory_save`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`, `run_step`,
-`run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
+`resume`, `memory_save`, `memory_update`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`,
+`run_step`, `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
+
+### Memory hygiene
+
+- `memory_update` (REST: `PATCH /v1/memories/{id}`) corrects a memory in place: any of `content`, `kind`, `tags`.
+  Redaction applies and the search index follows. On a multi-user server, a global memory can only be updated or
+  forgotten by its owner or an admin (403 otherwise); project memories stay editable by any user.
+- Saving a near-duplicate merges instead of adding: a memory of the same kind and scope (project, or your globals)
+  whose significant words overlap by at least 75% (Jaccard; short words and stopwords ignored, "auth" ~
+  "authentication") is updated with the newer text and merged tags. The result says so (`merged: true` in REST/JSON).
+- The brief flags a memory with ` _(may be outdated: src/auth/jwt.rs changed 2h ago)_` when it mentions a file that
+  a recent `file_change` event touched after the memory was last updated.
+
+### Search and recall
+
+`memory_search` is ranked full-text search over memory content and tags (SQLite FTS5 with `bm25`, Postgres
+`tsvector` with `ts_rank`, `simple` config, no stemming). Any word may match; the best match comes first, newest
+first among ties. Query text is split into plain words, never interpreted as query syntax. No query lists the most
+recent memories.
+
+On every prompt, the `UserPromptSubmit` hook searches the project's memories (plus visible globals) with the prompt
+and injects up to 5 that match at least two of its distinctive words (one, if the prompt has only one) in a
+`<memdusa-recall>` block. A memory is injected at most once per session, and not if it was already in the session's
+brief. Harnesses that can't inject context on a prompt (Cursor) get nothing. Set `MEMDUSA_RECALL=off` to disable it.
 
 ### MCP resources and prompts
 
@@ -350,14 +379,17 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 
 - [x] Claude Code hooks: auto-resume, journaling, checkpoint guard, fallback checkpoints
 - [x] Remote mode: `memdusa login`, hooks over REST, stdio→HTTP MCP proxy
-- [ ] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
+- [x] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
 - [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
 - [x] Handoff eval with real agents (`eval/`)
 - [x] Git hooks (commits, branch switches) as events
 - [x] MCP resources and prompts (brief, memories, /resume)
 - [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
-- [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
-- [ ] Memory consolidation: summarize old events, merge near-duplicate memories
+- [x] Ranked full-text memory search
+- [x] Relevant memories injected on each prompt
+- [ ] Semantic memory search (embeddings behind a trait; local model or API)
+- [x] Memory hygiene: update, near-duplicate merge, stale flags
+- [ ] Memory consolidation: summarize old events
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)

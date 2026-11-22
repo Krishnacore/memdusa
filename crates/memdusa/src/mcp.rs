@@ -87,6 +87,21 @@ pub struct MemorySaveArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct MemoryUpdateArgs {
+    /// Id of the memory to change.
+    pub id: String,
+    /// The corrected knowledge, replacing the old content.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// fact | preference | decision | todo | note
+    #[serde(default)]
+    pub kind: Option<MemoryKind>,
+    /// Replaces the tags.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct MemorySearchArgs {
     /// Words to match. Omit to list the most recent memories.
     #[serde(default)]
@@ -297,7 +312,24 @@ impl MemdusaMcp {
             source: self.agent(&ctx),
             user: identity(&ctx).user,
         };
-        json(self.store.memory_save(m).await.map_err(err)?)
+        let saved = self.store.memory_save(m).await.map_err(err)?;
+        if saved.merged {
+            let note = format!("updated existing memory {} (near-duplicate)\n", saved.id);
+            return Ok(note + &json(saved)?);
+        }
+        json(saved)
+    }
+
+    #[tool(
+        description = "Correct or refine an existing memory in place (by id) instead of saving a near-copy. Only the fields you pass change."
+    )]
+    async fn memory_update(
+        &self,
+        Parameters(a): Parameters<MemoryUpdateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let patch = MemoryPatch { content: a.content, kind: a.kind, tags: a.tags, source: self.agent(&ctx) };
+        json(self.store.memory_update_as(&a.id, patch, &identity(&ctx)).await.map_err(err)?)
     }
 
     #[tool(description = "Search memories (project + global) by words, optionally filtered by kind.")]
@@ -317,8 +349,8 @@ impl MemdusaMcp {
     }
 
     #[tool(description = "Delete a memory that is wrong or obsolete.")]
-    async fn memory_forget(&self, Parameters(a): Parameters<IdArg>) -> ToolResult {
-        self.store.memory_forget(&a.id).await.map_err(err)?;
+    async fn memory_forget(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        self.store.memory_forget_as(&a.id, &identity(&ctx)).await.map_err(err)?;
         Ok(format!("forgot {}", a.id))
     }
 
@@ -681,6 +713,48 @@ mod tests {
             .unwrap();
         let text = read_text(&c, "memdusa://memories").await;
         assert!(text.contains("prefer tabs over spaces"), "{text}");
+    }
+
+    async fn call(
+        c: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tool: &'static str,
+        args: serde_json::Value,
+    ) -> (bool, String) {
+        let r = c.call_tool(CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone())).await;
+        let r = r.unwrap();
+        let text = serde_json::to_value(&r.content[0]).unwrap()["text"].as_str().unwrap().to_owned();
+        (r.is_error != Some(true), text)
+    }
+
+    #[tokio::test]
+    async fn updates_memories_and_reports_near_duplicate_merges() {
+        let c = client().await;
+        let (ok, saved) =
+            call(&c, "memory_save", serde_json::json!({ "content": "The API uses JWT tokens for auth" })).await;
+        assert!(ok);
+        let id = serde_json::from_str::<Value>(&saved).unwrap()["id"].as_str().unwrap().to_owned();
+
+        let (ok, text) =
+            call(&c, "memory_save", serde_json::json!({ "content": "API uses JWT tokens for authentication" })).await;
+        assert!(ok);
+        assert!(text.contains(&format!("updated existing memory {id} (near-duplicate)")), "{text}");
+
+        let (ok, text) = call(
+            &c,
+            "memory_update",
+            serde_json::json!({ "id": id, "content": "Auth moved to opaque session cookies", "kind": "decision", "tags": ["auth"] }),
+        )
+        .await;
+        assert!(ok, "{text}");
+        let m: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(m["content"], "Auth moved to opaque session cookies");
+        assert_eq!(m["kind"], "decision");
+        assert_eq!(m["tags"], serde_json::json!(["auth"]));
+
+        let (ok, _) = call(&c, "memory_update", serde_json::json!({ "id": "nope", "content": "x" })).await;
+        assert!(!ok);
+        let (_, found) = call(&c, "memory_search", serde_json::json!({ "query": "cookies" })).await;
+        assert!(found.contains(&id), "{found}");
     }
 
     #[tokio::test]

@@ -63,7 +63,14 @@ export default function (pi: any) {
       const brief = out?.hookSpecificOutput?.additionalContext
       if (brief) message = { customType: "memdusa", content: brief, display: false }
     }
-    await memdusa("user-prompt-submit", { session_id, cwd: ctx.cwd, prompt: event.prompt ?? "" })
+    // Memories relevant to this prompt (none when nothing matches or recall is off).
+    const recall = await memdusa("user-prompt-submit", { session_id, cwd: ctx.cwd, prompt: event.prompt ?? "" })
+    const relevant = recall?.hookSpecificOutput?.additionalContext
+    if (relevant) {
+      message = message
+        ? { ...message, content: `${message.content}\n\n${relevant}` }
+        : { customType: "memdusa", content: relevant, display: false }
+    }
     return message ? { message } : undefined
   })
 

@@ -165,7 +165,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/hooks/{event}", post(hook))
         .route("/v1/resume", get(resume))
         .route("/v1/memories", post(memory_save).get(memory_search))
-        .route("/v1/memories/{id}", delete(memory_forget))
+        .route("/v1/memories/{id}", delete(memory_forget).patch(memory_update))
         .route("/v1/events", post(event_append).get(events_recent))
         .route("/v1/checkpoints", post(checkpoint_save).get(checkpoints_latest))
         .route("/v1/runs", post(run_start).get(run_list))
@@ -332,7 +332,9 @@ async fn hook_batch(
         return Err(Error::Invalid("at most 1000 items per batch".into()).into());
     }
     let mut resp = HookBatchResponse::default();
-    for (i, item) in b.items.into_iter().enumerate() {
+    for (i, mut item) in b.items.into_iter().enumerate() {
+        // replayed prompts can't inject anything any more
+        item.request.config.recall = false;
         let event: HookEvent = match item.event.parse() {
             Ok(e) => e,
             Err(e) => {
@@ -554,6 +556,16 @@ async fn memory_save(
     Ok(Json(s.store.memory_save(m).await?))
 }
 
+async fn memory_update(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Path(mid): Path<String>,
+    Json(mut p): Json<MemoryPatch>,
+) -> ApiResult<Memory> {
+    p.source = attribute(&id, None);
+    Ok(Json(s.store.memory_update_as(&mid, p, &id).await?))
+}
+
 async fn memory_search(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
@@ -563,8 +575,12 @@ async fn memory_search(
     Ok(Json(s.store.memory_search(q).await?))
 }
 
-async fn memory_forget(State(s): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
-    s.store.memory_forget(&id).await?;
+async fn memory_forget(
+    State(s): State<AppState>,
+    Extension(who): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    s.store.memory_forget_as(&id, &who).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -734,7 +750,12 @@ mod tests {
 
         let req = |input| HookRequest {
             project: "github.com/acme/shop".into(),
-            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            config: HookConfig {
+                agent: "claude-code".into(),
+                journal_prompts: true,
+                stop_guard_mins: 15,
+                recall: true,
+            },
             input,
             git: None,
             at: None,
@@ -797,6 +818,81 @@ mod tests {
         let resp = r.send().await.unwrap();
         let status = resp.status().as_u16();
         (status, resp.json().await.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn patch_updates_a_memory_and_post_reports_merges() {
+        use reqwest::Method as M;
+        let (url, _) = spawn(None).await;
+        let u = |p: &str| format!("{url}{p}");
+
+        let first = json!({"project": "p", "content": "The API uses JWT tokens for auth"});
+        let (st, saved) = call(M::POST, &u("/v1/memories"), None, Some(first)).await;
+        assert_eq!(st, 200);
+        assert!(saved.get("merged").is_none(), "plain saves stay backward compatible: {saved}");
+        let id = saved["id"].as_str().unwrap().to_owned();
+
+        let near = json!({"project": "p", "content": "API uses JWT tokens for authentication"});
+        let (_, merged) = call(M::POST, &u("/v1/memories"), None, Some(near)).await;
+        assert_eq!((merged["id"].clone(), merged["merged"].clone()), (json!(id), json!(true)));
+
+        let patch = json!({"content": "Sessions use opaque cookies", "kind": "decision", "tags": ["auth"]});
+        let (st, m) = call(M::PATCH, &u(&format!("/v1/memories/{id}")), None, Some(patch)).await;
+        assert_eq!(st, 200, "{m}");
+        assert_eq!(
+            (m["content"].clone(), m["kind"].clone(), m["tags"].clone()),
+            (json!("Sessions use opaque cookies"), json!("decision"), json!(["auth"]))
+        );
+
+        let (st, _) = call(M::PATCH, &u("/v1/memories/missing"), None, Some(json!({"content": "x"}))).await;
+        assert_eq!(st, 404);
+        let (st, _) = call(M::PATCH, &u(&format!("/v1/memories/{id}")), None, Some(json!({"content": "  "}))).await;
+        assert_eq!(st, 400);
+    }
+
+    #[tokio::test]
+    async fn global_memories_can_only_be_changed_by_owner_or_admin() {
+        use reqwest::Method as M;
+        let (url, store) = spawn(Some("shared")).await;
+        let u = |p: &str| format!("{url}{p}");
+        let mut keys = std::collections::HashMap::new();
+        for (name, admin) in [("alice", false), ("bob", false), ("carol", true)] {
+            store.user_create(name, admin).await.unwrap();
+            keys.insert(name, store.key_create(name, "k").await.unwrap().secret);
+        }
+        let save = |who: &'static str, content: &'static str, project: Option<&'static str>| {
+            let (u, k) = (u("/v1/memories"), keys[who].clone());
+            async move { call(M::POST, &u, Some(&k), Some(json!({"content": content, "project": project}))).await.1 }
+        };
+        let patch = |who: &str, id: &str| {
+            let (url, key) = (u(&format!("/v1/memories/{id}")), keys[who].clone());
+            async move { call(M::PATCH, &url, Some(&key), Some(json!({"content": "edited"}))).await }
+        };
+        let forget = |who: &str, id: &str| {
+            let (url, key) = (u(&format!("/v1/memories/{id}")), keys[who].clone());
+            async move { call(M::DELETE, &url, Some(&key), None).await }
+        };
+
+        let g = save("alice", "alice's private preference", None).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(patch("bob", &g).await.0, 403, "bob can't update alice's global");
+        assert_eq!(forget("bob", &g).await.0, 403, "bob can't forget alice's global");
+        assert_eq!(patch("alice", &g).await.0, 200, "owner can update");
+        assert_eq!(patch("carol", &g).await.0, 200, "admin can update");
+        assert_eq!(patch("bob", "missing").await.0, 404);
+        assert_eq!(forget("bob", &g).await.0, 403, "still there after the failed attempts");
+        assert_eq!(forget("alice", &g).await.0, 204, "owner can forget");
+        let g2 = save("alice", "another global", None).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(forget("carol", &g2).await.0, 204, "admin can forget");
+
+        // project memories stay editable by any authenticated user
+        let p = save("alice", "API uses JWT", Some("shop")).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(patch("bob", &p).await.0, 200);
+        assert_eq!(forget("bob", &p).await.0, 204);
+
+        // the shared token (root) keeps full access
+        let g3 = save("alice", "third global", None).await["id"].as_str().unwrap().to_owned();
+        let (st, _) = call(M::DELETE, &u(&format!("/v1/memories/{g3}")), Some("shared"), None).await;
+        assert_eq!(st, 204);
     }
 
     #[tokio::test]
@@ -898,7 +994,12 @@ mod tests {
         let spool = Spool::at(dir.clone()).unwrap();
         let req = |input: Value, at: i64| HookRequest {
             project: "shop".into(),
-            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            config: HookConfig {
+                agent: "claude-code".into(),
+                journal_prompts: true,
+                stop_guard_mins: 15,
+                recall: true,
+            },
             input,
             git: None,
             at: Some(at),
@@ -973,10 +1074,19 @@ mod tests {
         assert_eq!(reqwest::get(format!("{url}/health")).await.unwrap().status(), 200, "health isn't rate limited");
 
         // fresh limiter-free server for the body limit
-        let (url2, _) = spawn(None).await;
+        let (url2, store2) = spawn(None).await;
         let big = "x".repeat(2 * 1024 * 1024);
-        let (st, _) = call(M::POST, &format!("{url2}/v1/memories"), None, Some(json!({"content": big}))).await;
-        assert_eq!(st, 413, "1 MB default body limit");
+        // The server answers 413 and closes the connection while the client may still be uploading,
+        // so under load the client can see a connection reset instead of the 413. Either way the
+        // request must be refused and nothing stored.
+        let sent =
+            reqwest::Client::new().post(format!("{url2}/v1/memories")).json(&json!({"content": big})).send().await;
+        match sent {
+            Ok(resp) => assert_eq!(resp.status().as_u16(), 413, "1 MB default body limit"),
+            Err(e) => assert!(e.is_request() || e.is_body() || e.is_connect(), "refused mid-upload: {e}"),
+        }
+        let stored = store2.memory_search(MemoryQuery { limit: Some(5), ..Default::default() }).await.unwrap();
+        assert!(stored.is_empty(), "the oversized memory must not be stored");
 
         let text = reqwest::get(format!("{url}/metrics")).await.unwrap().text().await.unwrap();
         assert!(

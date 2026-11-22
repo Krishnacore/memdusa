@@ -69,6 +69,24 @@ pub struct Memory {
     pub user: Option<String>,
     pub created_at: Millis,
     pub updated_at: Millis,
+    /// Only set on the result of a save: it was folded into an existing
+    /// near-duplicate memory instead of creating a new one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merged: bool,
+}
+
+/// A partial update of a memory: only the `Some` fields change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryPatch {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub kind: Option<MemoryKind>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Set by the server from the authenticated caller; never from the request.
+    #[serde(skip)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

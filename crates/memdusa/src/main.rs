@@ -358,7 +358,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Hook { event, harness, agent, no_prompts, stop_guard_mins } => {
             // A hook must never break the user's session: log and exit 0.
             let agent = agent.unwrap_or_else(|| harness.agent().into());
-            let cfg = hooks::HookConfig { agent, journal_prompts: !no_prompts, stop_guard_mins };
+            // MEMDUSA_RECALL=off (or 0/false/no) stops memories being injected on each prompt.
+            let recall = !std::env::var("MEMDUSA_RECALL")
+                .is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "off" | "0" | "false" | "no"));
+            let cfg = hooks::HookConfig { agent, journal_prompts: !no_prompts, stop_guard_mins, recall };
             // Finish well inside the harness's hook timeout instead of stalling the session.
             let budget = harness.events().iter().filter(|h| h.event == event).map(|h| h.timeout_secs).max();
             let deadline = Duration::from_millis(budget.unwrap_or(event.timeout_secs()) * 1000 - 500);
@@ -673,7 +676,7 @@ async fn run_git_hook(
     let Some(input) = git_hook_input(kind, args, &cwd)? else { return Ok(()) };
     let agent =
         std::env::var("MEMDUSA_AGENT").ok().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| "git".to_owned());
-    let config = hooks::HookConfig { agent, journal_prompts: true, stop_guard_mins: 0 };
+    let config = hooks::HookConfig { agent, journal_prompts: true, stop_guard_mins: 0, recall: false };
     run_hook_input(hooks::HookEvent::Git, adapters::Harness::Git, config, input, project, database_url, deadline)
         .await?;
     Ok(())

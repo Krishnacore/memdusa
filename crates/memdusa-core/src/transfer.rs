@@ -71,7 +71,8 @@ impl Store {
             }
         };
 
-        let mut q = Q::new("SELECT * FROM memories");
+        // explicit columns: Postgres' `search` tsvector column isn't readable through `sqlx::Any`
+        let mut q = Q::new(&format!("SELECT {} FROM memories", crate::store::MEMORY_COLS));
         filter(&mut q);
         q.push(" ORDER BY created_at");
         for r in q.build().fetch_all(&self.pool).await? {
@@ -85,6 +86,7 @@ impl Store {
                 user: r.try_get("user_name")?,
                 created_at: r.try_get("created_at")?,
                 updated_at: r.try_get("updated_at")?,
+                merged: false,
             }));
         }
 

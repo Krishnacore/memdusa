@@ -9,10 +9,16 @@ use crate::store::Store;
 
 /// Event kinds written automatically by harness hooks.
 pub const FILE_CHANGE: &str = "file_change";
+pub const AGENT_MESSAGE: &str = "agent_message";
+pub const COMPACT_SUMMARY: &str = "compact_summary";
 pub const COMMAND: &str = "command";
 pub const STOP_GUARD: &str = "stop_guard";
+/// Which memories were already shown to an agent in a session (`data: {"ids": [...]}`).
+pub const MEMORY_RECALL: &str = "memory_recall";
 /// Bookkeeping events that would only be noise in the brief.
-const HIDDEN: &[&str] = &[STOP_GUARD];
+const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL];
+/// How much of a compaction summary the brief quotes.
+const SUMMARY_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Brief {
@@ -76,8 +82,51 @@ fn bullets(out: &mut String, title: &str, items: &[String]) {
     out.push('\n');
 }
 
+const PATH_EXTENSIONS: &[&str] =
+    &["rs", "py", "ts", "tsx", "js", "go", "java", "rb", "md", "toml", "json", "yaml", "yml", "sql"];
+
+/// Path-like tokens of a text: contain `/` or end in a common source extension.
+fn paths_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for raw in text.split_whitespace() {
+        let t = raw
+            .trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
+            .trim_start_matches("./");
+        let t = t.trim_end_matches('.');
+        if t.is_empty() || t.contains("://") || t.ends_with('/') {
+            continue;
+        }
+        let ext = t.rsplit_once('.').map(|(_, e)| e).filter(|e| PATH_EXTENSIONS.contains(e));
+        if (t.contains('/') || ext.is_some()) && !out.iter().any(|p| p == t) {
+            out.push(t.to_owned());
+        }
+    }
+    out
+}
+
+/// A changed file `changed` is the memory's `path` when equal or one is a path suffix of the other.
+fn same_path(path: &str, changed: &str) -> bool {
+    let (a, b) = (path.trim_start_matches('/'), changed.trim_start_matches('/'));
+    a == b || changed.ends_with(&format!("/{a}")) || path.ends_with(&format!("/{b}"))
+}
+
+/// ` _(may be outdated: <path> changed <age>)_` when a `file_change` event touched a file the
+/// memory mentions after the memory was last updated.
+fn stale_note(m: &Memory, events: &[Event]) -> String {
+    let hit = paths_in(&m.content).into_iter().find_map(|p| {
+        events
+            .iter()
+            .filter(|e| e.kind == FILE_CHANGE && e.created_at > m.updated_at && same_path(&p, &e.content))
+            .map(|e| e.created_at)
+            .max()
+            .map(|at| (p, at))
+    });
+    hit.map(|(p, at)| format!(" _(may be outdated: {p} changed {})_", ago(at))).unwrap_or_default()
+}
+
 /// Memories grouped by kind, as Markdown (the body of the brief's Memory section).
-fn memory_groups(memories: &[Memory]) -> String {
+/// Memories that mention a file changed since they were written get a staleness flag.
+fn memory_groups(memories: &[Memory], events: &[Event]) -> String {
     let mut o = String::new();
     for kind in [MemoryKind::Preference, MemoryKind::Decision, MemoryKind::Fact, MemoryKind::Todo, MemoryKind::Note] {
         let group: Vec<_> = memories.iter().filter(|m| m.kind == kind).collect();
@@ -87,7 +136,7 @@ fn memory_groups(memories: &[Memory]) -> String {
         let _ = writeln!(o, "**{}s:**", kind.as_str());
         for m in group {
             let scope = if m.project.is_none() { " _(global)_" } else { "" };
-            let _ = writeln!(o, "- {}{scope}", m.content);
+            let _ = writeln!(o, "- {}{scope}{}", m.content, stale_note(m, events));
         }
         o.push('\n');
     }
@@ -100,7 +149,7 @@ pub fn memories_markdown(project: &str, memories: &[Memory]) -> String {
     if memories.is_empty() {
         o.push_str("_No memories saved yet._\n");
     } else {
-        o.push_str(&memory_groups(memories));
+        o.push_str(&memory_groups(memories, &[]));
     }
     o
 }
@@ -148,6 +197,36 @@ fn render(
         o.push('\n');
     }
 
+    // A checkpoint the agent wrote already says where things stand: only show what came after it.
+    // Automatic fallback checkpoints are written at session end, after the last words, so they don't count.
+    let since = checkpoints
+        .iter()
+        .find(|c| !c.source.as_deref().is_some_and(|s| s.ends_with(" (auto)")))
+        .map_or(0, |c| c.created_at);
+    let latest =
+        |kind: &str| events.iter().filter(|e| e.kind == kind && e.created_at > since).max_by_key(|e| e.created_at);
+    let (message, summary) = (latest(AGENT_MESSAGE), latest(COMPACT_SUMMARY));
+    if message.is_some() || summary.is_some() {
+        let _ = writeln!(o, "## Last words from the previous session");
+        let quote = |t: &str| t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+        if let Some(m) = message {
+            let by = m.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
+            let _ = writeln!(o, "\n_last message{by}, {}_\n\n{}", ago(m.created_at), quote(&m.content));
+        }
+        if let Some(s) = summary {
+            let text = if s.content.chars().count() > SUMMARY_CHARS {
+                let mut t: String = s.content.chars().take(SUMMARY_CHARS).collect();
+                t.push('…');
+                t
+            } else {
+                s.content.clone()
+            };
+            let by = s.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
+            let _ = writeln!(o, "\n_compaction summary{by}, {}_\n\n{}", ago(s.created_at), quote(&text));
+        }
+        o.push('\n');
+    }
+
     if !runs.is_empty() {
         let _ = writeln!(o, "## Unfinished durable runs");
         for r in runs {
@@ -168,7 +247,7 @@ fn render(
 
     if !memories.is_empty() {
         let _ = writeln!(o, "## Memory");
-        o.push_str(&memory_groups(memories));
+        o.push_str(&memory_groups(memories, events));
         o.push('\n');
     }
 

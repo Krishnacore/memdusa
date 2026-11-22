@@ -20,8 +20,18 @@ use crate::model::*;
 use crate::store::{Q, Store};
 
 /// Event kinds written automatically by harness hooks.
-pub const ACTIVITY_KINDS: &[&str] =
-    &["file_change", "command", "prompt", "session_start", "session_end", "compaction", "stop_guard"];
+pub const ACTIVITY_KINDS: &[&str] = &[
+    "file_change",
+    "command",
+    "prompt",
+    "session_start",
+    "session_end",
+    "compaction",
+    "stop_guard",
+    "agent_message",
+    "compact_summary",
+    "memory_recall",
+];
 pub const SESSION_SUMMARY: &str = "session_summary";
 
 const DAY_MS: i64 = 86_400_000;

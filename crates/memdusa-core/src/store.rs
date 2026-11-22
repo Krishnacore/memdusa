@@ -99,12 +99,92 @@ fn list_from_json(s: String) -> Vec<String> {
 
 // ---------------------------------------------------------------- schema
 
+/// One schema migration: statements run in order inside the migration transaction.
+enum Migration {
+    /// Valid on both SQLite and Postgres.
+    Portable(&'static [&'static str]),
+    /// Needs backend-specific SQL (full-text search, ...).
+    PerBackend { sqlite: &'static [&'static str], postgres: &'static [&'static str] },
+}
+
+impl Migration {
+    fn statements(&self, backend: Backend) -> &'static [&'static str] {
+        match (self, backend) {
+            (Self::Portable(s), _) => s,
+            (Self::PerBackend { sqlite, .. }, Backend::Sqlite) => sqlite,
+            (Self::PerBackend { postgres, .. }, Backend::Postgres) => postgres,
+        }
+    }
+}
+
+/// Columns of `memories` that are read back. Never `SELECT *`: Postgres adds a
+/// `search` tsvector column that `sqlx::Any` can't decode.
+pub(crate) const MEMORY_COLS: &str = "id, project, kind, content, tags, source, user_name, created_at, updated_at";
+/// [`MEMORY_COLS`] qualified with the `m` alias (searches join the FTS table, which has its own `id`/`content`).
+const MEMORY_COLS_M: &str =
+    "m.id, m.project, m.kind, m.content, m.tags, m.source, m.user_name, m.created_at, m.updated_at";
+
+/// Most distinct terms a search considers.
+const MAX_SEARCH_TERMS: usize = 24;
+
+/// The words of a text: lowercase runs of letters/digits, without duplicates
+/// (first occurrences, in order). Matches how both backends tokenize.
+pub fn words(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && seen.insert(*w))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The terms a full-text query is built from: [`words`], at most 24. This is
+/// the only form user text takes in a query, so FTS5/tsquery syntax characters
+/// can't get through.
+pub fn search_terms(text: &str) -> Vec<String> {
+    let mut w = words(text);
+    w.truncate(MAX_SEARCH_TERMS);
+    w
+}
+
+/// Jaccard similarity from which a saved memory counts as a near-duplicate of an existing one.
+const NEAR_DUPLICATE: f64 = 0.75;
+/// How many full-text candidates are compared when looking for a near-duplicate.
+const NEAR_DUPLICATE_CANDIDATES: i64 = 10;
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "has", "have", "had", "its", "not",
+    "but", "you", "all", "can", "will", "our", "their", "they", "them", "into", "also", "any", "than", "then", "when",
+    "which",
+];
+
+/// The words that carry a memory's meaning: [`words`] without short words and stopwords.
+fn significant_words(text: &str) -> Vec<String> {
+    words(text).into_iter().filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str())).collect()
+}
+
+/// Two words count as the same when equal, or when one is a prefix (4+ chars) of the
+/// other, so "auth" ~ "authentication" and "test" ~ "testing".
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || (a.chars().count().min(b.chars().count()) >= 4 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// Jaccard similarity (0..=1) of the significant word sets of two texts.
+fn similarity(a: &str, b: &str) -> f64 {
+    let (wa, wb) = (significant_words(a), significant_words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return 0.0;
+    }
+    let common = wa.iter().filter(|x| wb.iter().any(|y| same_word(x, y))).count();
+    common as f64 / (wa.len() + wb.len() - common) as f64
+}
+
 /// Ordered, append-only list of migrations. Never edit a released entry:
-/// add a new one (e.g. `ALTER TABLE ... ADD COLUMN ...`). Statements must be
-/// valid on both SQLite and Postgres.
-const MIGRATIONS: &[&[&str]] = &[
+/// add a new one (e.g. `ALTER TABLE ... ADD COLUMN ...`). Portable statements
+/// must be valid on both SQLite and Postgres.
+const MIGRATIONS: &[Migration] = &[
     // 1: initial schema
-    &[
+    Migration::Portable(&[
         "CREATE TABLE IF NOT EXISTS memories (
         id TEXT PRIMARY KEY,
         project TEXT,
@@ -166,9 +246,9 @@ const MIGRATIONS: &[&[&str]] = &[
         started_at BIGINT NOT NULL,
         completed_at BIGINT,
         PRIMARY KEY (run_id, step_key))",
-    ],
+    ]),
     // 2: users, API keys, per-user global memories
-    &[
+    Migration::Portable(&[
         "CREATE TABLE users (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
@@ -186,9 +266,34 @@ const MIGRATIONS: &[&[&str]] = &[
             revoked_at BIGINT)",
         "CREATE INDEX api_keys_user ON api_keys (user_id)",
         "ALTER TABLE memories ADD COLUMN user_name TEXT",
-    ],
+    ]),
     // 3: code state on checkpoints
-    &["ALTER TABLE checkpoints ADD COLUMN git TEXT"],
+    Migration::Portable(&["ALTER TABLE checkpoints ADD COLUMN git TEXT"]),
+    // 4: ranked full-text search over memories (content + tags)
+    Migration::PerBackend {
+        // FTS5 table kept in sync by triggers, joined back on `id` (rowids aren't stable
+        // across VACUUM for this table). Backfilled from the existing rows.
+        sqlite: &[
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, tags, id UNINDEXED)",
+            "INSERT INTO memories_fts (id, content, tags) SELECT id, content, tags FROM memories",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts (id, content, tags) VALUES (new.id, new.content, new.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+                DELETE FROM memories_fts WHERE id = old.id;
+            END",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content, tags ON memories BEGIN
+                DELETE FROM memories_fts WHERE id = old.id;
+                INSERT INTO memories_fts (id, content, tags) VALUES (new.id, new.content, new.tags);
+            END",
+        ],
+        // A generated column is maintained (and backfilled) by Postgres itself.
+        postgres: &[
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS search tsvector
+                GENERATED ALWAYS AS (to_tsvector('simple', content || ' ' || tags)) STORED",
+            "CREATE INDEX IF NOT EXISTS memories_search ON memories USING GIN (search)",
+        ],
+    },
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -276,7 +381,7 @@ impl Store {
         }
         for (i, stmts) in MIGRATIONS.iter().enumerate().skip(current) {
             tracing::info!("applying schema migration v{}", i + 1);
-            for stmt in *stmts {
+            for stmt in stmts.statements(self.backend) {
                 tx.execute(*stmt).await?;
             }
         }
@@ -301,6 +406,7 @@ impl Store {
             user: r.try_get("user_name")?,
             created_at: r.try_get("created_at")?,
             updated_at: r.try_get("updated_at")?,
+            merged: false,
         })
     }
 
@@ -327,7 +433,7 @@ impl Store {
         }
         let now = now_ms();
 
-        let mut q = Q::new("SELECT * FROM memories WHERE ");
+        let mut q = Q::new(&format!("SELECT {MEMORY_COLS} FROM memories WHERE "));
         let (c, k) = (q.text(&content), q.text(m.kind.as_str()));
         q.push(&format!("content = {c} AND kind = {k} AND "));
         match &m.project {
@@ -355,6 +461,35 @@ impl Store {
             return Ok(existing);
         }
 
+        // a near-duplicate (same kind and scope) is updated in place: newer wording wins, tags merge
+        let candidates = self
+            .memory_search(MemoryQuery {
+                query: Some(content.clone()),
+                project: m.project.clone(),
+                kind: Some(m.kind),
+                limit: Some(NEAR_DUPLICATE_CANDIDATES),
+                user: m.user.clone(),
+            })
+            .await?;
+        if let Some(mut near) = candidates
+            .into_iter()
+            .find(|c| c.project == m.project && similarity(&c.content, &content) >= NEAR_DUPLICATE)
+        {
+            for t in m.tags {
+                if !near.tags.contains(&t) {
+                    near.tags.push(t);
+                }
+            }
+            self.memory_write(&near.id, &content, near.kind, &near.tags, m.source.as_deref(), now).await?;
+            near.content = content;
+            near.updated_at = now;
+            if m.source.is_some() {
+                near.source = m.source;
+            }
+            near.merged = true;
+            return Ok(near);
+        }
+
         let mem = Memory {
             id: new_id(),
             project: m.project,
@@ -365,6 +500,7 @@ impl Store {
             user: m.user,
             created_at: now,
             updated_at: now,
+            merged: false,
         };
         let mut q = Q::new(
             "INSERT INTO memories (id, project, kind, content, tags, source, user_name, created_at, updated_at) VALUES (",
@@ -385,33 +521,168 @@ impl Store {
         Ok(mem)
     }
 
+    /// Overwrite a memory's editable columns (`source` only when given) and bump `updated_at`.
+    /// The full-text index follows: SQLite triggers on content/tags, a generated column on Postgres.
+    async fn memory_write(
+        &self,
+        id: &str,
+        content: &str,
+        kind: MemoryKind,
+        tags: &[String],
+        source: Option<&str>,
+        now: Millis,
+    ) -> Result<()> {
+        let mut q = Q::new("UPDATE memories SET ");
+        let (c, k, t, u) = (q.text(content), q.text(kind.as_str()), q.text(list_to_json(tags)), q.int(now));
+        q.push(&format!("content = {c}, kind = {k}, tags = {t}, updated_at = {u}"));
+        if let Some(s) = source {
+            let s = q.text(s);
+            q.push(&format!(", source = {s}"));
+        }
+        let id_p = q.text(id);
+        q.push(&format!(" WHERE id = {id_p}"));
+        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("memory {id}")));
+        }
+        Ok(())
+    }
+
+    async fn memory_get(&self, id: &str) -> Result<Memory> {
+        let mut q = Q::new(&format!("SELECT {MEMORY_COLS} FROM memories WHERE id = "));
+        let id_p = q.text(id);
+        q.push(&id_p);
+        let row = q.build().fetch_optional(&self.pool).await?.ok_or_else(|| Error::NotFound(format!("memory {id}")))?;
+        Self::row_to_memory(&row)
+    }
+
+    /// A global memory may only be changed by its owner or an admin; project memories by anyone.
+    /// The root identity (no user, admin) is an admin.
+    fn memory_check(mem: &Memory, actor: &Identity) -> Result<()> {
+        let allowed = actor.admin || mem.project.is_some() || (actor.user.is_some() && mem.user == actor.user);
+        if allowed {
+            Ok(())
+        } else {
+            Err(Error::Forbidden("global memories can only be changed by their owner".into()))
+        }
+    }
+
+    async fn memory_authorize(&self, id: &str, actor: &Identity) -> Result<()> {
+        Self::memory_check(&self.memory_get(id).await?, actor)
+    }
+
+    /// Correct or refine a memory in place, with full access (local use).
+    pub async fn memory_update(&self, id: &str, patch: MemoryPatch) -> Result<Memory> {
+        self.memory_update_as(id, patch, &Identity::root()).await
+    }
+
+    /// Correct or refine a memory in place on behalf of `actor`. Only the fields set in
+    /// `patch` change; content and tags are redacted like on save. A global memory can
+    /// only be changed by its owner or an admin (else [`Error::Forbidden`]).
+    pub async fn memory_update_as(&self, id: &str, patch: MemoryPatch, actor: &Identity) -> Result<Memory> {
+        let mut mem = self.memory_get(id).await?;
+        Self::memory_check(&mem, actor)?;
+
+        if let Some(c) = patch.content {
+            let c = self.redactor.string(c.trim().to_owned());
+            if c.is_empty() {
+                return Err(Error::Invalid("memory content is empty".into()));
+            }
+            mem.content = c;
+        }
+        if let Some(k) = patch.kind {
+            mem.kind = k;
+        }
+        if let Some(t) = patch.tags {
+            mem.tags = self.redactor.list(t);
+        }
+        if patch.source.is_some() {
+            mem.source = patch.source;
+        }
+        mem.updated_at = now_ms();
+        self.memory_write(id, &mem.content, mem.kind, &mem.tags, mem.source.as_deref(), mem.updated_at).await?;
+        Ok(mem)
+    }
+
+    /// Search memories. With a query: full-text, any word may match, best match
+    /// first (ties: newest). Without one: the most recently updated.
     pub async fn memory_search(&self, f: MemoryQuery) -> Result<Vec<Memory>> {
-        let mut q = Q::new("SELECT * FROM memories WHERE ");
+        Ok(self.memory_search_ranked(f).await?.into_iter().map(|(m, _)| m).collect())
+    }
+
+    /// Like [`Store::memory_search`], with each memory's relevance score
+    /// (higher is better, comparable within one result set only; 0 when there
+    /// was no query).
+    pub async fn memory_search_ranked(&self, f: MemoryQuery) -> Result<Vec<(Memory, f64)>> {
+        let terms = f.query.as_deref().map(search_terms);
+        let limit = f.limit.unwrap_or(20).clamp(1, 200);
+        let ranked = match &terms {
+            // a query with nothing searchable in it (only punctuation) matches nothing
+            Some(t) if t.is_empty() && f.query.as_deref().is_some_and(|s| !s.trim().is_empty()) => return Ok(vec![]),
+            Some(t) if !t.is_empty() => Some(t),
+            _ => None,
+        };
+
+        let mut q;
+        match ranked {
+            Some(terms) => {
+                // Terms are plain alphanumeric words (see `search_terms`): quoted for FTS5,
+                // bare for tsquery. User text is never passed on as query syntax.
+                match self.backend {
+                    Backend::Sqlite => {
+                        q = Q::new(&format!(
+                            "SELECT {MEMORY_COLS_M}, -bm25(memories_fts, 1.0, 0.5, 0.0) AS score \
+                             FROM memories_fts JOIN memories m ON m.id = memories_fts.id WHERE memories_fts MATCH "
+                        ));
+                        let m = q.text(terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR "));
+                        q.push(&m).push(" AND ");
+                    }
+                    Backend::Postgres => {
+                        q = Q::new("SELECT ");
+                        let tsq = q.text(terms.join(" | "));
+                        q.push(&format!(
+                            "{MEMORY_COLS_M}, CAST(ts_rank(m.search, to_tsquery('simple', CAST({tsq} AS TEXT))) AS DOUBLE PRECISION) AS score \
+                             FROM memories m WHERE m.search @@ to_tsquery('simple', CAST({tsq} AS TEXT)) AND "
+                        ));
+                    }
+                }
+            }
+            None => {
+                q = Q::new(&format!(
+                    "SELECT {MEMORY_COLS_M}, CAST(0 AS DOUBLE PRECISION) AS score FROM memories m WHERE "
+                ))
+            }
+        }
+
         let globals = Self::global_visible(&mut q, f.user.as_deref());
         match f.project {
             Some(p) => {
                 let p = q.text(p);
-                q.push(&format!("(project = {p} OR {globals})"))
+                q.push(&format!("(m.project = {p} OR {globals})"))
             }
-            None => q.push(&format!("(project IS NOT NULL OR {globals})")),
+            None => q.push(&format!("(m.project IS NOT NULL OR {globals})")),
         };
         if let Some(k) = f.kind {
             let k = q.text(k.as_str());
-            q.push(&format!(" AND kind = {k}"));
+            q.push(&format!(" AND m.kind = {k}"));
         }
-        if let Some(text) = f.query.as_deref() {
-            // every word must match content or tags
-            for word in text.split_whitespace().take(8) {
-                let w = q.text(format!("%{}%", word.to_lowercase()));
-                q.push(&format!(" AND (LOWER(content) LIKE {w} OR LOWER(tags) LIKE {w})"));
-            }
+        let limit = q.int(limit);
+        if ranked.is_some() {
+            q.push(&format!(" ORDER BY score DESC, m.updated_at DESC LIMIT {limit}"));
+        } else {
+            q.push(&format!(" ORDER BY m.updated_at DESC LIMIT {limit}"));
         }
-        let limit = q.int(f.limit.unwrap_or(20).clamp(1, 200));
-        q.push(&format!(" ORDER BY updated_at DESC LIMIT {limit}"));
-        q.build().fetch_all(&self.pool).await?.iter().map(Self::row_to_memory).collect()
+        let rows = q.build().fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok((Self::row_to_memory(r)?, r.try_get::<f64, _>("score")?))).collect()
     }
 
+    /// Delete a memory, with full access (local use).
     pub async fn memory_forget(&self, id: &str) -> Result<()> {
+        self.memory_forget_as(id, &Identity::root()).await
+    }
+
+    /// Delete a memory on behalf of `actor`; see [`Store::memory_update_as`] for who may.
+    pub async fn memory_forget_as(&self, id: &str, actor: &Identity) -> Result<()> {
+        self.memory_authorize(id, actor).await?;
         let mut q = Q::new("DELETE FROM memories WHERE id = ");
         let id_p = q.text(id);
         q.push(&id_p);
@@ -453,12 +724,37 @@ impl Store {
 
     /// Most recent events first.
     pub async fn events_recent(&self, project: &str, session: Option<&str>, limit: i64) -> Result<Vec<Event>> {
+        self.events_query(project, session, None, limit).await
+    }
+
+    /// Most recent events of one `kind` first (so busy kinds can't push them out of a window).
+    pub async fn events_recent_kind(
+        &self,
+        project: &str,
+        session: Option<&str>,
+        kind: &str,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        self.events_query(project, session, Some(kind), limit).await
+    }
+
+    async fn events_query(
+        &self,
+        project: &str,
+        session: Option<&str>,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
         let mut q = Q::new("SELECT * FROM events WHERE project = ");
         let p = q.text(project);
         q.push(&p);
         if let Some(s) = session {
             let s = q.text(s);
             q.push(&format!(" AND session = {s}"));
+        }
+        if let Some(k) = kind {
+            let k = q.text(k);
+            q.push(&format!(" AND kind = {k}"));
         }
         let l = q.int(limit.clamp(1, 500));
         q.push(&format!(" ORDER BY created_at DESC, id DESC LIMIT {l}"));

@@ -544,7 +544,8 @@ impl Backend<'_> {
 
     /// Run the session's hooks through the canonical pipeline, in order.
     async fn send(&self, harness: TranscriptHarness, project: &str, session: &ImportedSession) -> anyhow::Result<()> {
-        let config = HookConfig { agent: harness.name().into(), journal_prompts: true, stop_guard_mins: 0 };
+        let config =
+            HookConfig { agent: harness.name().into(), journal_prompts: true, stop_guard_mins: 0, recall: false };
         let request = |input: &Value, at: Millis| HookRequest {
             project: project.to_owned(),
             config: config.clone(),
