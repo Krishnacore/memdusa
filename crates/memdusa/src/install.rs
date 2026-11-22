@@ -281,37 +281,176 @@ pub fn merge_mcp_json(
     Ok(config)
 }
 
+/// Env vars forwarded to memdusa's Codex MCP server. Unlike hooks, Codex does not pass the parent environment to
+/// stdio MCP servers, so the coordination variables have to be named explicitly. Deliberately only these four:
+/// `MEMDUSA_DATABASE_URL` is already baked into `args` when given, and `MEMDUSA_HOME` is not needed.
+const CODEX_MCP_ENV_VARS: [&str; 4] = ["MEMDUSA_RUN", "MEMDUSA_TASK", "MEMDUSA_PARENT", "MEMDUSA_STEP_LEASE_SECS"];
+
+/// Keys in `[mcp_servers.memdusa]` that the installer owns. Any other key the user put in that table is left
+/// exactly as written.
+const CODEX_OWNED_KEYS: [&str; 4] = ["command", "args", "default_tools_approval_mode", "env_vars"];
+
+fn codex_quote(v: &str) -> String {
+    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Canonical TOML for a single memdusa-owned key.
+///
+/// `default_tools_approval_mode = "approve"` is needed because `codex exec` denies MCP tool calls that require
+/// approval (there is no interactive user to ask). Auto-approval is reasonable here: memdusa's tools only write to
+/// memdusa's own store, so approving them grants no access to arbitrary files or commands.
+fn codex_owned_lines(key: &str, bin: &str, db: Option<&str>) -> Vec<String> {
+    match key {
+        "command" => vec![format!("command = {}", codex_quote(bin))],
+        "args" => {
+            let extra: String = db_args(db).iter().map(|a| format!(", {}", codex_quote(a))).collect();
+            vec![format!("args = [\"mcp\", \"--agent\", \"codex\"{extra}]")]
+        }
+        "default_tools_approval_mode" => vec!["default_tools_approval_mode = \"approve\"".to_owned()],
+        "env_vars" => vec![format!(
+            "env_vars = [{}]",
+            CODEX_MCP_ENV_VARS.iter().map(|v| codex_quote(v)).collect::<Vec<_>>().join(", ")
+        )],
+        _ => unreachable!("unknown memdusa-owned Codex key: {key}"),
+    }
+}
+
+/// Split a table body into statements, preserving each statement's original lines verbatim. A statement can span
+/// several lines (a user's multi-line array), so re-installing does not fold or rewrite it.
+fn toml_statements(lines: &[&str]) -> Vec<Vec<String>> {
+    let delta = |line: &str| {
+        line.chars().fold(0, |d, c| match c {
+            '[' => d + 1,
+            ']' => d - 1,
+            _ => d,
+        })
+    };
+    let mut out: Vec<Vec<String>> = vec![];
+    let mut cur: Vec<String> = vec![];
+    let mut depth = 0;
+    for &line in lines {
+        cur.push(line.to_owned());
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            if depth == 0 {
+                out.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        depth += delta(t);
+        if depth <= 0 {
+            depth = 0;
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn toml_statement_key(stmt: &[String]) -> Option<&str> {
+    let t = stmt.first()?.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return None;
+    }
+    t.split_once('=').map(|(k, _)| k.trim())
+}
+
+/// Rebuild the memdusa table body: refresh memdusa's keys in place (appending any that were missing), keep every
+/// other line — user keys, comments, blank lines — as written.
+fn codex_table_body(body: &[&str], bin: &str, db: Option<&str>) -> Vec<String> {
+    let mut out = vec![];
+    let mut written = [false; CODEX_OWNED_KEYS.len()];
+    for stmt in toml_statements(body) {
+        let owned = toml_statement_key(&stmt).and_then(|key| CODEX_OWNED_KEYS.iter().position(|k| *k == key));
+        if let Some(i) = owned {
+            out.extend(codex_owned_lines(CODEX_OWNED_KEYS[i], bin, db));
+            written[i] = true;
+        } else {
+            out.extend(stmt);
+        }
+    }
+    for (i, &key) in CODEX_OWNED_KEYS.iter().enumerate() {
+        if !written[i] {
+            out.extend(codex_owned_lines(key, bin, db));
+        }
+    }
+    out
+}
+
 /// Add (or remove) the `[mcp_servers.memdusa]` table in Codex's config.toml.
 pub fn merge_codex_toml(text: &str, bin: &str, db: Option<&str>, uninstall: bool) -> String {
     const HEADER: &str = "[mcp_servers.memdusa]";
-    // drop an existing table: from its header to the next table header
-    let mut out: Vec<&str> = vec![];
-    let mut skipping = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t == HEADER || t.starts_with("[mcp_servers.memdusa.") {
-            skipping = true;
+    const NESTED: &str = "[mcp_servers.memdusa.";
+
+    if uninstall {
+        // Drop the table and any of its sub-tables; keep every other line, including later tables.
+        let mut out: Vec<&str> = vec![];
+        let mut skipping = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if t == HEADER || t.starts_with(NESTED) {
+                skipping = true;
+                continue;
+            }
+            if skipping && t.starts_with('[') {
+                skipping = false;
+            }
+            if !skipping {
+                out.push(line);
+            }
+        }
+        let mut s = out.join("\n");
+        while s.ends_with('\n') {
+            s.pop();
+        }
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        return s;
+    }
+
+    // Install: replace the table in place, preserving the user's own keys and sub-tables around it.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = vec![];
+    let mut i = 0;
+    let mut found = false;
+    while i < lines.len() {
+        if lines[i].trim() == HEADER {
+            if found {
+                // A duplicate table: drop it, its keys were folded into the first one.
+                i += 1;
+                while i < lines.len() && !lines[i].trim_start().starts_with('[') {
+                    i += 1;
+                }
+                continue;
+            }
+            found = true;
+            let start = i + 1;
+            let mut end = start;
+            while end < lines.len() && !lines[end].trim_start().starts_with('[') {
+                end += 1;
+            }
+            out.push(HEADER.to_owned());
+            out.extend(codex_table_body(&lines[start..end], bin, db));
+            i = end;
             continue;
         }
-        if skipping && t.starts_with('[') {
-            skipping = false;
-        }
-        if !skipping {
-            out.push(line);
-        }
+        out.push(lines[i].to_owned());
+        i += 1;
     }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
-        out.pop();
+    if !found {
+        while out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.pop();
+        }
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push(HEADER.to_owned());
+        out.extend(codex_table_body(&[], bin, db));
     }
     let mut s = out.join("\n");
-    if !uninstall {
-        let quote = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        let extra: String = db_args(db).iter().map(|a| format!(", {}", quote(a))).collect();
-        s.push_str(&format!("{HEADER}\ncommand = {}\nargs = [\"mcp\", \"--agent\", \"codex\"{extra}]", quote(bin)));
-    }
     if !s.is_empty() {
         s.push('\n');
     }
@@ -913,7 +1052,16 @@ mod tests {
 
         let toml = "model = \"o5\"\n\n[mcp_servers.other]\ncommand = \"x\"\n";
         let added = merge_codex_toml(toml, "/opt/my \"bin\"/memdusa", None, false);
-        assert!(added.ends_with("[mcp_servers.memdusa]\ncommand = \"/opt/my \\\"bin\\\"/memdusa\"\nargs = [\"mcp\", \"--agent\", \"codex\"]\n"), "{added}");
+        assert!(
+            added.ends_with(concat!(
+                "[mcp_servers.memdusa]\n",
+                "command = \"/opt/my \\\"bin\\\"/memdusa\"\n",
+                "args = [\"mcp\", \"--agent\", \"codex\"]\n",
+                "default_tools_approval_mode = \"approve\"\n",
+                "env_vars = [\"MEMDUSA_RUN\", \"MEMDUSA_TASK\", \"MEMDUSA_PARENT\", \"MEMDUSA_STEP_LEASE_SECS\"]\n"
+            )),
+            "{added}"
+        );
         assert_eq!(merge_codex_toml(&added, "/opt/my \"bin\"/memdusa", None, false), added, "idempotent");
         assert_eq!(merge_codex_toml(&added, BIN, None, true), toml, "uninstall restores the original");
         let between =
@@ -923,6 +1071,50 @@ mod tests {
             "[profile]\nx = 1\n",
             "removes nested tables, keeps later ones"
         );
+    }
+
+    #[test]
+    fn codex_mcp_config_forwards_coordination_vars_and_keeps_user_keys() {
+        let existing = concat!(
+            "model = \"o5\"\n\n",
+            "[mcp_servers.memdusa]\n",
+            "command = \"/old/memdusa\"\n",
+            "env = { FOO = \"bar\" }\n",             // user key: must survive
+            "startup_timeout_sec = 42\n",            // user key: must survive
+            "tags = [\n  \"one\",\n  \"two\",\n]\n", // user's multi-line array: must survive verbatim
+            "\n",
+            "[mcp_servers.memdusa.env]\n",
+            "NESTED = \"1\"\n", // user sub-table: must survive
+            "\n",
+            "[profile]\n",
+            "x = 1\n",
+        );
+        let once = merge_codex_toml(existing, BIN, Some("sqlite:///x/m.db"), false);
+        // memdusa's own keys are refreshed, including the stale command path
+        assert!(once.contains("command = \"/usr/local/bin/memdusa\""));
+        assert!(once.contains("args = [\"mcp\", \"--agent\", \"codex\", \"--database-url\", \"sqlite:///x/m.db\"]"));
+        assert!(once.contains("default_tools_approval_mode = \"approve\""));
+        assert!(once.contains(
+            "env_vars = [\"MEMDUSA_RUN\", \"MEMDUSA_TASK\", \"MEMDUSA_PARENT\", \"MEMDUSA_STEP_LEASE_SECS\"]"
+        ));
+        assert!(!once.contains("/old/memdusa"));
+        // only the four coordination variables are forwarded
+        assert!(!once.contains("MEMDUSA_HOME"));
+        assert!(!once.contains("MEMDUSA_DATABASE_URL"));
+        // every user key, comment line and sub-table is untouched
+        assert!(once.contains("env = { FOO = \"bar\" }"));
+        assert!(once.contains("startup_timeout_sec = 42"));
+        assert!(once.contains("tags = [\n  \"one\",\n  \"two\",\n]\n"));
+        assert!(once.contains("[mcp_servers.memdusa.env]\nNESTED = \"1\""));
+        assert!(once.contains("[profile]\nx = 1\n"));
+        // re-installing changes nothing
+        assert_eq!(merge_codex_toml(&once, BIN, Some("sqlite:///x/m.db"), false), once);
+        // uninstall removes the new keys with the whole table
+        let removed = merge_codex_toml(&once, BIN, Some("sqlite:///x/m.db"), true);
+        assert_eq!(removed, "model = \"o5\"\n\n[profile]\nx = 1\n");
+        assert!(!removed.contains("mcp_servers.memdusa"));
+        assert!(!removed.contains("env_vars"));
+        assert!(!removed.contains("startup_timeout_sec"));
     }
 
     #[test]
@@ -1002,7 +1194,7 @@ mod tests {
         // Codex TOML
         let toml = merge_codex_toml("", "/opt/my \"bin\"/memdusa", Some("postgres://u:p\"q@h/db"), false);
         assert!(
-            toml.ends_with(
+            toml.contains(
                 "args = [\"mcp\", \"--agent\", \"codex\", \"--database-url\", \"postgres://u:p\\\"q@h/db\"]\n"
             ),
             "{toml}"
