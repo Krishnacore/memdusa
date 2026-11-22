@@ -524,9 +524,15 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
                 Some(list) => list.iter().filter_map(Value::as_str).collect(),
                 None => field("file_path").or_else(|| field("notebook_path")).into_iter().collect(),
             };
+            // `cwd` is the only worktree hint available here: PostToolUse must stay fast and
+            // never shells out to git. Canonicalizing it (no process spawn) makes it comparable
+            // with `git rev-parse --show-toplevel`, e.g. /var vs /private/var on macOS.
+            let cwd = ctx.cwd.as_deref().map(|c| {
+                std::fs::canonicalize(c).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| c.to_owned())
+            });
             for path in paths {
                 let rel = relative(path, ctx.cwd.as_deref());
-                log(ctx, FILE_CHANGE, rel, Some(json!({ "tool": tool, "path": path }))).await?;
+                log(ctx, FILE_CHANGE, rel, Some(json!({ "tool": tool, "path": path, "cwd": cwd }))).await?;
             }
         }
         "Bash" => {

@@ -284,6 +284,10 @@ pub struct GitState {
     /// Machine name: uncommitted work only exists there.
     #[serde(default)]
     pub host: Option<String>,
+    /// Absolute path of the worktree root (`git rev-parse --show-toplevel`).
+    /// Two worktrees of one repo share a project key but not their code state.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 fn short(sha: &str) -> &str {
@@ -572,6 +576,7 @@ mod tests {
             dirty_count: dirty.len() as i64,
             dirty_files: dirty.iter().map(|s| s.to_string()).collect(),
             host: Some(host.into()),
+            worktree: None,
         }
     }
 
@@ -595,6 +600,19 @@ mod tests {
 
         let clean = g("main", "a1b2c3d4e5", &[], "laptop");
         assert!(clean.drift(&g("main", "a1b2c3d4e5", &[], "desktop")).is_empty(), "clean tree: machine doesn't matter");
+    }
+
+    #[test]
+    fn worktree_defaults_and_round_trips() {
+        // Old clients/data have no `worktree` field at all.
+        let old: GitState = serde_json::from_str(r#"{"branch":"main","host":"mbp"}"#).unwrap();
+        assert_eq!(old.worktree, None);
+        let g = GitState { worktree: Some("/work/wt-a".into()), ..g("main", "a1b2c3d4e5", &[], "mbp") };
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("/work/wt-a"), "{json}");
+        assert_eq!(serde_json::from_str::<GitState>(&json).unwrap().worktree, g.worktree);
+        // Worktree alone doesn't create drift when everything else matches.
+        assert!(g.drift(&g).is_empty());
     }
 
     #[test]

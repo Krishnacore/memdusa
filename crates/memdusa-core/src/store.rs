@@ -872,6 +872,16 @@ impl Store {
         Ok(out)
     }
 
+    /// The newest checkpoints of the project, all tasks included, most recent first.
+    /// Unlike [`Self::checkpoints_latest`] this keeps older checkpoints of the same task, so a
+    /// caller can find the last checkpoint saved in its own worktree (which may be an older one).
+    pub async fn checkpoints_recent(&self, project: &str, limit: i64) -> Result<Vec<Checkpoint>> {
+        let mut q = Q::new("SELECT * FROM checkpoints WHERE project = ");
+        let (p, l) = (q.text(project), q.int(limit.clamp(1, 500)));
+        q.push(&format!("{p} ORDER BY created_at DESC, id DESC LIMIT {l}"));
+        q.build().fetch_all(&self.pool).await?.iter().map(|r| Self::row_to_checkpoint(r, r.try_get("task")?)).collect()
+    }
+
     /// The newest checkpoints of one task, most recent first.
     pub async fn checkpoints_for_task(&self, project: &str, task: &str, limit: i64) -> Result<Vec<Checkpoint>> {
         let mut q = Q::new("SELECT * FROM checkpoints WHERE project = ");

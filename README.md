@@ -166,6 +166,10 @@ MEMDUSA_TASK=install-scripts MEMDUSA_PARENT=lead-session claude   # or opencode,
   7 days (up to 10, newest first): harness, status (`active` until the worker's session ends, then `ended`), the task's
   latest checkpoint goal and next steps, and the worker's last message. Workers' checkpoints and messages are kept out
   of the coordinator's own "Where things stand" and "Last words".
+- **Worktrees are separate.** Workers in sibling git worktrees share the project key, but the brief compares code state
+  with the latest checkpoint from *this* worktree (on this machine), lists this worktree's recent file edits first and
+  summarizes the others as `Other worktrees: ../memdusa-eval2 (4 files)`; a checkpoint from another worktree is noted
+  calmly instead of raising a "Code state differs" warning.
 
 ### Delegating through a durable run
 
@@ -491,8 +495,8 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
     from hook fields like `agent_id`/`agent_type` or Hermes `conversation_id` is not done)
   - [x] task-scoped checkpoints by default for workers (`task` = the assignment), so they never overwrite the
     coordinator's checkpoint, and a worker's replacement resumes exactly that task
-  - worktree/branch awareness: workers in different worktrees share the project key, but code-state warnings and
-    "files changed" should be per worktree/branch, not mixed
+  - [x] worktree/branch awareness: workers in different worktrees share the project key, but code-state warnings and
+    "files changed" are per worktree/branch, not mixed
   - [x] durable runs as the coordination primitive: the coordinator creates a run whose steps are the delegated tasks;
     workers claim steps with leases, so a crashed or rate-limited worker's step is visibly stale and can be
     claimed by another harness, and finished steps are never redone
