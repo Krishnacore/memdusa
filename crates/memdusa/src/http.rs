@@ -255,6 +255,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/runs/{id}/steps/{key}/complete", post(step_complete))
         .route("/v1/runs/{id}/steps/{key}/fail", post(step_fail))
         .nest_service("/mcp", mcp)
+        .merge(oauth::identity_routes())
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), observe))

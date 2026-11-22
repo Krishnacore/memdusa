@@ -10,6 +10,9 @@ mod install;
 mod local_embed;
 mod mcp;
 mod oauth;
+mod oauth_upstream;
+#[cfg(test)]
+mod oauth_upstream_tests;
 mod ops;
 mod project;
 mod proxy;
@@ -425,6 +428,21 @@ enum UserCmd {
     Enable {
         name: String,
     },
+    /// Link an external identity (lazy: binds on first sign-in by login/email).
+    /// Example: github:octocat, github:12345, google:alice@acme.com
+    Link {
+        user: String,
+        identity: String,
+    },
+    /// Remove a linked or pending external identity.
+    Unlink {
+        user: String,
+        identity: String,
+    },
+    /// List a user's linked external identities.
+    Identities {
+        user: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -627,6 +645,43 @@ async fn run() -> anyhow::Result<()> {
             UserCmd::List => store.user_list().await?.iter().for_each(print_user),
             UserCmd::Disable { name } => print_user(&store.user_set_disabled(&name, true).await?),
             UserCmd::Enable { name } => print_user(&store.user_set_disabled(&name, false).await?),
+            UserCmd::Link { user, identity } => {
+                let (provider, handle) = oauth_upstream::parse_link(&identity)?;
+                let (subject, login, email) = if oauth_upstream::is_stable_subject(&handle) {
+                    (handle.clone(), None, None)
+                } else if provider == oauth_upstream::GITHUB {
+                    (format!("{}{}", oauth_upstream::PENDING_PREFIX, handle), Some(handle.clone()), None)
+                } else {
+                    (format!("{}{}", oauth_upstream::PENDING_PREFIX, handle), None, Some(handle.clone()))
+                };
+                let linked =
+                    store.identity_insert(&user, &provider, &subject, email.as_deref(), login.as_deref()).await?;
+                store
+                    .audit(
+                        memdusa_core::model::NewAuditEvent::ok("root", "oauth.identity_link")
+                            .target(&user)
+                            .detail(serde_json::json!({"provider": provider, "handle": handle})),
+                    )
+                    .await?;
+                print_identity(&linked);
+            }
+            UserCmd::Unlink { user, identity } => {
+                let (provider, handle) = oauth_upstream::parse_link(&identity)?;
+                let n = store.identity_unlink(&user, &provider, &handle).await?;
+                store
+                    .audit(
+                        memdusa_core::model::NewAuditEvent::ok("root", "oauth.identity_unlink")
+                            .target(&user)
+                            .detail(serde_json::json!({"provider": provider, "handle": handle, "removed": n})),
+                    )
+                    .await?;
+                println!("unlinked {n} identity/identities from {user}");
+            }
+            UserCmd::Identities { user } => {
+                for i in store.identity_list(&user).await? {
+                    print_identity(&i);
+                }
+            }
         },
         Cmd::Key { cmd } => match cmd {
             KeyCmd::Create { user, name } => {
@@ -685,6 +740,9 @@ async fn run() -> anyhow::Result<()> {
             let oauth = oauth::OAuthConfig::from_env().context("invalid MEMDUSA_PUBLIC_URL")?;
             if let Some(c) = &oauth {
                 tracing::info!("OAuth sign-in enabled (issuer {})", c.issuer);
+                for (provider, url) in c.callback_urls() {
+                    tracing::info!("register this {provider} OAuth callback URL: {url}");
+                }
             }
             let opts = http::HttpOptions {
                 addr,
@@ -867,6 +925,20 @@ async fn run_remote(
                 UserCmd::List => c.user_list().await?.iter().for_each(print_user),
                 UserCmd::Disable { name } => print_user(&c.user_set_disabled(&name, true).await?),
                 UserCmd::Enable { name } => print_user(&c.user_set_disabled(&name, false).await?),
+                UserCmd::Link { user, identity } => {
+                    let (provider, handle) = oauth_upstream::parse_link(&identity)?;
+                    print_identity(&c.identity_link(&user, &provider, &handle).await?);
+                }
+                UserCmd::Unlink { user, identity } => {
+                    let (provider, handle) = oauth_upstream::parse_link(&identity)?;
+                    let r = c.identity_unlink(&user, &provider, &handle).await?;
+                    println!("unlinked {} identity/identities from {user}", r["unlinked"]);
+                }
+                UserCmd::Identities { user } => {
+                    for i in c.identity_list(&user).await? {
+                        print_identity(&i);
+                    }
+                }
             }
         }
         Cmd::Key { cmd } => {
@@ -1310,6 +1382,12 @@ fn print_created(k: &CreatedKey) {
 
 fn print_grant(g: &ProjectGrant) {
     println!("{:<36} {:<20} {:<6} created by {}  id {}", g.pattern, g.user, g.role.as_str(), g.created_by, g.id);
+}
+
+fn print_identity(i: &memdusa_core::oauth::UserIdentity) {
+    let state = if i.pending() { "pending" } else { "linked" };
+    let handle = i.login.as_deref().or(i.email.as_deref()).unwrap_or_else(|| i.handle());
+    println!("{:<8} {:<28} {:<40} {:<8} user {}   id {}", i.provider, handle, i.subject, state, i.user_name, i.id);
 }
 
 fn print_session(s: &memdusa_core::oauth::OAuthSession) {

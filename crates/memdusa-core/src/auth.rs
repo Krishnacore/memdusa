@@ -91,6 +91,33 @@ impl Store {
         }
     }
 
+    /// Create a non-admin user from an external handle (GitHub login, email
+    /// local part). Sanitises the name to the allowed character set and adds a
+    /// numeric suffix on collision, so auto-provisioning never fails on a
+    /// duplicate. Returns the name actually used.
+    pub async fn user_create_unique(&self, base: &str) -> Result<User> {
+        let sanitized: String = base
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c) { c } else { '-' })
+            .take(36)
+            .collect();
+        let base = if sanitized.is_empty() { "user".into() } else { sanitized };
+        for n in 1..=1000 {
+            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            if name.len() > 40 {
+                continue;
+            }
+            match self.user_create(&name, false).await {
+                Ok(u) => return Ok(u),
+                Err(Error::Conflict(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Invalid("could not allocate a unique user name".into()))
+    }
+
     pub async fn user_list(&self) -> Result<Vec<User>> {
         sqlx::query("SELECT * FROM users ORDER BY name")
             .fetch_all(&self.pool)

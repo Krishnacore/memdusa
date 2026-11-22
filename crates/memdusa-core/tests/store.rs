@@ -769,6 +769,9 @@ async fn v3_database_migrates_to_v4_and_backfills() {
         // v5 columns, so the migrations from v3 on all run again
         "ALTER TABLE steps DROP COLUMN owner",
         "ALTER TABLE steps DROP COLUMN lease_until",
+        // v9 columns, so the migration that adds them runs again
+        "ALTER TABLE oauth_transactions DROP COLUMN upstream",
+        "ALTER TABLE oauth_transactions DROP COLUMN signin_method",
         "UPDATE memdusa_meta SET value = '3' WHERE key = 'schema_version'",
         "INSERT INTO memories (id, project, kind, content, tags, created_at, updated_at) \
          VALUES ('legacy-1', 'PROJECT', 'note', 'legacy cache invalidation notes', '[\"perf\"]', 1, 1)",
@@ -779,7 +782,7 @@ async fn v3_database_migrates_to_v4_and_backfills() {
     raw.close().await;
 
     let s = Store::connect(&url).await.unwrap();
-    assert_eq!(s.migrate().await.unwrap(), 8);
+    assert_eq!(s.migrate().await.unwrap(), 9);
     // v5: steps can be delegated and leased
     let run = s.run_delegate(&p, "after migration", vec!["t".into()], None).await.unwrap();
     assert!(matches!(

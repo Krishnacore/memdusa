@@ -28,6 +28,16 @@ pub struct OAuthClient {
     pub created_at: Millis,
 }
 
+/// The short-lived upstream (GitHub/Google) round trip bound to a sign-in
+/// transaction. Stored as JSON on the transaction; never outlives it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamTxn {
+    pub provider: String,
+    pub state: String,
+    pub verifier: String,
+    pub nonce: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTransaction {
     pub csrf: String,
@@ -39,6 +49,16 @@ pub struct OAuthTransaction {
     pub state: String,
     pub user_name: Option<String>,
     pub created_at: Millis,
+    /// H2b: upstream round-trip details while talking to GitHub/Google.
+    #[serde(default)]
+    pub upstream: Option<UpstreamTxn>,
+    /// How the user authenticated: `api_key`, `github` or `google`.
+    #[serde(default = "default_signin_method")]
+    pub signin_method: String,
+}
+
+fn default_signin_method() -> String {
+    "api_key".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +121,34 @@ pub struct OAuthToken {
     pub created_at: Millis,
 }
 
+/// A linked external identity (H2b). `subject` is the provider's stable id
+/// (GitHub numeric user id, Google `sub`); `login`/`email` are the human
+/// handles used to resolve pending admin links and allowlists. A pending link
+/// stores the sentinel `subject = "pending:<handle>"` until the first
+/// successful sign-in binds it to the real subject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIdentity {
+    pub id: String,
+    pub user_name: String,
+    pub provider: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub login: Option<String>,
+    pub linked_at: Millis,
+}
+
+impl UserIdentity {
+    pub fn pending(&self) -> bool {
+        self.subject.starts_with(PENDING_PREFIX)
+    }
+
+    pub fn handle(&self) -> &str {
+        self.subject.strip_prefix(PENDING_PREFIX).unwrap_or(&self.subject)
+    }
+}
+
+pub const PENDING_PREFIX: &str = "pending:";
+
 /// Result of resolving an `mdo_` bearer token in the HTTP auth middleware.
 #[derive(Debug, Clone)]
 pub struct AccessAuth {
@@ -153,6 +201,24 @@ fn row_to_txn(r: &AnyRow) -> Result<OAuthTransaction> {
         state: r.try_get("state")?,
         user_name: r.try_get("user_name")?,
         created_at: r.try_get("created_at")?,
+        upstream: r.try_get::<Option<String>, _>("upstream").ok().flatten().and_then(|s| serde_json::from_str(&s).ok()),
+        signin_method: r
+            .try_get::<Option<String>, _>("signin_method")
+            .ok()
+            .flatten()
+            .unwrap_or_else(default_signin_method),
+    })
+}
+
+fn row_to_identity(r: &AnyRow) -> Result<UserIdentity> {
+    Ok(UserIdentity {
+        id: r.try_get("id")?,
+        user_name: r.try_get("user_name")?,
+        provider: r.try_get("provider")?,
+        subject: r.try_get("subject")?,
+        email: r.try_get("email")?,
+        login: r.try_get("login")?,
+        linked_at: r.try_get("linked_at")?,
     })
 }
 
@@ -234,7 +300,7 @@ impl Store {
 
     pub async fn oauth_txn_create(&self, t: &OAuthTransaction) -> Result<()> {
         let mut q = Q::new(
-            "INSERT INTO oauth_transactions (csrf, client_id, redirect_uri, code_challenge, scope, resource, state, user_name, created_at) VALUES (",
+            "INSERT INTO oauth_transactions (csrf, client_id, redirect_uri, code_challenge, scope, resource, state, user_name, created_at, upstream, signin_method) VALUES (",
         );
         let vals = [
             q.text(&t.csrf),
@@ -246,6 +312,8 @@ impl Store {
             q.text(&t.state),
             q.opt_text(t.user_name.clone()),
             q.int(t.created_at),
+            q.opt_text(t.upstream.as_ref().and_then(|u| serde_json::to_string(u).ok())),
+            q.text(t.signin_method.clone()),
         ];
         q.push(&vals.join(", ")).push(")");
         q.build().execute(&self.pool).await?;
@@ -263,6 +331,19 @@ impl Store {
         let mut q = Q::new("UPDATE oauth_transactions SET user_name = ");
         let (u, c) = (q.text(user), q.text(csrf));
         q.push(&format!("{u} WHERE csrf = {c}"));
+        q.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Bind the upstream round trip and the sign-in method to a transaction.
+    pub async fn oauth_txn_set_upstream(&self, csrf: &str, upstream: &UpstreamTxn, method: &str) -> Result<()> {
+        let mut q = Q::new("UPDATE oauth_transactions SET upstream = ");
+        let u = q.text(serde_json::to_string(upstream).unwrap_or_default());
+        q.push(&u).push(", signin_method = ");
+        let m = q.text(method);
+        q.push(&m).push(" WHERE csrf = ");
+        let c = q.text(csrf);
+        q.push(&c);
         q.build().execute(&self.pool).await?;
         Ok(())
     }
@@ -536,6 +617,109 @@ impl Store {
         self.oauth_grant_revoke(&grant_id, now).await?;
         let after = self.oauth_sessions_list(user).await?.len();
         Ok(before.saturating_sub(after))
+    }
+
+    // ------------------------------------------------------------- identities
+
+    pub async fn identity_by_subject(&self, provider: &str, subject: &str) -> Result<Option<UserIdentity>> {
+        let mut q = Q::new("SELECT * FROM user_identities WHERE provider = ");
+        let p = q.text(provider);
+        q.push(&p).push(" AND subject = ");
+        let s = q.text(subject);
+        q.push(&s);
+        q.build().fetch_optional(&self.pool).await?.map(|r| row_to_identity(&r)).transpose()
+    }
+
+    /// Resolve a pending link by its human handle (GitHub login, Google email).
+    /// Handles are compared case-insensitively: GitHub logins and email
+    /// addresses are case-insensitive in practice.
+    pub async fn identity_pending(&self, provider: &str, handle: &str) -> Result<Option<UserIdentity>> {
+        let mut q = Q::new("SELECT * FROM user_identities WHERE provider = ");
+        let p = q.text(provider);
+        q.push(&p).push(" AND LOWER(subject) = LOWER(");
+        let s = q.text(format!("{PENDING_PREFIX}{handle}"));
+        q.push(&s).push(")");
+        q.build().fetch_optional(&self.pool).await?.map(|r| row_to_identity(&r)).transpose()
+    }
+
+    /// Insert a link. Callers use a `pending:` subject for lazy login/email
+    /// links, or a real stable subject once it is known.
+    pub async fn identity_insert(
+        &self,
+        user: &str,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        login: Option<&str>,
+    ) -> Result<UserIdentity> {
+        let identity = UserIdentity {
+            id: new_id(),
+            user_name: user.into(),
+            provider: provider.into(),
+            subject: subject.into(),
+            email: email.map(String::from),
+            login: login.map(String::from),
+            linked_at: now_ms(),
+        };
+        let mut q =
+            Q::new("INSERT INTO user_identities (id, user_name, provider, subject, email, login, linked_at) VALUES (");
+        let vals = [
+            q.text(&identity.id),
+            q.text(&identity.user_name),
+            q.text(&identity.provider),
+            q.text(&identity.subject),
+            q.opt_text(identity.email.clone()),
+            q.opt_text(identity.login.clone()),
+            q.int(identity.linked_at),
+        ];
+        q.push(&vals.join(", ")).push(")");
+        match q.build().execute(&self.pool).await {
+            Ok(_) => Ok(identity),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                Err(Error::Conflict(format!("identity '{provider}:{subject}' is already linked")))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Bind a matching pending link to the real subject on first successful
+    /// upstream sign-in. Returns the user the pending link belonged to.
+    pub async fn identity_bind_pending(&self, pending: &UserIdentity, subject: &str) -> Result<String> {
+        let mut q = Q::new("UPDATE user_identities SET subject = ");
+        let s = q.text(subject);
+        q.push(&s).push(" WHERE id = ");
+        let id = q.text(&pending.id);
+        q.push(&id).push(" AND subject = ");
+        let old = q.text(&pending.subject);
+        q.push(&old);
+        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+            return Err(Error::Conflict("pending identity changed concurrently".into()));
+        }
+        Ok(pending.user_name.clone())
+    }
+
+    pub async fn identity_unlink(&self, user: &str, provider: &str, handle: &str) -> Result<usize> {
+        let mut q = Q::new("DELETE FROM user_identities WHERE user_name = ");
+        let u = q.text(user);
+        q.push(&u).push(" AND provider = ");
+        let p = q.text(provider);
+        q.push(&p).push(" AND (subject = ");
+        let s = q.text(handle);
+        q.push(&s).push(" OR subject = ");
+        let pending = q.text(format!("{PENDING_PREFIX}{handle}"));
+        q.push(&pending).push(" OR login = ");
+        let l = q.text(handle);
+        q.push(&l).push(" OR email = ");
+        let e = q.text(handle);
+        q.push(&e).push(")");
+        Ok(q.build().execute(&self.pool).await?.rows_affected() as usize)
+    }
+
+    pub async fn identity_list(&self, user: &str) -> Result<Vec<UserIdentity>> {
+        let mut q = Q::new("SELECT * FROM user_identities WHERE user_name = ");
+        let u = q.text(user);
+        q.push(&u).push(" ORDER BY provider, linked_at");
+        q.build().fetch_all(&self.pool).await?.iter().map(row_to_identity).collect()
     }
 }
 
