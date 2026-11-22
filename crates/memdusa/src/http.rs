@@ -973,10 +973,19 @@ mod tests {
         assert_eq!(reqwest::get(format!("{url}/health")).await.unwrap().status(), 200, "health isn't rate limited");
 
         // fresh limiter-free server for the body limit
-        let (url2, _) = spawn(None).await;
+        let (url2, store2) = spawn(None).await;
         let big = "x".repeat(2 * 1024 * 1024);
-        let (st, _) = call(M::POST, &format!("{url2}/v1/memories"), None, Some(json!({"content": big}))).await;
-        assert_eq!(st, 413, "1 MB default body limit");
+        // The server answers 413 and closes the connection while the client may still be uploading,
+        // so under load the client can see a connection reset instead of the 413. Either way the
+        // request must be refused and nothing stored.
+        let sent =
+            reqwest::Client::new().post(format!("{url2}/v1/memories")).json(&json!({"content": big})).send().await;
+        match sent {
+            Ok(resp) => assert_eq!(resp.status().as_u16(), 413, "1 MB default body limit"),
+            Err(e) => assert!(e.is_request() || e.is_body() || e.is_connect(), "refused mid-upload: {e}"),
+        }
+        let stored = store2.memory_search(MemoryQuery { limit: Some(5), ..Default::default() }).await.unwrap();
+        assert!(stored.is_empty(), "the oversized memory must not be stored");
 
         let text = reqwest::get(format!("{url}/metrics")).await.unwrap().text().await.unwrap();
         assert!(
