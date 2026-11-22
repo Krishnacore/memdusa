@@ -7,6 +7,7 @@ pub mod auth;
 pub mod brief;
 pub mod embed;
 pub mod model;
+pub mod oauth;
 pub mod redact;
 pub mod retention;
 pub mod review;

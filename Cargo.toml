@@ -23,7 +23,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "3", features = ["server", "client", "macros", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls"] }
 sha2 = "0.11"
 # Only pulled in by the opt-in `local-embed` feature. No hf-hub: memdusa downloads the model
 # files itself into <MEMDUSA_HOME>/models and feeds them to fastembed from disk.

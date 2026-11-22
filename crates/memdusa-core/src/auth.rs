@@ -19,14 +19,25 @@ const DISPLAY_PREFIX_LEN: usize = 12;
 /// Don't write `last_used_at` more than once per minute per key.
 const TOUCH_INTERVAL_MS: i64 = 60_000;
 
-fn hash_key(secret: &str) -> String {
+/// SHA-256 of a high-entropy secret, as lowercase hex. Shared with OAuth
+/// tokens/codes: all credentials are stored as hashes, never in the clear.
+pub fn hash_secret(secret: &str) -> String {
     Sha256::digest(secret.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn generate_key() -> Result<String> {
+fn hash_key(secret: &str) -> String {
+    hash_secret(secret)
+}
+
+/// `prefix` + 32 random bytes as hex. Used for API keys and OAuth credentials.
+pub fn generate_secret(prefix: &str) -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| Error::Invalid(format!("no system randomness available: {e}")))?;
-    Ok(format!("{KEY_PREFIX}{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+    Ok(format!("{prefix}{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+fn generate_key() -> Result<String> {
+    generate_secret(KEY_PREFIX)
 }
 
 /// User names end up in identities like `alice/claude-code`, so keep them simple.

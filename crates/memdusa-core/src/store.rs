@@ -53,6 +53,9 @@ pub struct Store {
 pub(crate) enum Arg {
     Text(Option<String>),
     Int(i64),
+    /// A nullable BIGINT. Binding `None::<String>` would make Postgres infer
+    /// TEXT and fail against an integer column, even for a NULL.
+    IntOpt(Option<i64>),
 }
 
 pub(crate) struct Q {
@@ -80,6 +83,10 @@ impl Q {
         self.args.push(Arg::Int(v));
         format!("${}", self.args.len())
     }
+    pub(crate) fn opt_int(&mut self, v: Option<i64>) -> String {
+        self.args.push(Arg::IntOpt(v));
+        format!("${}", self.args.len())
+    }
     pub(crate) fn build(&self) -> sqlx::query::Query<'_, sqlx::Any, sqlx::any::AnyArguments> {
         // every dynamic part is a `$N` placeholder; values are always bound
         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.sql.as_str()));
@@ -87,6 +94,7 @@ impl Q {
             q = match a {
                 Arg::Text(v) => q.bind(v.clone()),
                 Arg::Int(v) => q.bind(*v),
+                Arg::IntOpt(v) => q.bind(*v),
             };
         }
         q
@@ -386,6 +394,85 @@ const MIGRATIONS: &[Migration] = &[
         "CREATE INDEX IF NOT EXISTS audit_events_at ON audit_events (at)",
         "CREATE INDEX IF NOT EXISTS audit_events_actor ON audit_events (actor, at)",
         "CREATE INDEX IF NOT EXISTS audit_events_project ON audit_events (project, at)",
+    ]),
+    // 8: OAuth 2.1 authorization server (H2a). All credentials are stored as
+    // SHA-256 hashes; ids/timestamps follow the same portable conventions.
+    Migration::Portable(&[
+        "CREATE TABLE IF NOT EXISTS oauth_clients (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL,
+            grant_types TEXT NOT NULL,
+            created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS oauth_transactions (
+            csrf TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            state TEXT NOT NULL,
+            user_name TEXT,
+            created_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS oauth_grants (
+            id TEXT PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            method TEXT NOT NULL,
+            created_at BIGINT NOT NULL,
+            last_interactive_at BIGINT NOT NULL,
+            revoked_at BIGINT)",
+        "CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user_name)",
+        "CREATE TABLE IF NOT EXISTS oauth_codes (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            grant_id TEXT NOT NULL,
+            expires_at BIGINT NOT NULL,
+            used_at BIGINT,
+            created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS oauth_codes_grant ON oauth_codes (grant_id)",
+        "CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL UNIQUE,
+            grant_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            prefix TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            expires_at BIGINT NOT NULL,
+            rotated_from TEXT,
+            revoked_at BIGINT,
+            last_used_at BIGINT,
+            created_at BIGINT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS oauth_tokens_grant ON oauth_tokens (grant_id)",
+        "CREATE TABLE IF NOT EXISTS user_identities (
+            id TEXT PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            email TEXT,
+            login TEXT,
+            linked_at BIGINT NOT NULL,
+            UNIQUE (provider, subject))",
+        "CREATE TABLE IF NOT EXISTS oauth_device_codes (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL UNIQUE,
+            user_code TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            expires_at BIGINT NOT NULL,
+            interval BIGINT NOT NULL,
+            user_name TEXT,
+            created_at BIGINT NOT NULL)",
     ]),
 ];
 

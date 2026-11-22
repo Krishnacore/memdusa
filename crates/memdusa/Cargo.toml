@@ -31,6 +31,9 @@ clap.workspace = true
 http = "1"
 reqwest.workspace = true
 sha2.workspace = true
+base64 = "0.22"
+getrandom = "0.4"
+serde_urlencoded = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate"] }

@@ -1,6 +1,6 @@
 # Design: memdusa as a team server
 
-Status: H1 in progress; H2 and H3 proposed.
+Status: H1 done; H2 in progress; H3 proposed.
 
 A memdusa server (`memdusa serve`, Postgres or SQLite) already has per-user API keys, server-side attribution
 (`user/agent`) and private global memories. What a team needs next, in dependency order:
@@ -64,18 +64,61 @@ Redaction applies to `detail` like everything else.
 v7 (portable): `project_grants`, `audit_events` + indexes. No data changes; default policy `write` = no behaviour
 change for existing servers.
 
-## H2: OAuth for remote MCP (proposed)
+## H2: OAuth sign-in (MCP, hooks, CLI)
 
-Follow the MCP authorization spec: the memdusa server is an OAuth 2.1 resource server and its own authorization server.
-- Protected resource metadata (RFC 9728) at `/.well-known/oauth-protected-resource`; authorization server metadata
-  (RFC 8414) at `/.well-known/oauth-authorization-server`; dynamic client registration (RFC 7591) so harnesses register
-  themselves; authorization code + PKCE.
-- Login page: the user signs in with an existing memdusa API key once (or, later, an external IdP such as GitHub OIDC)
-  and approves the client; memdusa issues short-lived access tokens + refresh tokens tied to the user, scoped to
-  `memdusa:read` / `memdusa:write`. H1 grants still decide project access.
-- Tokens stored hashed (like API keys), revocable from `memdusa keys` / admin API; audited.
-Open questions: external IdP support first or later; token lifetimes; whether hooks (not MCP) should also use OAuth
-tokens (probably via `memdusa login --browser`).
+Status: in progress (H2a core first; H2b GitHub/Google and H2c CLI browser login build on it).
+
+memdusa is an OAuth 2.1 **authorization server** and **resource server** for its own API and MCP endpoint, following
+the MCP authorization spec, so a harness connecting to `https://memdusa.example.com/mcp` gets a browser sign-in
+instead of a pasted API key. Users sign in with an existing memdusa API key, with GitHub, or with Google.
+
+### Decisions
+| Topic | Decision |
+|---|---|
+| Sign-in methods | memdusa API key (always), GitHub OAuth, Google OIDC; each upstream enabled by the admin with its client id/secret |
+| Who may sign in via GitHub/Google | Only identities linked to a memdusa user. Linking: an admin runs `memdusa user link <user> github:<login>` / `google:<email>`, or the user links while signed in with an API key. Optional auto-provisioning by allowlist: `MEMDUSA_OAUTH_ALLOW_GOOGLE_DOMAINS=acme.com`, `MEMDUSA_OAUTH_ALLOW_GITHUB_ORGS=acme` creates a non-admin user on first sign-in (default: off). Google requires `email_verified`. |
+| Access token | Opaque random token (`mdo_…`), stored hashed like API keys, **1 hour** |
+| Refresh token | Opaque (`mdr_…`), hashed, **30 days sliding**, rotated on every use; reuse of an old refresh token revokes the whole grant chain (theft detection) |
+| Absolute session limit | **365 days** from the last interactive sign-in; then sign in again |
+| Scopes | `memdusa` (full user access, still limited by H1 grants); `memdusa:read` (read-only regardless of grants) |
+| Clients | Dynamic client registration (RFC 7591) for public clients (harnesses), PKCE S256 required, exact redirect URI match; loopback redirects (`http://127.0.0.1:<any port>/…`) allowed per RFC 8252 |
+| Hooks/CLI | `memdusa login <url> --browser` (authorization code + PKCE with a loopback redirect) and `--device` (device authorization grant, RFC 8628) for SSH/headless; stores the refresh token in `~/.memdusa`, refreshes transparently |
+| Revocation | `memdusa sessions` / `memdusa sessions revoke <id>` (own), admin API for everyone; token revocation endpoint (RFC 7009); all audited (H1 audit log) |
+| Existing API keys | Keep working unchanged as bearer tokens |
+
+### Endpoints
+- `/.well-known/oauth-protected-resource` (RFC 9728): resource = `<base>/mcp` (and `<base>/v1`), authorization_servers =
+  [`<base>`]. `401` responses from `/mcp` and `/v1` carry `WWW-Authenticate: Bearer resource_metadata="…"`.
+- `/.well-known/oauth-authorization-server` (RFC 8414): issuer, endpoints, `code_challenge_methods_supported: [S256]`,
+  `grant_types_supported: [authorization_code, refresh_token, urn:ietf:params:oauth:grant-type:device_code]`,
+  `token_endpoint_auth_methods_supported: [none]`, scopes.
+- `POST /oauth/register` (DCR), `GET /oauth/authorize` → sign-in page (API key form + "Continue with GitHub/Google"
+  buttons when configured) → consent screen (client name, redirect host, scopes) → redirect with `code` + `state`.
+- `GET /oauth/callback/{github,google}` (upstream returns here; memdusa itself uses PKCE + state with the upstream).
+- `POST /oauth/token` (code + PKCE verifier; refresh_token; device_code), `POST /oauth/revoke`,
+  `POST /oauth/device_authorization` + `GET /oauth/device` (user enters the code).
+- The `resource` parameter (RFC 8707) is accepted and bound into the token audience.
+
+### Storage (migration v8, portable)
+`oauth_clients`, `oauth_codes` (hashed, 10 min, single use), `oauth_grants` (a sign-in: user, client, scopes, method,
+created/last_interactive_at, revoked_at), `oauth_tokens` (hashed access/refresh, grant id, kind, expires_at,
+rotated_from, revoked_at), `user_identities` (user, provider, subject, email/login, linked_at),
+`oauth_device_codes`.
+
+### Security notes
+- All secrets random 256-bit, stored as SHA-256 hashes; constant-time comparison.
+- CSRF: `state` on every redirect; sign-in/consent forms carry a per-request token; `SameSite=Lax` cookie only for the
+  short sign-in transaction (no long-lived browser session needed).
+- The sign-in page never reveals whether a user exists; rate-limit failed API-key sign-ins per IP.
+- Upstream tokens (GitHub/Google) are used once to read identity and are not stored.
+- Requires `MEMDUSA_PUBLIC_URL` (the external https base URL) when OAuth is enabled; refuse non-https issuers except
+  localhost.
+
+### Phases
+- **H2a**: metadata, DCR, authorize with API-key sign-in + consent, token endpoint (code+PKCE, refresh rotation, reuse
+  detection, absolute limit), revocation, bearer validation for `/mcp` and `/v1`, sessions CLI/API, audit.
+- **H2b**: GitHub + Google upstream sign-in, identity linking, optional allowlist auto-provisioning.
+- **H2c**: `memdusa login --browser` / `--device`, transparent refresh in the client.
 
 ## H3: continuous local ⇄ hosted sync (proposed)
 

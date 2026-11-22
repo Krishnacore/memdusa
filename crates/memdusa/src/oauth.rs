@@ -1,0 +1,1562 @@
+//! OAuth 2.1 authorization server (H2a): metadata, dynamic client
+//! registration, API-key sign-in + consent, authorization code with PKCE,
+//! refresh rotation with theft detection, revocation and session listing.
+//!
+//! External identity providers and the CLI browser/device flows (H2b/H2c) can
+//! hook into `POST /oauth/signin` and `oauth_grant_find_or_create`: no other
+//! part of the server needs to change.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::to_bytes;
+use axum::extract::{ConnectInfo, Extension, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Form, Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use memdusa_core::Error;
+use memdusa_core::auth::generate_secret;
+use memdusa_core::model::*;
+use memdusa_core::oauth::*;
+use reqwest::Url;
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::http::{ApiError, AppState};
+
+pub const ACCESS_SECS: i64 = 3600;
+pub const REFRESH_SECS: i64 = 30 * 24 * 3600;
+pub const ABSOLUTE_SECS: i64 = 365 * 24 * 3600;
+pub const CODE_SECS: i64 = 600;
+pub const TXN_SECS: i64 = 600;
+
+pub const SUPPORTED_SCOPES: &[&str] = &["memdusa", "memdusa:read"];
+const CLIENT_PREFIX: &str = "mdoc_";
+const CSRF_COOKIE: &str = "memdusa_oauth";
+const SIGNIN_FAIL_LIMIT: usize = 10;
+const SIGNIN_WINDOW: Duration = Duration::from_secs(300);
+
+/// Server configuration, built from env when `MEMDUSA_PUBLIC_URL` is set.
+#[derive(Clone, Debug)]
+pub struct OAuthConfig {
+    /// The external https base URL; also the token issuer.
+    pub issuer: String,
+    pub access_secs: i64,
+    pub refresh_secs: i64,
+    pub absolute_secs: i64,
+    pub code_secs: i64,
+    pub txn_secs: i64,
+}
+
+impl OAuthConfig {
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let Ok(url) = std::env::var("MEMDUSA_PUBLIC_URL") else { return Ok(None) };
+        let url = url.trim().trim_end_matches('/');
+        if url.is_empty() {
+            return Ok(None);
+        }
+        validate_issuer(url)?;
+        let secs = |name: &str, default: i64| -> i64 {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+        };
+        Ok(Some(Self {
+            issuer: url.into(),
+            access_secs: secs("MEMDUSA_OAUTH_ACCESS_SECS", ACCESS_SECS),
+            refresh_secs: secs("MEMDUSA_OAUTH_REFRESH_SECS", REFRESH_SECS),
+            absolute_secs: secs("MEMDUSA_OAUTH_ABSOLUTE_SECS", ABSOLUTE_SECS),
+            code_secs: secs("MEMDUSA_OAUTH_CODE_SECS", CODE_SECS),
+            txn_secs: secs("MEMDUSA_OAUTH_SIGNIN_SECS", TXN_SECS),
+        }))
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.issuer)
+    }
+
+    pub fn resource_metadata_url(&self) -> String {
+        self.url("/.well-known/oauth-protected-resource")
+    }
+
+    pub fn www_authenticate(&self) -> String {
+        // `scope` tells MCP clients what to request (spec: scope from the challenge first, else every
+        // `scopes_supported`); without it they asked for `memdusa memdusa:read` together.
+        format!("Bearer resource_metadata=\"{}\", scope=\"memdusa\"", self.resource_metadata_url())
+    }
+
+    pub fn is_secure(&self) -> bool {
+        self.issuer.starts_with("https://")
+    }
+}
+
+/// An issuer must be an absolute URL, https except for local development.
+pub fn validate_issuer(url: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(url)?;
+    let https = parsed.scheme() == "https";
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    anyhow::ensure!(https || loopback, "MEMDUSA_PUBLIC_URL must use https (http allowed only on localhost/127.0.0.1)");
+    anyhow::ensure!(parsed.username().is_empty() && parsed.password().is_none(), "issuer must not contain credentials");
+    anyhow::ensure!(
+        parsed.query().is_none() && parsed.fragment().is_none(),
+        "issuer must not contain a query or fragment"
+    );
+    Ok(())
+}
+
+/// Shared state for OAuth endpoints: config + a tiny per-IP failed-sign-in limiter.
+#[derive(Clone)]
+pub struct OAuthRuntime {
+    pub config: OAuthConfig,
+    failures: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+}
+
+impl OAuthRuntime {
+    pub fn new(config: OAuthConfig) -> Self {
+        Self { config, failures: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Record a failed sign-in; returns true when this IP is now blocked.
+    fn failed(&self, ip: &str) -> bool {
+        let mut hits = self.failures.lock().expect("sign-in limiter poisoned");
+        let now = Instant::now();
+        let entry = hits.entry(ip.to_owned()).or_insert((0, now));
+        if now.duration_since(entry.1) > SIGNIN_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.0 > SIGNIN_FAIL_LIMIT
+    }
+
+    fn succeeded(&self, ip: &str) {
+        self.failures.lock().expect("sign-in limiter poisoned").remove(ip);
+    }
+}
+
+fn cfg(s: &AppState) -> &OAuthRuntime {
+    s.oauth.as_ref().expect("OAuth routes are only mounted when OAuth is enabled")
+}
+
+pub fn public_routes() -> Router<AppState> {
+    Router::new()
+        .route("/.well-known/oauth-protected-resource", get(protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(server_metadata))
+}
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/oauth/register", post(register))
+        .route("/oauth/authorize", get(authorize))
+        .route("/oauth/signin", post(signin))
+        .route("/oauth/consent", post(consent))
+        .route("/oauth/token", post(token))
+        .route("/oauth/revoke", post(revoke))
+}
+
+/// Session endpoints need the normal bearer-auth middleware (they produce the
+/// same `Identity` every other `/v1` handler sees).
+pub fn session_routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/me/sessions", get(my_sessions))
+        .route("/v1/me/sessions/{id}", delete(my_session_revoke))
+        .route("/v1/admin/sessions", get(admin_sessions))
+        .route("/v1/admin/sessions/{id}", delete(admin_session_revoke))
+}
+
+// ---------------------------------------------------------------- metadata
+
+async fn protected_resource(State(s): State<AppState>) -> Response {
+    let c = &cfg(&s).config;
+    Json(json!({
+        "resource": c.url("/mcp"),
+        "authorization_servers": [c.issuer],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": SUPPORTED_SCOPES,
+    }))
+    .into_response()
+}
+
+async fn server_metadata(State(s): State<AppState>) -> Response {
+    let c = &cfg(&s).config;
+    Json(json!({
+        "issuer": c.issuer,
+        "authorization_endpoint": c.url("/oauth/authorize"),
+        "token_endpoint": c.url("/oauth/token"),
+        "registration_endpoint": c.url("/oauth/register"),
+        "revocation_endpoint": c.url("/oauth/revoke"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "revocation_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": SUPPORTED_SCOPES,
+    }))
+    .into_response()
+}
+
+// ------------------------------------------------------------- registration
+
+#[derive(Debug, Deserialize)]
+struct RegisterRequest {
+    #[serde(default)]
+    redirect_uris: Vec<String>,
+    #[serde(default)]
+    client_name: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_method: Option<String>,
+    #[serde(default)]
+    grant_types: Option<Vec<String>>,
+    #[serde(default)]
+    response_types: Option<Vec<String>>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// https redirects, plus loopback http with any port (RFC 8252).
+fn valid_redirect(uri: &str) -> bool {
+    let Ok(u) = Url::parse(uri) else { return false };
+    if !u.username().is_empty() || u.password().is_some() || u.fragment().is_some() {
+        return false;
+    }
+    match u.scheme() {
+        "https" => u.host_str().is_some_and(|h| !h.is_empty()),
+        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+        _ => false,
+    }
+}
+
+async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> Response {
+    if b.redirect_uris.is_empty() || !b.redirect_uris.iter().all(|u| valid_redirect(u)) {
+        return invalid("redirect_uris must be https URLs or loopback http URLs");
+    }
+    if b.token_endpoint_auth_method.as_deref().is_some_and(|m| m != "none") {
+        return invalid("only public clients (token_endpoint_auth_method=none) are supported");
+    }
+    let grant_types = b.grant_types.unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
+    if grant_types.is_empty()
+        || !grant_types.iter().all(|g| matches!(g.as_str(), "authorization_code" | "refresh_token"))
+    {
+        return invalid("unsupported grant_type");
+    }
+    if let Some(types) = &b.response_types
+        && (types.len() != 1 || types[0] != "code")
+    {
+        return invalid("only response_type=code is supported");
+    }
+    if let Some(scope) = &b.scope
+        && !valid_scope(scope)
+    {
+        return invalid("unsupported scope");
+    }
+    // Echo what the client asked for (default: full access). Advertising every supported scope made
+    // clients (e.g. the MCP Python SDK) request `memdusa memdusa:read` when they only wanted `memdusa`.
+    // The scope a token actually gets is decided (and shown on the consent page) at /oauth/authorize.
+    let registered_scope = b.scope.clone().unwrap_or_else(|| "memdusa".into());
+    let client = OAuthClient {
+        id: new_id(),
+        client_id: generate_secret(CLIENT_PREFIX).unwrap_or_else(|_| format!("{CLIENT_PREFIX}{}", new_id())),
+        name: b.client_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "MCP client".into()),
+        redirect_uris: b.redirect_uris,
+        grant_types,
+        created_at: now_ms(),
+    };
+    if let Err(e) = s.store.oauth_client_create(&client).await {
+        return internal(&e);
+    }
+    if let Err(e) = s
+        .store
+        .audit(NewAuditEvent::ok("anonymous", "oauth.register").target(&client.client_id).detail(json!({
+            "name": client.name, "redirect_uris": client.redirect_uris
+        })))
+        .await
+    {
+        tracing::warn!("could not audit client registration: {e}");
+    }
+    Json(json!({
+        "client_id": client.client_id,
+        "client_id_issued_at": client.created_at / 1000,
+        "client_name": client.name,
+        "redirect_uris": client.redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": client.grant_types,
+        "response_types": ["code"],
+        "scope": registered_scope,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------- authorize
+
+#[derive(Debug, Deserialize)]
+struct AuthorizeQuery {
+    response_type: Option<String>,
+    client_id: Option<String>,
+    redirect_uri: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+    state: Option<String>,
+    scope: Option<String>,
+    resource: Option<String>,
+}
+
+async fn authorize(State(s): State<AppState>, Query(q): Query<AuthorizeQuery>) -> Response {
+    let (Some(client_id), Some(redirect_uri), Some(challenge), Some(state)) =
+        (q.client_id, q.redirect_uri, q.code_challenge, q.state)
+    else {
+        return invalid("client_id, redirect_uri, code_challenge and state are required");
+    };
+    if q.response_type.as_deref() != Some("code") {
+        return invalid("response_type must be code");
+    }
+    if q.code_challenge_method.as_deref() != Some("S256") {
+        return invalid("code_challenge_method must be S256 (plain is not supported)");
+    }
+    if challenge.len() < 43
+        || challenge.len() > 128
+        || !challenge.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return invalid("invalid code_challenge");
+    }
+    if state.is_empty() {
+        return invalid("state must not be empty");
+    }
+    let scope = match q.scope {
+        Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
+        _ => "memdusa".into(),
+    };
+    if !valid_scope(&scope) {
+        return invalid("unsupported scope");
+    }
+    let Some(client) = (match s.store.oauth_client_get(&client_id).await {
+        Ok(c) => c,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid("unknown client_id");
+    };
+    if !client.redirect_uris.contains(&redirect_uri) {
+        return invalid("redirect_uri is not registered for this client");
+    }
+    let txn = OAuthTransaction {
+        csrf: generate_secret("csrf_").unwrap_or_else(|_| format!("csrf_{}", new_id())),
+        client_id,
+        redirect_uri,
+        code_challenge: challenge,
+        scope,
+        resource: q.resource.filter(|r| !r.is_empty()),
+        state,
+        user_name: None,
+        created_at: now_ms(),
+    };
+    if let Err(e) = s.store.oauth_txn_create(&txn).await {
+        return internal(&e);
+    }
+    let secs = cfg(&s).config.txn_secs;
+    let cookie = cookie_header(&s, &txn.csrf, false, secs);
+    let html = signin_html(&txn, &client.name, None);
+    ([(header::SET_COOKIE, cookie), (header::CACHE_CONTROL, "no-store".to_owned())], Html(html)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SignInForm {
+    csrf: String,
+    api_key: String,
+}
+
+async fn signin(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    ip: Result<ConnectInfo<std::net::SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    Form(f): Form<SignInForm>,
+) -> Response {
+    let txn = match check_csrf(&s, &headers, &f.csrf).await {
+        Some(t) => t,
+        None => return invalid("missing or expired sign-in cookie"),
+    };
+    let client_name = s.store.oauth_client_get(&txn.client_id).await.ok().flatten().map(|c| c.name).unwrap_or_default();
+    let ip_key = ip.ok().map_or_else(|| "unknown".into(), |c| c.0.ip().to_string());
+    let auth = s.store.authenticate(&f.api_key).await;
+    let identity = match auth {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            let blocked = cfg(&s).failed(&ip_key);
+            if let Err(e) = s
+                .store
+                .audit(
+                    NewAuditEvent::denied("anonymous", "oauth.signin")
+                        .detail(json!({"ip": ip_key, "blocked": blocked})),
+                )
+                .await
+            {
+                tracing::warn!("could not audit failed sign-in: {e}");
+            }
+            if blocked {
+                return err(StatusCode::TOO_MANY_REQUESTS, "slow_down", "too many failed sign-ins; try again later");
+            }
+            let html = signin_html(&txn, &client_name, Some("That API key didn't work. Try again."));
+            return (StatusCode::UNAUTHORIZED, Html(html)).into_response();
+        }
+        Err(e) => return internal(&e),
+    };
+    let user = identity.user.clone().unwrap_or_default();
+    cfg(&s).succeeded(&ip_key);
+    if let Err(e) = s.store.oauth_txn_set_user(&txn.csrf, &user).await {
+        return internal(&e);
+    }
+    if let Err(e) = s
+        .store
+        .audit(NewAuditEvent::ok(&user, "oauth.signin").target(&txn.client_id).detail(json!({"method": "api_key"})))
+        .await
+    {
+        tracing::warn!("could not audit sign-in: {e}");
+    }
+    Html(consent_html(&user, &client_name, &txn.redirect_uri, &txn.scope, &txn.csrf)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsentForm {
+    csrf: String,
+    decision: String,
+}
+
+async fn consent(State(s): State<AppState>, headers: HeaderMap, Form(f): Form<ConsentForm>) -> Response {
+    let txn = match check_csrf(&s, &headers, &f.csrf).await {
+        Some(t) => t,
+        None => return invalid("missing or expired sign-in cookie"),
+    };
+    let Some(user) = txn.user_name.clone() else { return invalid("sign in first") };
+    let clear = cookie_header(&s, "", true, 0);
+    if let Err(e) = s.store.oauth_txn_delete(&txn.csrf).await {
+        return internal(&e);
+    }
+    if f.decision != "allow" {
+        return (
+            StatusCode::FOUND,
+            [
+                (
+                    header::LOCATION,
+                    with_params(&txn.redirect_uri, &[("error", "access_denied"), ("state", &txn.state)]),
+                ),
+                (header::SET_COOKIE, clear),
+            ],
+        )
+            .into_response();
+    }
+    let grant = match s
+        .store
+        .oauth_grant_find_or_create(&user, &txn.client_id, &txn.scope, txn.resource.as_deref(), "api_key")
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => return internal(&e),
+    };
+    let secret = generate_secret(CODE_PREFIX).unwrap_or_else(|_| format!("{CODE_PREFIX}{}", new_id()));
+    let code = OAuthCode {
+        id: new_id(),
+        secret: secret.clone(),
+        client_id: txn.client_id.clone(),
+        redirect_uri: txn.redirect_uri.clone(),
+        code_challenge: txn.code_challenge.clone(),
+        scope: txn.scope.clone(),
+        resource: txn.resource.clone(),
+        grant_id: grant.id.clone(),
+        used_at: None,
+        expires_at: now_ms() + cfg(&s).config.code_secs * 1000,
+        created_at: now_ms(),
+    };
+    if let Err(e) = s.store.oauth_code_create(&code).await {
+        return internal(&e);
+    }
+    let location = with_params(&txn.redirect_uri, &[("code", &secret), ("state", &txn.state)]);
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, location), (header::SET_COOKIE, clear), (header::CACHE_CONTROL, "no-store".to_owned())],
+    )
+        .into_response()
+}
+
+// -------------------------------------------------------------------- token
+
+#[derive(Debug, Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+}
+
+async fn token(State(s): State<AppState>, req: Request) -> Response {
+    let Ok(bytes) = to_bytes(req.into_body(), 1024 * 1024).await else { return invalid("body too large") };
+    let body: TokenRequest = match serde_urlencoded::from_bytes(&bytes) {
+        Ok(v) => v,
+        Err(_) => match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return invalid("expected form-encoded or JSON body"),
+        },
+    };
+    match body.grant_type.as_str() {
+        "authorization_code" => code_to_token(&s, &body).await,
+        "refresh_token" => refresh_to_token(&s, &body).await,
+        _ => err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "unsupported grant_type"),
+    }
+}
+
+async fn code_to_token(s: &AppState, b: &TokenRequest) -> Response {
+    let (Some(code), Some(verifier), Some(client_id), Some(redirect_uri)) =
+        (b.code.as_deref(), b.code_verifier.as_deref(), b.client_id.as_deref(), b.redirect_uri.as_deref())
+    else {
+        return invalid("code, code_verifier, client_id and redirect_uri are required");
+    };
+    let Some(code) = (match s.store.oauth_code_get(code).await {
+        Ok(c) => c,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid_grant("unknown authorization code");
+    };
+    if code.used_at.is_some() {
+        return invalid_grant("authorization code already used");
+    }
+    if code.expires_at <= now_ms() {
+        return invalid_grant("authorization code expired");
+    }
+    if code.client_id != client_id || code.redirect_uri != redirect_uri {
+        return invalid_grant("client_id or redirect_uri mismatch");
+    }
+    if b.resource.as_deref().is_some() && b.resource != code.resource {
+        return invalid_grant("resource mismatch");
+    }
+    if !pkce_ok(verifier, &code.code_challenge) {
+        return invalid_grant("PKCE verification failed");
+    }
+    // Claim atomically: two concurrent exchanges can't both mint tokens.
+    let Some(secret) = b.code.as_deref() else { return invalid_grant("missing code") };
+    let claimed = match s.store.oauth_code_claim(secret, now_ms()).await {
+        Ok(v) => v,
+        Err(e) => return internal(&e),
+    };
+    if !claimed {
+        return invalid_grant("authorization code already used");
+    }
+    let Some(grant) = (match s.store.oauth_grant_get(&code.grant_id).await {
+        Ok(g) => g,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid_grant("grant no longer exists");
+    };
+    if grant.revoked_at.is_some() {
+        return invalid_grant("grant revoked");
+    }
+    issue_tokens(s, &grant, None).await
+}
+
+async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
+    let Some(refresh) = b.refresh_token.as_deref() else { return invalid("refresh_token is required") };
+    let Some(token) = (match s.store.oauth_token_get(refresh).await {
+        Ok(t) => t,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid_grant("unknown refresh token");
+    };
+    if token.kind != TokenKind::Refresh {
+        return invalid_grant("not a refresh token");
+    }
+    let now = now_ms();
+    if token.revoked_at.is_some() {
+        // Theft detection: an old, already-rotated refresh token was replayed.
+        if let Err(e) = s.store.oauth_grant_revoke(&token.grant_id, now).await {
+            return internal(&e);
+        }
+        let who = s
+            .store
+            .oauth_grant_get(&token.grant_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|g| g.user_name)
+            .unwrap_or_else(|| "unknown".into());
+        if let Err(e) = s.store.audit(NewAuditEvent::denied(who, "oauth.refresh_reuse").target(&token.grant_id)).await {
+            tracing::warn!("could not audit refresh reuse: {e}");
+        }
+        return invalid_grant("refresh token reuse detected; grant revoked");
+    }
+    if token.expires_at <= now {
+        return invalid_grant("refresh token expired");
+    }
+    let Some(grant) = (match s.store.oauth_grant_get(&token.grant_id).await {
+        Ok(g) => g,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid_grant("grant no longer exists");
+    };
+    if grant.revoked_at.is_some() || now - grant.last_interactive_at >= cfg(s).config.absolute_secs * 1000 {
+        return invalid_grant("session expired; sign in again");
+    }
+    if b.resource.as_deref().is_some() && b.resource != grant.resource {
+        return invalid_grant("resource mismatch");
+    }
+    // Rotate: the presented token dies, a fresh one takes its place.
+    if let Err(e) = s.store.oauth_token_revoke(&token.id, now).await {
+        return internal(&e);
+    }
+    issue_tokens(s, &grant, Some(token.id.clone())).await
+}
+
+async fn issue_tokens(s: &AppState, grant: &OAuthGrant, rotated_from: Option<String>) -> Response {
+    let c = &cfg(s).config;
+    let now = now_ms();
+    let access_secret = match generate_secret(ACCESS_PREFIX) {
+        Ok(v) => v,
+        Err(e) => return internal(&e),
+    };
+    let refresh_secret = match generate_secret(REFRESH_PREFIX) {
+        Ok(v) => v,
+        Err(e) => return internal(&e),
+    };
+    let access = OAuthToken {
+        id: new_id(),
+        secret: access_secret.clone(),
+        grant_id: grant.id.clone(),
+        kind: TokenKind::Access,
+        prefix: access_secret[..12].into(),
+        scope: grant.scope.clone(),
+        resource: grant.resource.clone(),
+        expires_at: now + c.access_secs * 1000,
+        rotated_from: None,
+        revoked_at: None,
+        last_used_at: None,
+        created_at: now,
+    };
+    let refresh = OAuthToken {
+        id: new_id(),
+        secret: refresh_secret.clone(),
+        grant_id: grant.id.clone(),
+        kind: TokenKind::Refresh,
+        prefix: refresh_secret[..12].into(),
+        scope: grant.scope.clone(),
+        resource: grant.resource.clone(),
+        expires_at: now + c.refresh_secs * 1000,
+        rotated_from,
+        revoked_at: None,
+        last_used_at: None,
+        created_at: now,
+    };
+    for t in [&access, &refresh] {
+        if let Err(e) = s.store.oauth_token_create(t).await {
+            return internal(&e);
+        }
+    }
+    Json(json!({
+        "access_token": access.secret,
+        "token_type": "Bearer",
+        "expires_in": c.access_secs,
+        "refresh_token": refresh.secret,
+        "scope": grant.scope,
+    }))
+    .into_response()
+}
+
+// ------------------------------------------------------------------- revoke
+
+#[derive(Debug, Deserialize)]
+struct RevokeRequest {
+    token: String,
+    #[serde(default)]
+    token_type_hint: Option<String>,
+}
+
+async fn revoke(State(s): State<AppState>, req: Request) -> Response {
+    let Ok(bytes) = to_bytes(req.into_body(), 64 * 1024).await else { return invalid("body too large") };
+    let body: RevokeRequest = match serde_urlencoded::from_bytes(&bytes) {
+        Ok(v) => v,
+        Err(_) => match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return invalid("expected form-encoded or JSON body"),
+        },
+    };
+    let now = now_ms();
+    if let Ok(Some(token)) = s.store.oauth_token_get(&body.token).await {
+        if token.kind == TokenKind::Refresh {
+            if let Err(e) = s.store.oauth_grant_revoke(&token.grant_id, now).await {
+                return internal(&e);
+            }
+        } else if let Err(e) = s.store.oauth_token_revoke(&token.id, now).await {
+            return internal(&e);
+        }
+        let who = s
+            .store
+            .oauth_grant_get(&token.grant_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|g| g.user_name)
+            .unwrap_or_else(|| "unknown".into());
+        let detail = json!({ "kind": token.kind.as_str(), "hint": body.token_type_hint });
+        if let Err(e) =
+            s.store.audit(NewAuditEvent::ok(who, "oauth.revoke").target(&token.grant_id).detail(detail)).await
+        {
+            tracing::warn!("could not audit revocation: {e}");
+        }
+    }
+    // RFC 7009: always 200, even for unknown tokens.
+    StatusCode::OK.into_response()
+}
+
+// ------------------------------------------------------------------ sessions
+
+async fn my_sessions(State(s): State<AppState>, Extension(id): Extension<Identity>) -> Response {
+    match user_of(&id) {
+        Ok(u) => json_sessions(&s, Some(u)).await,
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+async fn admin_sessions(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(q): Query<KeysQ>,
+) -> Response {
+    if !id.admin {
+        return ApiError(Error::Forbidden("admin only".into())).into_response();
+    }
+    json_sessions(&s, q.user.as_deref()).await
+}
+
+async fn json_sessions(s: &AppState, user: Option<&str>) -> Response {
+    match s.store.oauth_sessions_list(user).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KeysQ {
+    user: Option<String>,
+}
+
+async fn my_session_revoke(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    axum::extract::Path(sid): axum::extract::Path<String>,
+) -> Response {
+    match user_of(&id) {
+        Ok(u) => revoke_session(&s, &sid, Some(u)).await,
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+async fn admin_session_revoke(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    axum::extract::Path(sid): axum::extract::Path<String>,
+) -> Response {
+    if !id.admin {
+        return ApiError(Error::Forbidden("admin only".into())).into_response();
+    }
+    revoke_session(&s, &sid, None).await
+}
+
+async fn revoke_session(s: &AppState, id: &str, user: Option<&str>) -> Response {
+    let actor = user.unwrap_or("root").to_owned();
+    match s.store.oauth_session_revoke(id, user, now_ms()).await {
+        Ok(n) => {
+            if let Err(e) = s
+                .store
+                .audit(NewAuditEvent::ok(actor, "oauth.session_revoke").target(id).detail(json!({"tokens": n})))
+                .await
+            {
+                tracing::warn!("could not audit session revocation: {e}");
+            }
+            Json(json!({ "revoked": n })).into_response()
+        }
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+fn user_of(id: &Identity) -> Result<&str, Error> {
+    id.user
+        .as_deref()
+        .ok_or_else(|| Error::Invalid("this credential isn't tied to a user (shared token / open server)".into()))
+}
+
+// ----------------------------------------------------------------- helpers
+
+async fn check_csrf(s: &AppState, headers: &HeaderMap, csrf: &str) -> Option<OAuthTransaction> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    let value = cookie.split(';').find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        (k == CSRF_COOKIE).then_some(v)
+    })?;
+    if value != csrf {
+        return None;
+    }
+    let txn = s.store.oauth_txn_get(csrf).await.ok().flatten()?;
+    (now_ms() - txn.created_at <= cfg(s).config.txn_secs * 1000).then_some(txn)
+}
+
+fn cookie_header(s: &AppState, csrf: &str, clear: bool, secs: i64) -> String {
+    let mut v =
+        format!("{CSRF_COOKIE}={csrf}; Path=/oauth; HttpOnly; SameSite=Lax; Max-Age={}", if clear { 0 } else { secs });
+    if cfg(s).config.is_secure() {
+        v.push_str("; Secure");
+    }
+    v
+}
+
+fn valid_scope(scope: &str) -> bool {
+    !scope.is_empty() && scope.split_whitespace().all(|s| SUPPORTED_SCOPES.contains(&s))
+}
+
+fn pkce_ok(verifier: &str, challenge: &str) -> bool {
+    if verifier.len() < 43 || verifier.len() > 128 {
+        return false;
+    }
+    if !verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)) {
+        return false;
+    }
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge
+}
+
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn with_params(uri: &str, pairs: &[(&str, &str)]) -> String {
+    let sep = if uri.contains('?') { "&" } else { "?" };
+    let query = pairs.iter().map(|(k, v)| format!("{}={}", pct(k), pct(v))).collect::<Vec<_>>().join("&");
+    format!("{uri}{sep}{query}")
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn html_page(title: &str, body: String) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" \
+         content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>\
+         body{{font:16px system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#222}}\
+         input{{width:100%;box-sizing:border-box;padding:.6rem;margin:.3rem 0 1rem}}\
+         button{{padding:.6rem 1rem;margin-right:.5rem;cursor:pointer}}\
+         .alt{{opacity:.55}}.err{{color:#b00020}}</style></head><body>{body}</body></html>"
+    )
+}
+
+fn signin_html(txn: &OAuthTransaction, client_name: &str, error: Option<&str>) -> String {
+    let error = error.map(|e| format!("<p class=\"err\">{}</p>", esc(e))).unwrap_or_default();
+    html_page(
+        "Sign in · memdusa",
+        format!(
+            "<h1>Sign in to memdusa</h1><p><strong>{}</strong> is requesting access.</p>{}\
+             <form method=\"post\" action=\"/oauth/signin\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <label for=\"api_key\">API key</label>\
+             <input id=\"api_key\" type=\"password\" name=\"api_key\" autocomplete=\"off\" required>\
+             <button type=\"submit\">Sign in</button></form>\
+             <hr><p class=\"alt\">Continue with GitHub / Google — coming in H2b</p>\
+             <p class=\"alt\"><button disabled>Continue with GitHub</button><button disabled>Continue with Google</button></p>",
+            esc(client_name),
+            error,
+            esc(&txn.csrf)
+        ),
+    )
+}
+
+fn consent_html(user: &str, client_name: &str, redirect_uri: &str, scope: &str, csrf: &str) -> String {
+    let host = Url::parse(redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| redirect_uri.into());
+    html_page(
+        "Authorize · memdusa",
+        format!(
+            "<h1>Authorize {}</h1><p>Signed in as <strong>{}</strong>.</p>\
+             <ul><li>Client: {}</li><li>Redirects to: {}</li><li>Scopes: {}</li></ul>\
+             <form method=\"post\" action=\"/oauth/consent\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\
+             <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form>",
+            esc(client_name),
+            esc(user),
+            esc(client_name),
+            esc(&host),
+            esc(scope),
+            esc(csrf)
+        ),
+    )
+}
+
+fn err(status: StatusCode, code: &str, desc: &str) -> Response {
+    (status, Json(json!({ "error": code, "error_description": desc }))).into_response()
+}
+
+fn invalid(desc: &str) -> Response {
+    err(StatusCode::BAD_REQUEST, "invalid_request", desc)
+}
+
+fn invalid_grant(desc: &str) -> Response {
+    err(StatusCode::BAD_REQUEST, "invalid_grant", desc)
+}
+
+fn internal(e: &impl std::fmt::Display) -> Response {
+    tracing::error!("oauth: database error: {e}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "internal error")
+}
+
+#[cfg(test)]
+mod tests {
+    use memdusa_core::Store;
+    use memdusa_core::store::sqlite_url;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::http::HttpOptions;
+
+    fn config() -> OAuthConfig {
+        OAuthConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            access_secs: 3600,
+            refresh_secs: 30 * 24 * 3600,
+            absolute_secs: 365 * 24 * 3600,
+            code_secs: 600,
+            txn_secs: 600,
+        }
+    }
+
+    async fn spawn(cfg: OAuthConfig, default_access: DefaultPolicy) -> (String, Store) {
+        let dir = std::env::temp_dir().join(format!("memdusa-oauth-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::connect(&sqlite_url(&dir.join("t.db"))).await.unwrap();
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: None,
+            allowed_hosts: vec![],
+            auto_prune: None,
+            rate_limit: 0.0,
+            metrics: false,
+            default_access,
+            oauth: Some(cfg),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::http::app(store.clone(), opts);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, store)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
+    }
+
+    fn hidden(html: &str, name: &str) -> String {
+        let marker = format!("name=\"{name}\" value=\"");
+        let rest = html.split_once(&marker).unwrap_or_else(|| panic!("no hidden field {name}: {html}")).1;
+        rest.split_once('"').unwrap().0.to_owned()
+    }
+
+    fn param(location: &str, key: &str) -> String {
+        let query = location.split_once('?').expect("redirect has no query").1;
+        query
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("no {key} in {location}"))
+            .1
+            .to_owned()
+    }
+
+    fn pkce() -> (String, String) {
+        let verifier = "p".repeat(43);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        (verifier, challenge)
+    }
+
+    struct Flow {
+        client_id: String,
+        redirect_uri: String,
+        verifier: String,
+        code: String,
+        state: String,
+    }
+
+    impl Flow {
+        async fn token(&self, url: &str) -> (u16, Value) {
+            let r = client()
+                .post(format!("{url}/oauth/token"))
+                .form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", self.code.as_str()),
+                    ("redirect_uri", self.redirect_uri.as_str()),
+                    ("client_id", self.client_id.as_str()),
+                    ("code_verifier", self.verifier.as_str()),
+                ])
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            (status, r.json().await.unwrap_or_default())
+        }
+    }
+
+    async fn register(url: &str, redirect_uri: &str) -> String {
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({
+                "client_name": "Test Harness",
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "none",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body: Value = r.json().await.unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        body["client_id"].as_str().unwrap().to_owned()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_flow(url: &str, api_key: &str, scope: &str, resource: Option<&str>, redirect_uri: &str) -> Flow {
+        let client_id = register(url, redirect_uri).await;
+        let (verifier, challenge) = pkce();
+        let mut q = vec![
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", "state-1"),
+            ("scope", scope),
+        ];
+        if let Some(r) = resource {
+            q.push(("resource", r));
+        }
+        let r = client().get(format!("{url}/oauth/authorize")).query(&q).send().await.unwrap();
+        let status = r.status();
+        let cookie =
+            r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_owned();
+        let html = r.text().await.unwrap();
+        assert_eq!(status, 200, "{html}");
+        let csrf = hidden(&html, "csrf");
+
+        let r = client()
+            .post(format!("{url}/oauth/signin"))
+            .header(header::COOKIE, &cookie)
+            .form(&[("csrf", csrf.as_str()), ("api_key", api_key)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        let html = r.text().await.unwrap();
+        assert!(html.contains("Test Harness") && !html.contains("state-1"));
+        assert!(html.contains("Authorize") && html.contains("Allow"));
+
+        let r = client()
+            .post(format!("{url}/oauth/consent"))
+            .header(header::COOKIE, &cookie)
+            .form(&[("csrf", csrf.as_str()), ("decision", "allow")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 302, "{}", r.text().await.unwrap_or_default());
+        let location = r.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+        Flow {
+            client_id,
+            redirect_uri: redirect_uri.to_owned(),
+            verifier,
+            code: param(&location, "code"),
+            state: param(&location, "state"),
+        }
+    }
+
+    async fn call_status(url: &str, method: reqwest::Method, path: &str, body: Option<Value>, key: &str) -> u16 {
+        let mut r = client().request(method, format!("{url}{path}")).bearer_auth(key);
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        r.send().await.unwrap().status().as_u16()
+    }
+
+    async fn new_user(store: &Store, name: &str, admin: bool) -> String {
+        store.user_create(name, admin).await.unwrap();
+        store.key_create(name, "signin").await.unwrap().secret
+    }
+
+    // ------------------------------------------------------------------ tests
+
+    #[tokio::test]
+    async fn full_flow_refresh_reuse_revoke_and_mcp() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "alice", false).await;
+        let flow =
+            start_flow(&url, &key, "memdusa", Some("http://127.0.0.1:1/mcp"), "http://127.0.0.1:54321/callback").await;
+        assert_eq!(flow.state, "state-1");
+
+        let (st, tokens) = flow.token(&url).await;
+        assert_eq!(st, 200, "{tokens}");
+        let access = tokens["access_token"].as_str().unwrap().to_owned();
+        let refresh = tokens["refresh_token"].as_str().unwrap().to_owned();
+        assert!(access.starts_with("mdo_") && refresh.starts_with("mdr_"));
+        assert_eq!(tokens["scope"], json!("memdusa"));
+
+        let me = client().get(format!("{url}/v1/whoami")).bearer_auth(&access).send().await.unwrap();
+        assert_eq!(me.status(), 200);
+        let me: Value = me.json().await.unwrap();
+        assert_eq!((me["user"].as_str(), me["admin"].as_bool()), (Some("alice"), Some(false)));
+
+        // MCP accepts the same identity.
+        let mcp = client()
+            .post(format!("{url}/mcp"))
+            .bearer_auth(&access)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(mcp.status(), 401, "access token must work on /mcp");
+        assert_ne!(mcp.status(), 403);
+
+        // Sessions show up for the user and for admins.
+        let sessions = store.oauth_sessions_list(Some("alice")).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].client_name, "Test Harness");
+
+        // Refresh rotates; replaying the old token kills the new one too.
+        let r = client()
+            .post(format!("{url}/oauth/token"))
+            .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let fresh: Value = r.json().await.unwrap();
+        let access2 = fresh["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(&access2).send().await.unwrap().status(), 200);
+
+        let replay = client()
+            .post(format!("{url}/oauth/token"))
+            .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), 400, "reuse is rejected");
+        assert_eq!(replay.json::<Value>().await.unwrap()["error"], "invalid_grant");
+        assert_eq!(
+            client().get(format!("{url}/v1/whoami")).bearer_auth(&access2).send().await.unwrap().status(),
+            401,
+            "the whole grant chain was revoked"
+        );
+
+        // A fresh sign-in can be revoked through RFC 7009.
+        let flow2 = start_flow(&url, &key, "memdusa", None, "http://localhost:9876/cb").await;
+        let (st, tokens) = flow2.token(&url).await;
+        assert_eq!(st, 200, "{tokens}");
+        let access3 = tokens["access_token"].as_str().unwrap().to_owned();
+        let revoke = client()
+            .post(format!("{url}/oauth/revoke"))
+            .form(&[("token", access3.as_str()), ("token_type_hint", "access_token")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), 200);
+        assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(&access3).send().await.unwrap().status(), 401);
+
+        let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
+        for action in ["oauth.register", "oauth.signin", "oauth.refresh_reuse", "oauth.revoke"] {
+            assert!(audit.iter().any(|e| e.action == action), "missing audit event {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_flow_over_postgres() {
+        let Ok(url) = std::env::var("MEMDUSA_TEST_POSTGRES_URL") else { return };
+        let dir = std::env::temp_dir().join(format!("memdusa-oauth-pg-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::connect(&url).await.unwrap();
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: None,
+            allowed_hosts: vec![],
+            auto_prune: None,
+            rate_limit: 0.0,
+            metrics: false,
+            default_access: DefaultPolicy::Write,
+            oauth: Some(config()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::http::app(store.clone(), opts);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Unique user name: Postgres tests share one database.
+        let user = format!("pg{}", new_id()).replace('-', "");
+        store.user_create(&user, false).await.unwrap();
+        let key = store.key_create(&user, "signin").await.unwrap().secret;
+        let flow =
+            start_flow(&base, &key, "memdusa", Some("http://127.0.0.1:1/mcp"), "http://127.0.0.1:43210/cb").await;
+        let (st, tokens) = flow.token(&base).await;
+        assert_eq!(st, 200, "{tokens}");
+        let access = tokens["access_token"].as_str().unwrap();
+        let me = client().get(format!("{base}/v1/whoami")).bearer_auth(access).send().await.unwrap();
+        assert_eq!(me.status(), 200);
+        assert_eq!(me.json::<Value>().await.unwrap()["user"], json!(user));
+    }
+
+    #[tokio::test]
+    async fn pkce_verifier_and_single_use_code() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "bob", false).await;
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:4242/cb").await;
+
+        let bad = client()
+            .post(format!("{url}/oauth/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", flow.code.as_str()),
+                ("redirect_uri", flow.redirect_uri.as_str()),
+                ("client_id", flow.client_id.as_str()),
+                ("code_verifier", "wrong-verifier-that-is-long-enough-to-be-valid-000"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+        assert_eq!(bad.json::<Value>().await.unwrap()["error"], "invalid_grant");
+
+        assert_eq!(flow.token(&url).await.0, 200, "code still usable after failed PKCE");
+        let replay = flow.token(&url).await;
+        assert_eq!(replay.0, 400);
+        assert_eq!(replay.1["error"], "invalid_grant", "code is single-use");
+    }
+
+    #[tokio::test]
+    async fn redirect_and_pkce_validation() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        new_user(&store, "carol", false).await;
+        let (_, challenge) = pkce();
+        let client_id = register(&url, "http://127.0.0.1:5555/cb").await;
+        let base = vec![
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", "s"),
+            ("scope", "memdusa"),
+        ];
+
+        let mut wrong = base.clone();
+        wrong.push(("redirect_uri", "http://127.0.0.1:6666/cb"));
+        assert_eq!(client().get(format!("{url}/oauth/authorize")).query(&wrong).send().await.unwrap().status(), 400);
+
+        let mut plain = base.clone();
+        plain.push(("redirect_uri", "http://127.0.0.1:5555/cb"));
+        let plain: Vec<(&str, &str)> = plain.iter().map(|(k, v)| (*k, *v)).collect();
+        let plain = plain
+            .into_iter()
+            .map(|(k, v)| if k == "code_challenge_method" { (k, "plain") } else { (k, v) })
+            .collect::<Vec<_>>();
+        assert_eq!(client().get(format!("{url}/oauth/authorize")).query(&plain).send().await.unwrap().status(), 400);
+
+        // Non-loopback http redirect URIs are refused at registration.
+        let bad = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"redirect_uris": ["http://evil.example/cb"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+
+        let flow = start_flow(
+            &url,
+            &store.key_create("carol", "k").await.unwrap().secret,
+            "memdusa",
+            None,
+            "http://127.0.0.1:5555/cb",
+        )
+        .await;
+        let mismatch = client()
+            .post(format!("{url}/oauth/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", flow.code.as_str()),
+                ("redirect_uri", "http://127.0.0.1:9999/cb"),
+                ("client_id", flow.client_id.as_str()),
+                ("code_verifier", flow.verifier.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn read_only_scope_and_h1_grants() {
+        let (url, store) = spawn(config(), DefaultPolicy::None).await;
+        store.user_create("dave", false).await.unwrap();
+        store.grant_create("proj/a", "dave", Role::Read, "root").await.unwrap();
+        let key = store.key_create("dave", "k").await.unwrap().secret;
+
+        let flow = start_flow(&url, &key, "memdusa:read", None, "http://127.0.0.1:7777/cb").await;
+        let (st, tokens) = flow.token(&url).await;
+        assert_eq!(st, 200, "{tokens}");
+        let access = tokens["access_token"].as_str().unwrap();
+
+        assert_eq!(call_status(&url, reqwest::Method::GET, "/v1/resume?project=proj/a", None, access).await, 200);
+        assert_eq!(
+            call_status(
+                &url,
+                reqwest::Method::POST,
+                "/v1/memories",
+                Some(json!({"project":"proj/a","content":"x"})),
+                access
+            )
+            .await,
+            403,
+            "memdusa:read denies writes even with a write grant"
+        );
+        assert_eq!(
+            call_status(&url, reqwest::Method::GET, "/v1/resume?project=proj/b", None, access).await,
+            403,
+            "H1 grants still apply"
+        );
+
+        // Full-scope token: H1 still decides project access.
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:7778/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let full = tokens["access_token"].as_str().unwrap();
+        assert_eq!(call_status(&url, reqwest::Method::GET, "/v1/resume?project=proj/a", None, full).await, 200);
+        assert_eq!(
+            call_status(
+                &url,
+                reqwest::Method::POST,
+                "/v1/memories",
+                Some(json!({"project":"proj/a","content":"x"})),
+                full
+            )
+            .await,
+            403,
+            "read grant denies writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_code_and_access_token() {
+        let mut short = config();
+        short.code_secs = 0;
+        let (url, store) = spawn(short, DefaultPolicy::Write).await;
+        let key = new_user(&store, "eve", false).await;
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:8888/cb").await;
+        let (st, body) = flow.token(&url).await;
+        assert_eq!(st, 400);
+        assert_eq!(body["error"], "invalid_grant", "expired code");
+
+        let mut short = config();
+        short.access_secs = 0;
+        let (url2, store2) = spawn(short, DefaultPolicy::Write).await;
+        let key2 = new_user(&store2, "frank", false).await;
+        let flow2 = start_flow(&url2, &key2, "memdusa", None, "http://127.0.0.1:8889/cb").await;
+        let (st, tokens) = flow2.token(&url2).await;
+        assert_eq!(st, 200, "{tokens}");
+        let access = tokens["access_token"].as_str().unwrap();
+        assert_eq!(client().get(format!("{url2}/v1/whoami")).bearer_auth(access).send().await.unwrap().status(), 401);
+    }
+
+    #[tokio::test]
+    async fn metadata_and_www_authenticate() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        // Creating a user latches auth on, so unauthenticated calls are 401s.
+        new_user(&store, "ian", false).await;
+        let protected: Value = client()
+            .get(format!("{url}/.well-known/oauth-protected-resource"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(protected["authorization_servers"][0], json!("http://127.0.0.1:1"));
+        assert_eq!(protected["resource"], json!("http://127.0.0.1:1/mcp"));
+        let as_doc: Value = client()
+            .get(format!("{url}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(as_doc["code_challenge_methods_supported"], json!(["S256"]));
+        assert_eq!(as_doc["token_endpoint_auth_methods_supported"], json!(["none"]));
+
+        for path in ["/v1/whoami", "/mcp"] {
+            let r = client().get(format!("{url}{path}")).send().await.unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(
+                r.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap(),
+                "Bearer resource_metadata=\"http://127.0.0.1:1/.well-known/oauth-protected-resource\", scope=\"memdusa\""
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn csrf_and_session_api() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "grace", false).await;
+        let client_id = register(&url, "http://127.0.0.1:9991/cb").await;
+        let (_, challenge) = pkce();
+        let r = client()
+            .get(format!("{url}/oauth/authorize"))
+            .query(&[
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", "http://127.0.0.1:9991/cb"),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("state", "s"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let cookie =
+            r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_owned();
+        let html = r.text().await.unwrap();
+        let csrf = hidden(&html, "csrf");
+
+        // No cookie: sign-in is refused.
+        assert_eq!(
+            client()
+                .post(format!("{url}/oauth/signin"))
+                .form(&[("csrf", csrf.as_str()), ("api_key", key.as_str())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        // Wrong csrf with a valid cookie is refused too.
+        assert_eq!(
+            client()
+                .post(format!("{url}/oauth/signin"))
+                .header(header::COOKIE, &cookie)
+                .form(&[("csrf", "wrong"), ("api_key", key.as_str())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+
+        let r = client()
+            .post(format!("{url}/oauth/signin"))
+            .header(header::COOKIE, &cookie)
+            .form(&[("csrf", csrf.as_str()), ("api_key", key.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        // Consent needs the same csrf.
+        assert_eq!(
+            client()
+                .post(format!("{url}/oauth/consent"))
+                .header(header::COOKIE, &cookie)
+                .form(&[("csrf", "bad"), ("decision", "allow")])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:9992/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let access = tokens["access_token"].as_str().unwrap();
+
+        let mine = client().get(format!("{url}/v1/me/sessions")).bearer_auth(access).send().await.unwrap();
+        let mine_status = mine.status();
+        let mine_text = mine.text().await.unwrap_or_default();
+        assert_eq!(mine_status, 200, "{mine_text}");
+        let mine_body: Value = serde_json::from_str(&mine_text).unwrap_or_default();
+        assert_eq!(mine_body.as_array().unwrap().len(), 1);
+
+        let sid = store.oauth_sessions_list(Some("grace")).await.unwrap()[0].id.clone();
+        let revoked = client().delete(format!("{url}/v1/me/sessions/{sid}")).bearer_auth(access).send().await.unwrap();
+        assert_eq!(revoked.status(), 200);
+        assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(access).send().await.unwrap().status(), 401);
+    }
+
+    #[tokio::test]
+    async fn failed_signins_are_rate_limited() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        new_user(&store, "heidi", false).await;
+        let client_id = register(&url, "http://127.0.0.1:9993/cb").await;
+        let (_, challenge) = pkce();
+        for i in 0..SIGNIN_FAIL_LIMIT + 2 {
+            let r = client()
+                .get(format!("{url}/oauth/authorize"))
+                .query(&[
+                    ("response_type", "code"),
+                    ("client_id", client_id.as_str()),
+                    ("redirect_uri", "http://127.0.0.1:9993/cb"),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", "S256"),
+                    ("state", "s"),
+                ])
+                .send()
+                .await
+                .unwrap();
+            let cookie =
+                r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_owned();
+            let csrf = hidden(&r.text().await.unwrap(), "csrf");
+            let st = client()
+                .post(format!("{url}/oauth/signin"))
+                .header(header::COOKIE, &cookie)
+                .form(&[("csrf", csrf.as_str()), ("api_key", "mdk_wrong")])
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            if i >= SIGNIN_FAIL_LIMIT {
+                assert_eq!(st, 429, "failed sign-in {i} should be throttled");
+            } else {
+                assert_eq!(st, 401, "failed sign-in {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn issuer_validation() {
+        assert!(validate_issuer("https://memdusa.example.com").is_ok());
+        assert!(validate_issuer("http://localhost:8080").is_ok());
+        assert!(validate_issuer("http://127.0.0.1:7077").is_ok());
+        assert!(validate_issuer("http://example.com").is_err());
+        assert!(validate_issuer("https://user:pw@example.com").is_err());
+        assert!(validate_issuer("not a url").is_err());
+    }
+
+    #[test]
+    fn pkce_math() {
+        let (v, c) = pkce();
+        assert!(pkce_ok(&v, &c));
+        assert!(!pkce_ok("too short", &c));
+        assert!(!pkce_ok(&v, "plain-challenge"));
+        assert!(valid_scope("memdusa memdusa:read"));
+        assert!(!valid_scope("memdusa:admin"));
+    }
+}

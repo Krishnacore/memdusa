@@ -266,6 +266,27 @@ impl Client {
         let path = if admin { format!("/v1/admin/keys/{key}") } else { format!("/v1/me/keys/{key}") };
         Ok(self.send(self.request(Method::DELETE, &path)).await?)
     }
+
+    // -------------------------------------------------------------- sessions
+
+    /// `user: None` = the caller's own OAuth sessions.
+    pub async fn sessions(&self, user: Option<&str>) -> anyhow::Result<Vec<memdusa_core::oauth::OAuthSession>> {
+        let path = match user {
+            None => "/v1/me/sessions".to_string(),
+            Some(u) => format!("/v1/admin/sessions?user={}", path_segment(u)),
+        };
+        Ok(self.send(self.request(Method::GET, &path)).await?)
+    }
+
+    pub async fn session_revoke(&self, id: &str) -> anyhow::Result<Value> {
+        let admin = self.whoami().await?["admin"].as_bool().unwrap_or(false);
+        let path = if admin {
+            format!("/v1/admin/sessions/{}", path_segment(id))
+        } else {
+            format!("/v1/me/sessions/{}", path_segment(id))
+        };
+        Ok(self.send(self.request(Method::DELETE, &path)).await?)
+    }
 }
 
 /// A value as one URL path segment (everything but unreserved characters percent-encoded).
