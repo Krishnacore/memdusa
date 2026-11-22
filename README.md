@@ -66,7 +66,7 @@ your other hooks, and backs the file up to `settings.json.memdusa-backup` first:
 | Hook | What memdusa does |
 |---|---|
 | `SessionStart` | Injects the resume brief, on startup, `--resume`, `/clear`, after compaction and on fork, so Claude continues where *any* agent left off |
-| `UserPromptSubmit` | Journals what you asked for (turn off with `MEMDUSA_NO_PROMPTS=1`) |
+| `UserPromptSubmit` | Journals what you asked for (turn off with `MEMDUSA_NO_PROMPTS=1`), and injects up to 5 memories relevant to the prompt (`MEMDUSA_RECALL=off` disables) |
 | `PostToolUse` (`Edit\|MultiEdit\|Write\|NotebookEdit\|Bash`) | Journals changed files and shell commands |
 | `Stop` | If files changed and the last checkpoint is >15 min old, asks Claude once to save a `checkpoint` before finishing (`MEMDUSA_STOP_GUARD_MINS`, 0 = off) |
 | `PreCompact`, `SessionEnd` | Fallback: if files changed but no checkpoint was saved, writes an automatic one (last request, changed files, previous plan carried forward, the agent's last message) |
@@ -275,6 +275,18 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 `resume`, `memory_save`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`, `run_step`,
 `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
 
+### Search and recall
+
+`memory_search` is ranked full-text search over memory content and tags (SQLite FTS5 with `bm25`, Postgres
+`tsvector` with `ts_rank`, `simple` config, no stemming). Any word may match; the best match comes first, newest
+first among ties. Query text is split into plain words, never interpreted as query syntax. No query lists the most
+recent memories.
+
+On every prompt, the `UserPromptSubmit` hook searches the project's memories (plus visible globals) with the prompt
+and injects up to 5 that match at least two of its distinctive words (one, if the prompt has only one) in a
+`<memdusa-recall>` block. A memory is injected at most once per session, and not if it was already in the session's
+brief. Harnesses that can't inject context on a prompt (Cursor) get nothing. Set `MEMDUSA_RECALL=off` to disable it.
+
 ### MCP resources and prompts
 
 For clients that surface resources and prompts better than tool calls, the brief is also exposed as:
@@ -362,7 +374,9 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Git hooks (commits, branch switches) as events
 - [x] MCP resources and prompts (brief, memories, /resume)
 - [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
-- [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
+- [x] Ranked full-text memory search
+- [x] Relevant memories injected on each prompt
+- [ ] Semantic memory search (embeddings behind a trait; local model or API)
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log

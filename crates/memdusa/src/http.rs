@@ -332,7 +332,9 @@ async fn hook_batch(
         return Err(Error::Invalid("at most 1000 items per batch".into()).into());
     }
     let mut resp = HookBatchResponse::default();
-    for (i, item) in b.items.into_iter().enumerate() {
+    for (i, mut item) in b.items.into_iter().enumerate() {
+        // replayed prompts can't inject anything any more
+        item.request.config.recall = false;
         let event: HookEvent = match item.event.parse() {
             Ok(e) => e,
             Err(e) => {
@@ -734,7 +736,12 @@ mod tests {
 
         let req = |input| HookRequest {
             project: "github.com/acme/shop".into(),
-            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            config: HookConfig {
+                agent: "claude-code".into(),
+                journal_prompts: true,
+                stop_guard_mins: 15,
+                recall: true,
+            },
             input,
             git: None,
             at: None,
@@ -898,7 +905,12 @@ mod tests {
         let spool = Spool::at(dir.clone()).unwrap();
         let req = |input: Value, at: i64| HookRequest {
             project: "shop".into(),
-            config: HookConfig { agent: "claude-code".into(), journal_prompts: true, stop_guard_mins: 15 },
+            config: HookConfig {
+                agent: "claude-code".into(),
+                journal_prompts: true,
+                stop_guard_mins: 15,
+                recall: true,
+            },
             input,
             git: None,
             at: Some(at),

@@ -71,7 +71,10 @@ export default Plugin.define({
         const brief = out?.hookSpecificOutput?.additionalContext
         if (brief) await ctx.session.instructions.entry.put({ sessionID, key: "memdusa", value: brief })
       }
-      await memdusa("user-prompt-submit", { session_id: sessionID, cwd, prompt: event.prompt?.text ?? "" })
+      const recall = await memdusa("user-prompt-submit", { session_id: sessionID, cwd, prompt: event.prompt?.text ?? "" })
+      // Memories relevant to this prompt (none when nothing matches or recall is off).
+      const relevant = recall?.hookSpecificOutput?.additionalContext
+      if (relevant) await ctx.session.instructions.entry.put({ sessionID, key: "memdusa-recall", value: relevant })
     })
 
     // File edits and shell commands.

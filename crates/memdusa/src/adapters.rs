@@ -267,8 +267,18 @@ impl Harness {
             // Claude Code and Codex share the canonical format; OpenCode/pi plugins read it
             (Self::ClaudeCode | Self::Codex | Self::OpenCode | Self::Pi | Self::Git, _) => return Some(out),
             (Self::Gemini, HookEvent::SessionStart) => return Some(out), // same hookSpecificOutput shape
+            // BeforeAgent takes the same hookSpecificOutput.additionalContext, named for its event
+            (Self::Gemini, HookEvent::UserPromptSubmit) => {
+                json!({ "hookSpecificOutput": { "hookEventName": "BeforeAgent", "additionalContext": context? } })
+            }
             (Self::Gemini, HookEvent::Stop) => json!({ "decision": "deny", "reason": reason? }),
+            // beforeSubmitPrompt can't inject context
+            (Self::Cursor, HookEvent::UserPromptSubmit) => return None,
             (Self::Cursor, HookEvent::SessionStart) => json!({ "additional_context": context? }),
+            (Self::Antigravity, HookEvent::UserPromptSubmit) => {
+                json!({ "injectSteps": [{ "systemMessage": { "systemMessage": context? } }] })
+            }
+            (Self::Hermes, HookEvent::UserPromptSubmit) => json!({ "context": context? }),
             (Self::Cursor, HookEvent::Stop) => json!({ "followup_message": reason? }),
             (Self::Antigravity, HookEvent::SessionStart) => {
                 json!({ "injectSteps": [{ "systemMessage": { "systemMessage": context? } }] })
@@ -380,6 +390,26 @@ mod tests {
         );
         assert_eq!(Harness::Codex.render(HookEvent::Stop, Some(block.into())).unwrap(), block);
         assert_eq!(Harness::Cursor.render(HookEvent::Stop, None), None);
+    }
+
+    #[test]
+    fn recall_output_per_harness() {
+        let out = r#"{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"recall"}}"#;
+        let render = |h: Harness| h.render(HookEvent::UserPromptSubmit, Some(out.into()));
+        for h in [Harness::ClaudeCode, Harness::Codex, Harness::OpenCode, Harness::Pi] {
+            assert_eq!(render(h).unwrap(), out);
+        }
+        assert_eq!(
+            render(Harness::Gemini).unwrap(),
+            r#"{"hookSpecificOutput":{"additionalContext":"recall","hookEventName":"BeforeAgent"}}"#
+        );
+        assert_eq!(
+            render(Harness::Antigravity).unwrap(),
+            r#"{"injectSteps":[{"systemMessage":{"systemMessage":"recall"}}]}"#
+        );
+        assert_eq!(render(Harness::Hermes).unwrap(), r#"{"context":"recall"}"#);
+        assert_eq!(render(Harness::Cursor), None);
+        assert_eq!(Harness::Hermes.render(HookEvent::UserPromptSubmit, None), None);
     }
 
     #[test]

@@ -99,12 +99,61 @@ fn list_from_json(s: String) -> Vec<String> {
 
 // ---------------------------------------------------------------- schema
 
+/// One schema migration: statements run in order inside the migration transaction.
+enum Migration {
+    /// Valid on both SQLite and Postgres.
+    Portable(&'static [&'static str]),
+    /// Needs backend-specific SQL (full-text search, ...).
+    PerBackend { sqlite: &'static [&'static str], postgres: &'static [&'static str] },
+}
+
+impl Migration {
+    fn statements(&self, backend: Backend) -> &'static [&'static str] {
+        match (self, backend) {
+            (Self::Portable(s), _) => s,
+            (Self::PerBackend { sqlite, .. }, Backend::Sqlite) => sqlite,
+            (Self::PerBackend { postgres, .. }, Backend::Postgres) => postgres,
+        }
+    }
+}
+
+/// Columns of `memories` that are read back. Never `SELECT *`: Postgres adds a
+/// `search` tsvector column that `sqlx::Any` can't decode.
+pub(crate) const MEMORY_COLS: &str = "id, project, kind, content, tags, source, user_name, created_at, updated_at";
+/// [`MEMORY_COLS`] qualified with the `m` alias (searches join the FTS table, which has its own `id`/`content`).
+const MEMORY_COLS_M: &str =
+    "m.id, m.project, m.kind, m.content, m.tags, m.source, m.user_name, m.created_at, m.updated_at";
+
+/// Most distinct terms a search considers.
+const MAX_SEARCH_TERMS: usize = 24;
+
+/// The words of a text: lowercase runs of letters/digits, without duplicates
+/// (first occurrences, in order). Matches how both backends tokenize.
+pub fn words(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && seen.insert(*w))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The terms a full-text query is built from: [`words`], at most 24. This is
+/// the only form user text takes in a query, so FTS5/tsquery syntax characters
+/// can't get through.
+pub fn search_terms(text: &str) -> Vec<String> {
+    let mut w = words(text);
+    w.truncate(MAX_SEARCH_TERMS);
+    w
+}
+
 /// Ordered, append-only list of migrations. Never edit a released entry:
-/// add a new one (e.g. `ALTER TABLE ... ADD COLUMN ...`). Statements must be
-/// valid on both SQLite and Postgres.
-const MIGRATIONS: &[&[&str]] = &[
+/// add a new one (e.g. `ALTER TABLE ... ADD COLUMN ...`). Portable statements
+/// must be valid on both SQLite and Postgres.
+const MIGRATIONS: &[Migration] = &[
     // 1: initial schema
-    &[
+    Migration::Portable(&[
         "CREATE TABLE IF NOT EXISTS memories (
         id TEXT PRIMARY KEY,
         project TEXT,
@@ -166,9 +215,9 @@ const MIGRATIONS: &[&[&str]] = &[
         started_at BIGINT NOT NULL,
         completed_at BIGINT,
         PRIMARY KEY (run_id, step_key))",
-    ],
+    ]),
     // 2: users, API keys, per-user global memories
-    &[
+    Migration::Portable(&[
         "CREATE TABLE users (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
@@ -186,9 +235,34 @@ const MIGRATIONS: &[&[&str]] = &[
             revoked_at BIGINT)",
         "CREATE INDEX api_keys_user ON api_keys (user_id)",
         "ALTER TABLE memories ADD COLUMN user_name TEXT",
-    ],
+    ]),
     // 3: code state on checkpoints
-    &["ALTER TABLE checkpoints ADD COLUMN git TEXT"],
+    Migration::Portable(&["ALTER TABLE checkpoints ADD COLUMN git TEXT"]),
+    // 4: ranked full-text search over memories (content + tags)
+    Migration::PerBackend {
+        // FTS5 table kept in sync by triggers, joined back on `id` (rowids aren't stable
+        // across VACUUM for this table). Backfilled from the existing rows.
+        sqlite: &[
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, tags, id UNINDEXED)",
+            "INSERT INTO memories_fts (id, content, tags) SELECT id, content, tags FROM memories",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts (id, content, tags) VALUES (new.id, new.content, new.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+                DELETE FROM memories_fts WHERE id = old.id;
+            END",
+            "CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content, tags ON memories BEGIN
+                DELETE FROM memories_fts WHERE id = old.id;
+                INSERT INTO memories_fts (id, content, tags) VALUES (new.id, new.content, new.tags);
+            END",
+        ],
+        // A generated column is maintained (and backfilled) by Postgres itself.
+        postgres: &[
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS search tsvector
+                GENERATED ALWAYS AS (to_tsvector('simple', content || ' ' || tags)) STORED",
+            "CREATE INDEX IF NOT EXISTS memories_search ON memories USING GIN (search)",
+        ],
+    },
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -276,7 +350,7 @@ impl Store {
         }
         for (i, stmts) in MIGRATIONS.iter().enumerate().skip(current) {
             tracing::info!("applying schema migration v{}", i + 1);
-            for stmt in *stmts {
+            for stmt in stmts.statements(self.backend) {
                 tx.execute(*stmt).await?;
             }
         }
@@ -327,7 +401,7 @@ impl Store {
         }
         let now = now_ms();
 
-        let mut q = Q::new("SELECT * FROM memories WHERE ");
+        let mut q = Q::new(&format!("SELECT {MEMORY_COLS} FROM memories WHERE "));
         let (c, k) = (q.text(&content), q.text(m.kind.as_str()));
         q.push(&format!("content = {c} AND kind = {k} AND "));
         match &m.project {
@@ -385,30 +459,76 @@ impl Store {
         Ok(mem)
     }
 
+    /// Search memories. With a query: full-text, any word may match, best match
+    /// first (ties: newest). Without one: the most recently updated.
     pub async fn memory_search(&self, f: MemoryQuery) -> Result<Vec<Memory>> {
-        let mut q = Q::new("SELECT * FROM memories WHERE ");
+        Ok(self.memory_search_ranked(f).await?.into_iter().map(|(m, _)| m).collect())
+    }
+
+    /// Like [`Store::memory_search`], with each memory's relevance score
+    /// (higher is better, comparable within one result set only; 0 when there
+    /// was no query).
+    pub async fn memory_search_ranked(&self, f: MemoryQuery) -> Result<Vec<(Memory, f64)>> {
+        let terms = f.query.as_deref().map(search_terms);
+        let limit = f.limit.unwrap_or(20).clamp(1, 200);
+        let ranked = match &terms {
+            // a query with nothing searchable in it (only punctuation) matches nothing
+            Some(t) if t.is_empty() && f.query.as_deref().is_some_and(|s| !s.trim().is_empty()) => return Ok(vec![]),
+            Some(t) if !t.is_empty() => Some(t),
+            _ => None,
+        };
+
+        let mut q;
+        match ranked {
+            Some(terms) => {
+                // Terms are plain alphanumeric words (see `search_terms`): quoted for FTS5,
+                // bare for tsquery. User text is never passed on as query syntax.
+                match self.backend {
+                    Backend::Sqlite => {
+                        q = Q::new(&format!(
+                            "SELECT {MEMORY_COLS_M}, -bm25(memories_fts, 1.0, 0.5, 0.0) AS score \
+                             FROM memories_fts JOIN memories m ON m.id = memories_fts.id WHERE memories_fts MATCH "
+                        ));
+                        let m = q.text(terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR "));
+                        q.push(&m).push(" AND ");
+                    }
+                    Backend::Postgres => {
+                        q = Q::new("SELECT ");
+                        let tsq = q.text(terms.join(" | "));
+                        q.push(&format!(
+                            "{MEMORY_COLS_M}, CAST(ts_rank(m.search, to_tsquery('simple', CAST({tsq} AS TEXT))) AS DOUBLE PRECISION) AS score \
+                             FROM memories m WHERE m.search @@ to_tsquery('simple', CAST({tsq} AS TEXT)) AND "
+                        ));
+                    }
+                }
+            }
+            None => {
+                q = Q::new(&format!(
+                    "SELECT {MEMORY_COLS_M}, CAST(0 AS DOUBLE PRECISION) AS score FROM memories m WHERE "
+                ))
+            }
+        }
+
         let globals = Self::global_visible(&mut q, f.user.as_deref());
         match f.project {
             Some(p) => {
                 let p = q.text(p);
-                q.push(&format!("(project = {p} OR {globals})"))
+                q.push(&format!("(m.project = {p} OR {globals})"))
             }
-            None => q.push(&format!("(project IS NOT NULL OR {globals})")),
+            None => q.push(&format!("(m.project IS NOT NULL OR {globals})")),
         };
         if let Some(k) = f.kind {
             let k = q.text(k.as_str());
-            q.push(&format!(" AND kind = {k}"));
+            q.push(&format!(" AND m.kind = {k}"));
         }
-        if let Some(text) = f.query.as_deref() {
-            // every word must match content or tags
-            for word in text.split_whitespace().take(8) {
-                let w = q.text(format!("%{}%", word.to_lowercase()));
-                q.push(&format!(" AND (LOWER(content) LIKE {w} OR LOWER(tags) LIKE {w})"));
-            }
+        let limit = q.int(limit);
+        if ranked.is_some() {
+            q.push(&format!(" ORDER BY score DESC, m.updated_at DESC LIMIT {limit}"));
+        } else {
+            q.push(&format!(" ORDER BY m.updated_at DESC LIMIT {limit}"));
         }
-        let limit = q.int(f.limit.unwrap_or(20).clamp(1, 200));
-        q.push(&format!(" ORDER BY updated_at DESC LIMIT {limit}"));
-        q.build().fetch_all(&self.pool).await?.iter().map(Self::row_to_memory).collect()
+        let rows = q.build().fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok((Self::row_to_memory(r)?, r.try_get::<f64, _>("score")?))).collect()
     }
 
     pub async fn memory_forget(&self, id: &str) -> Result<()> {
@@ -453,12 +573,37 @@ impl Store {
 
     /// Most recent events first.
     pub async fn events_recent(&self, project: &str, session: Option<&str>, limit: i64) -> Result<Vec<Event>> {
+        self.events_query(project, session, None, limit).await
+    }
+
+    /// Most recent events of one `kind` first (so busy kinds can't push them out of a window).
+    pub async fn events_recent_kind(
+        &self,
+        project: &str,
+        session: Option<&str>,
+        kind: &str,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        self.events_query(project, session, Some(kind), limit).await
+    }
+
+    async fn events_query(
+        &self,
+        project: &str,
+        session: Option<&str>,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
         let mut q = Q::new("SELECT * FROM events WHERE project = ");
         let p = q.text(project);
         q.push(&p);
         if let Some(s) = session {
             let s = q.text(s);
             q.push(&format!(" AND session = {s}"));
+        }
+        if let Some(k) = kind {
+            let k = q.text(k);
+            q.push(&format!(" AND kind = {k}"));
         }
         let l = q.int(limit.clamp(1, 500));
         q.push(&format!(" ORDER BY created_at DESC, id DESC LIMIT {l}"));

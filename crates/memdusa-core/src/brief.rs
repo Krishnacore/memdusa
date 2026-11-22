@@ -13,8 +13,10 @@ pub const AGENT_MESSAGE: &str = "agent_message";
 pub const COMPACT_SUMMARY: &str = "compact_summary";
 pub const COMMAND: &str = "command";
 pub const STOP_GUARD: &str = "stop_guard";
+/// Which memories were already shown to an agent in a session (`data: {"ids": [...]}`).
+pub const MEMORY_RECALL: &str = "memory_recall";
 /// Bookkeeping events that would only be noise in the brief.
-const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY];
+const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL];
 /// How much of a compaction summary the brief quotes.
 const SUMMARY_CHARS: usize = 1_500;
 

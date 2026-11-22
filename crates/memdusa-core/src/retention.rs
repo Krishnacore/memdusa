@@ -30,6 +30,7 @@ pub const ACTIVITY_KINDS: &[&str] = &[
     "stop_guard",
     "agent_message",
     "compact_summary",
+    "memory_recall",
 ];
 pub const SESSION_SUMMARY: &str = "session_summary";
 

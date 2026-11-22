@@ -508,3 +508,175 @@ async fn export_import_round_trip_is_idempotent() {
     assert_eq!(copy.export(Some(&p)).await.unwrap().len(), 5);
     assert!(src.backup_sqlite(&file.display().to_string()).await.is_err(), "won't overwrite");
 }
+
+fn mem(project: &Option<String>, content: &str, tags: &[&str]) -> NewMemory {
+    NewMemory {
+        project: project.clone(),
+        content: content.into(),
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+fn query(project: &str, q: &str) -> MemoryQuery {
+    MemoryQuery { project: Some(project.into()), query: Some(q.into()), ..Default::default() }
+}
+
+fn ids(v: Vec<Memory>) -> Vec<String> {
+    let mut ids: Vec<String> = v.into_iter().map(|m| m.id).collect();
+    ids.sort();
+    ids
+}
+
+fn sorted(mut v: Vec<&String>) -> Vec<String> {
+    v.sort();
+    v.into_iter().cloned().collect()
+}
+
+#[tokio::test]
+async fn search_ranks_by_relevance_not_recency() {
+    for (name, s) in stores().await {
+        let p = project();
+        let proj = Some(p.clone());
+        let u = new_id().replace('-', "");
+        let (a, b) = (format!("{u}aa"), format!("{u}bb"));
+        // the better match is saved first, so it is the older one
+        let both = s.memory_save(mem(&proj, &format!("{a} and {b} together"), &[])).await.unwrap();
+        let one = s.memory_save(mem(&proj, &format!("only {a} here"), &[])).await.unwrap();
+        // filler, so no term is in most documents
+        for i in 0..8 {
+            s.memory_save(mem(&proj, &format!("unrelated filler number {i} about gardening"), &["misc"]))
+                .await
+                .unwrap();
+        }
+
+        let found = s.memory_search_ranked(query(&p, &format!("{a} {b}"))).await.unwrap();
+        let order: Vec<_> = found.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(order, vec![both.id.as_str(), one.id.as_str()], "{name}: ANY word matches, best first");
+        assert!(found[0].1 > found[1].1, "{name}: scores {:?}", found.iter().map(|f| f.1).collect::<Vec<_>>());
+
+        // tags are searched too
+        let tagged = s.memory_save(mem(&proj, "something else entirely", &[&format!("{u}tag")])).await.unwrap();
+        let found = s.memory_search(query(&p, &format!("{u}tag"))).await.unwrap();
+        assert_eq!(ids(found), vec![tagged.id.clone()], "{name}");
+
+        // updates and deletes keep the index in sync
+        s.memory_save(mem(&proj, &format!("only {a} here"), &[&format!("{u}later")])).await.unwrap();
+        let found = s.memory_search(query(&p, &format!("{u}later"))).await.unwrap();
+        assert_eq!(ids(found), vec![one.id.clone()], "{name}: merged tag searchable");
+        s.memory_forget(&one.id).await.unwrap();
+        let found = s.memory_search(query(&p, &a)).await.unwrap();
+        assert_eq!(ids(found), vec![both.id.clone()], "{name}: forgotten is gone");
+
+        // no query: plain listing, no scores
+        let recent =
+            s.memory_search_ranked(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap();
+        assert!(!recent.is_empty() && recent.iter().all(|(_, score)| *score == 0.0), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn search_survives_special_characters() {
+    for (name, s) in stores().await {
+        let p = project();
+        let proj = Some(p.clone());
+        s.memory_save(mem(&proj, "Don't use unwrap: prefer ? (the try operator) -- it's \"safer\"", &[]))
+            .await
+            .unwrap();
+        for q in [
+            "\"",
+            "*",
+            ":",
+            "(",
+            "-",
+            "'",
+            "\"unbalanced",
+            "a AND OR NOT b",
+            "NEAR(a b)",
+            "col:val",
+            "foo*",
+            "'; DROP TABLE memories; --",
+            "!!!",
+            "(((",
+            "\\",
+            "a | b & !c",
+            "<->",
+            "unwrap:",
+            "-unwrap",
+        ] {
+            let r = s.memory_search(query(&p, q)).await;
+            assert!(r.is_ok(), "{name}: query {q:?} failed: {r:?}");
+        }
+        let found = s.memory_search(query(&p, "\"unwrap\": (try) -safer*")).await.unwrap();
+        assert_eq!(found.len(), 1, "{name}: words inside the noise still match");
+        assert!(s.memory_search(query(&p, "!!!")).await.unwrap().is_empty(), "{name}: nothing searchable");
+        assert_eq!(s.memory_search(query(&p, "   ")).await.unwrap().len(), 1, "{name}: blank query lists recent");
+    }
+}
+
+#[tokio::test]
+async fn search_visibility_rules_unchanged() {
+    for (name, s) in stores().await {
+        let (p, other) = (project(), project());
+        let word = format!("{}vis", new_id().replace('-', ""));
+        let mine = s.memory_save(mem(&Some(p.clone()), &format!("{word} project memory"), &[])).await.unwrap();
+        s.memory_save(mem(&Some(other.clone()), &format!("{word} other project"), &[])).await.unwrap();
+        let shared = s.memory_save(mem(&None, &format!("{word} shared global"), &[])).await.unwrap();
+        let alice = s
+            .memory_save(NewMemory { user: Some("alice".into()), ..mem(&None, &format!("{word} alice global"), &[]) })
+            .await
+            .unwrap();
+
+        // local mode (no user): own project + user-less globals, never another project's memory
+        let got = ids(s.memory_search(query(&p, &word)).await.unwrap());
+        assert_eq!(got, sorted(vec![&mine.id, &shared.id]), "{name}");
+        // alice sees her globals too
+        let got = ids(s.memory_search(MemoryQuery { user: Some("alice".into()), ..query(&p, &word) }).await.unwrap());
+        assert_eq!(got, sorted(vec![&mine.id, &shared.id, &alice.id]), "{name}");
+        // bob doesn't see alice's
+        let got = ids(s.memory_search(MemoryQuery { user: Some("bob".into()), ..query(&p, &word) }).await.unwrap());
+        assert_eq!(got, sorted(vec![&mine.id, &shared.id]), "{name}");
+        // kind filter still applies
+        let got = s.memory_search(MemoryQuery { kind: Some(MemoryKind::Decision), ..query(&p, &word) }).await.unwrap();
+        assert!(got.is_empty(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn v3_database_migrates_to_v4_and_backfills() {
+    let dir = std::env::temp_dir().join(format!("memdusa-v3-{}", new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = memdusa_core::store::sqlite_url(&dir.join("old.db"));
+    let p = project();
+    let proj = Some(p.clone());
+
+    // build a current database, then turn it back into a v3 one by hand
+    let s = Store::connect(&url).await.unwrap();
+    s.memory_save(mem(&proj, "we chose postgres for the ledger", &["db"])).await.unwrap();
+    drop(s);
+    sqlx::any::install_default_drivers();
+    let raw = sqlx::AnyPool::connect(&format!("{url}?mode=rw")).await.unwrap();
+    for stmt in [
+        "DROP TRIGGER memories_fts_ai",
+        "DROP TRIGGER memories_fts_ad",
+        "DROP TRIGGER memories_fts_au",
+        "DROP TABLE memories_fts",
+        "UPDATE memdusa_meta SET value = '3' WHERE key = 'schema_version'",
+        "INSERT INTO memories (id, project, kind, content, tags, created_at, updated_at) \
+         VALUES ('legacy-1', 'PROJECT', 'note', 'legacy cache invalidation notes', '[\"perf\"]', 1, 1)",
+    ] {
+        let stmt = stmt.replace("PROJECT", &p);
+        sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&raw).await.unwrap();
+    }
+    raw.close().await;
+
+    let s = Store::connect(&url).await.unwrap();
+    assert_eq!(s.migrate().await.unwrap(), 4);
+    let found = s.memory_search(query(&p, "cache")).await.unwrap();
+    assert_eq!(found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["legacy-1"], "backfilled");
+    assert_eq!(s.memory_search(query(&p, "ledger")).await.unwrap().len(), 1);
+    assert_eq!(s.memory_search(query(&p, "perf")).await.unwrap().len(), 1, "tags backfilled");
+    // and new writes are indexed
+    s.memory_save(mem(&proj, "freshly written note about sharding", &[])).await.unwrap();
+    assert_eq!(s.memory_search(query(&p, "sharding")).await.unwrap().len(), 1);
+}
