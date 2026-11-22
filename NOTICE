@@ -1,0 +1,11 @@
+memdusa: Memory & Durability for AI Agents
+Copyright 2026 Artsiom Holikau and the memdusa contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+Source: https://github.com/Krishnacore/memdusa
+
+If you redistribute memdusa or a work derived from it, in source or binary
+form, including as part of a commercial product, the Apache License requires
+you to include this NOTICE file (or its contents) in what you distribute,
+keep the copyright notices, and state the changes you made. Please credit it
+visibly, for example: "Based on memdusa (https://github.com/Krishnacore/memdusa)".

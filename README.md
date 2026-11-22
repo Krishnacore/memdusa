@@ -362,6 +362,13 @@ crates/memdusa        binary: CLI, MCP server (rmcp, stdio + streamable HTTP), R
                       Claude Code hooks + installer
 ```
 
+## License
+
+memdusa is free and open source under the [Apache License 2.0](LICENSE). You may use it, including commercially,
+modify it and redistribute it. If you redistribute memdusa or a work based on it, in source or binary form, you must
+include the [NOTICE](NOTICE) file and the license, keep the copyright notices, and state your changes. Please credit
+it visibly, for example "Based on memdusa".
+
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, the store tests against
@@ -387,6 +394,20 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
 - [x] Ranked full-text memory search
 - [x] Relevant memories injected on each prompt
+- [ ] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
+      OpenCode or Codex workers via `hc`, or a harness's own subagents). Observed while building memdusa itself:
+      when a worker hit its usage limit, its replacement in another harness started from scratch. Ideas:
+  - parent/child sessions: link a worker's session to its coordinator (from hook fields like `agent_id`/`agent_type`,
+    Hermes `conversation_id`, or an explicit `MEMDUSA_PARENT_SESSION`), so the coordinator's brief gets a
+    "Delegated work" section with each worker's status, checkpoint and last words
+  - task-scoped checkpoints by default for workers (`task` = the assignment), so they never overwrite the
+    coordinator's checkpoint, and a worker's replacement resumes exactly that task
+  - worktree/branch awareness: workers in different worktrees share the project key, but code-state warnings and
+    "files changed" should be per worktree/branch, not mixed
+  - durable runs as the coordination primitive: the coordinator creates a run whose steps are the delegated tasks;
+    workers claim steps with leases, so a crashed or rate-limited worker's step is visibly stale and can be
+    claimed by another harness, and finished steps are never redone
+  - attribution in the brief: which agent (and harness) did what, across the whole team
 - [ ] Semantic memory search (embeddings behind a trait; local model or API)
 - [x] Memory hygiene: update, near-duplicate merge, stale flags
 - [ ] Memory consolidation: summarize old events
