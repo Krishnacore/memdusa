@@ -393,21 +393,63 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
         .map(drop)
 }
 
+/// Cursor fires `sessionStart` fire-and-forget: the agent loop does not wait for it, so a slow
+/// brief arrives after the agent has already started (or never arrives if the hook is cut short).
+/// Spend at most this long on the full brief, then answer with a minimal one. The session event
+/// is recorded before this budget starts, so a slow or failing brief can never lose the session.
+/// It must exceed the brief's own 3 s cap on the semantic query embedding (after which the brief
+/// falls back to lexical ranking), so a slow embedding API yields a lexical brief, not a degraded
+/// one; and stay under the 5 s hook timeout `memdusa install cursor` writes.
+const SESSION_BRIEF_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
-    let notice = claim_step(ctx, source).await;
-    // Build the brief before journaling, so it doesn't report its own start.
-    let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref(), ctx.task.as_deref()).await?;
+    session_start_with_budget(ctx, source, SESSION_BRIEF_BUDGET).await
+}
+
+/// [`session_start`] with an explicit brief budget, so a deadline can be tested.
+async fn session_start_with_budget(ctx: &Ctx<'_>, source: &str, budget: std::time::Duration) -> Result<Option<String>> {
+    // Journal first: a failure while building the brief (a slow embedding API, a transient DB
+    // error, or the hook's own deadline) must never cost us the session_start record.
     log(ctx, "session_start", format!("session started ({source})"), None).await?;
     if let Some(task) = &ctx.task {
         let data = json!({ "task": task, "parent": ctx.parent, "harness": ctx.cfg.agent, "source": source });
         log(ctx, brief::DELEGATED_SESSION, task.clone(), Some(data)).await?;
     }
+    let notice = claim_step(ctx, source).await;
+
+    let built = tokio::time::timeout(
+        budget,
+        brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref(), ctx.task.as_deref()),
+    )
+    .await;
+    let (mut b, degraded) = match built {
+        Ok(Ok(b)) => (b, false),
+        Ok(Err(e)) => {
+            eprintln!("memdusa: could not build the session brief: {e}");
+            (empty_brief(ctx), true)
+        }
+        Err(_) => {
+            eprintln!("memdusa: session brief timed out after {budget:?}");
+            (empty_brief(ctx), true)
+        }
+    };
+    // We journaled before building, so the brief would otherwise list its own start as the newest event.
+    if let Some(s) = &ctx.session {
+        b.recent_events.retain(|e| !(e.kind == "session_start" && e.session.as_deref() == Some(s.as_str())));
+    }
 
     let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty() && b.delegated.is_empty();
-    if empty && b.recent_events.is_empty() && notice.is_none() {
+    if empty && b.recent_events.is_empty() && notice.is_none() && !degraded {
         return Ok(None);
     }
     let mut md = b.markdown;
+    if degraded {
+        md = format!(
+            "# Resume brief: {}\n\n_The full brief could not be loaded in time (or the store was busy). Use the \
+             memdusa `resume` tool to load it._\n",
+            ctx.project
+        );
+    }
     if md.len() > MAX_CONTEXT_CHARS {
         let cut = md.floor_char_boundary(MAX_CONTEXT_CHARS);
         md.truncate(cut);
@@ -437,6 +479,21 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     Ok(Some(
         json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context } }).to_string(),
     ))
+}
+
+/// A stand-in used when the real brief can't be built within the session-start budget.
+fn empty_brief(ctx: &Ctx<'_>) -> brief::Brief {
+    brief::Brief {
+        project: ctx.project.clone(),
+        checkpoints: vec![],
+        active_runs: vec![],
+        memories: vec![],
+        recent_events: vec![],
+        delegated: vec![],
+        git_warnings: vec![],
+        other_worktree_note: None,
+        markdown: String::new(),
+    }
 }
 
 /// Memories injected per prompt, at most.
@@ -828,6 +885,26 @@ mod tests {
         }
         assert!(!ctx_text.contains("possibly written by a different harness"), "{ctx_text}");
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    }
+
+    #[tokio::test]
+    async fn session_start_records_the_event_even_when_the_brief_times_out() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        save(&store, MemoryKind::Decision, "We chose Postgres over MySQL for the billing ledger").await;
+
+        // A zero budget forces the brief build to time out. The session must still be recorded,
+        // and a minimal brief must reach the agent instead of silence.
+        let out = session_start_with_budget(&ctx(&store, &cfg), "startup", std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .expect("degraded brief is still delivered");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let text = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(text.contains("could not be loaded in time"), "{text}");
+
+        let events = store.events_recent("p", Some("s1"), 10).await.unwrap();
+        assert_eq!(events[0].kind, "session_start", "the event outlives a failed brief build");
     }
 
     #[tokio::test]
