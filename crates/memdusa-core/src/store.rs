@@ -154,13 +154,16 @@ pub fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The terms a full-text query is built from: the [`significant_words`] of the text, at most 24.
+/// The terms a full-text query is built from: the text's words minus stopwords and 1-letter words, at most 24.
 /// This is the only form user text takes in a query, so FTS5/tsquery syntax characters can't get
 /// through. Stopwords and short words are dropped here (not from the index): matching "the" or
 /// "is" says nothing about relevance. A query made only of those yields no terms and matches
 /// nothing — falling back to the raw words is exactly the bug this avoids.
 pub fn search_terms(text: &str) -> Vec<String> {
-    let mut w = significant_words(text);
+    // Two-letter words stay searchable ("CI", "db", "ui", "go") unless they are stopwords; the
+    // stricter `significant_words` (3+ letters) is for near-duplicate detection.
+    let mut w: Vec<String> =
+        words(text).into_iter().filter(|w| w.chars().count() >= 2 && !STOPWORDS.contains(&w.as_str())).collect();
     w.truncate(MAX_SEARCH_TERMS);
     w
 }
@@ -1501,6 +1504,8 @@ mod tests {
         use super::{search_terms, significant_words};
         assert_eq!(search_terms("what color is the sky"), ["color", "sky"]);
         assert_eq!(search_terms("release docker"), ["release", "docker"]);
+        // short technical words stay searchable
+        assert_eq!(search_terms("CI pipeline for the db"), ["ci", "pipeline", "db"]);
         // queries with no searchable terms match nothing (no fallback to the raw words)
         assert!(search_terms("is it").is_empty());
         assert!(search_terms("do it").is_empty());
