@@ -320,8 +320,8 @@ Not redacted on purpose: variable references (`TOKEN=$GH_TOKEN`), numbers (`max_
 
 Search is lexical by default (full-text, any word may match). That misses memories worded differently: "how do we
 ship releases" won't find "the release workflow pushes binaries on tag". Turn on **semantic search** and memdusa also
-compares meaning, using embeddings from any OpenAI-compatible `/embeddings` API. It is **off unless you set
-`MEMDUSA_EMBED_URL`**.
+compares meaning, using either an OpenAI-compatible `/embeddings` API or a small model that runs inside memdusa.
+It is **off unless you set `MEMDUSA_EMBED_URL`** (or `MEMDUSA_EMBED_PROVIDER`).
 
 ```sh
 # OpenAI
@@ -334,12 +334,34 @@ memdusa embed          # embed the memories you already have (new and edited one
 memdusa status         # "semantic search: on (model ..., 12/12 memories embedded)"
 ```
 
+### Built-in local model (no server, no API key)
+
+The `local-embed` cargo feature compiles in a retrieval-trained sentence transformer (`all-MiniLM-L6-v2`, 384 dims)
+running on ONNX Runtime. Default and release binaries do **not** include it; build it yourself when you want it:
+
+```sh
+cargo build --release --features local-embed      # or: cargo install memdusa --features local-embed
+
+export MEMDUSA_EMBED_URL=local                    # or MEMDUSA_EMBED_PROVIDER=local
+export MEMDUSA_EMBED_MODEL=all-MiniLM-L6-v2       # default; bge-small-en-v1.5 is also supported
+memdusa embed --download-model                    # once: ~91 MB into $MEMDUSA_HOME/models/ (default ~/.memdusa/models/)
+memdusa embed                                     # backfill existing memories
+memdusa status                                    # shows the model and coverage, or how to fetch it
+```
+
+Nothing leaves the machine: model text, memories and queries are processed in-process, and the only network request is
+that first Hugging Face download. After that memdusa works offline. Hooks and searches **never download**: if the model
+is missing they use lexical search, and `memdusa status` / `memdusa embed` print the one-line fetch command above.
+The model is loaded at most once per process; ONNX Runtime binaries (~20 MB per platform, fetched at build time by
+`ort`) are separate from the model download.
+
 | Variable | Meaning |
 |---|---|
-| `MEMDUSA_EMBED_URL` | Base URL of the API (`POST {url}/embeddings`). Unset = semantic search off |
+| `MEMDUSA_EMBED_URL` | Base URL of the API (`POST {url}/embeddings`). `local` selects the built-in model. Unset = semantic search off |
+| `MEMDUSA_EMBED_PROVIDER` | `http` (default) or `local`. `local` also works when no URL is set |
 | `MEMDUSA_EMBED_MODEL` | Model name (default `text-embedding-3-small`). Changing it re-embeds on the next `memdusa embed` |
 | `MEMDUSA_EMBED_API_KEY` | Bearer token. Falls back to `OPENAI_API_KEY`, but only when the URL host is `api.openai.com` |
-| `MEMDUSA_EMBED_RECALL_MIN` | Similarity (0..1) from which a memory is added to a prompt by meaning alone, without sharing words with it. Default `0.5`. Scores differ by model: with `nomic-embed-text`, related text scores about 0.45-0.6 and unrelated 0.3-0.42; OpenAI's `text-embedding-3-*` score lower overall, so try `0.35`-`0.4` there. Too low and every prompt pulls in loosely related memories |
+| `MEMDUSA_EMBED_RECALL_MIN` | Similarity (0..1) from which a memory is added to a prompt by meaning alone, without sharing words with it. Default `0.5` (`0.4` with built-in `all-MiniLM-L6-v2`). Scores differ by model: with `nomic-embed-text`, related text scores about 0.45-0.6 and unrelated 0.3-0.42; OpenAI's `text-embedding-3-*` score lower overall, so try `0.35`-`0.4` there. Too low and every prompt pulls in loosely related memories |
 
 How it works:
 
@@ -353,8 +375,16 @@ How it works:
   Merging on save stays lexical.
 - It never gets in the way: if the API fails or is slow (10 s per request; 3 s for prompt recall and the brief),
   memdusa logs one warning line and uses lexical search; a save or hook never fails because of embedding.
-- **Privacy:** memory text (already redacted before it is stored) and search queries are sent to the configured
-  provider. Use a local server such as Ollama to keep everything on your machine.
+- **Privacy:** with an HTTP provider, memory text (already redacted before it is stored) and search queries are sent
+  to that provider; use Ollama or the built-in model to keep everything on your machine.
+- **Measured quality (same 3-memory probe as the Ollama/Apple comparison):** `all-MiniLM-L6-v2` gets 3/4 target
+  queries with the right memory on top (currency precision 0.603, discount + currency 0.498, new release 0.232 top)
+  and leaves unrelated queries at ≤0.193. `bge-small-en-v1.5` also gets 3/4 but scores unrelated text much higher
+  (up to 0.586), so MiniLM is the default: smaller (86 MB vs 127 MB on disk) and better calibrated against
+  `COSINE_FLOOR` 0.3. The probe is an ignored test: `cargo test -p memdusa --features local-embed -- --ignored --nocapture`.
+- **Measured latency** (debug build, Apple Silicon): MiniLM first download + load 3.7 s once; cold single query
+  (new process, session load + embedding) ~0.50 s; warm single query ~11 ms — well inside the 3 s prompt-recall cap.
+  BGE small: ~4.7 s first download, ~0.74 s cold, ~18 ms warm.
 - **Hosted mode:** the server's environment decides. Set the variables where `memdusa serve` runs; clients just call
   the API and need nothing. Backfill a server with `memdusa embed` (admin).
 
