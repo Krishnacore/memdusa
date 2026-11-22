@@ -1,0 +1,10 @@
+{
+  "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/9f8ccf15-b22c-46d1-b2de-65e80ebbeff4",
+  "conversationId": "9f8ccf15-b22c-46d1-b2de-65e80ebbeff4",
+  "cwd": "/work/repo",
+  "hookEventName": "SessionStart",
+  "lastUserInput": "Create notes.txt containing hi, then reply DONE",
+  "modelName": "gemini-3.8-flash-high",
+  "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/9f8ccf15-b22c-46d1-b2de-65e80ebbeff4/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": ["/work/repo"]
+}
