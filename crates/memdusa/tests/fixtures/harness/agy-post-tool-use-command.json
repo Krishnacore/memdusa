@@ -1,0 +1,17 @@
+{
+  "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/de8ca976-a8ed-4181-8af6-41f5af388455",
+  "conversationId": "de8ca976-a8ed-4181-8af6-41f5af388455",
+  "cwd": "/work/repo",
+  "error": "",
+  "hookEventName": "PostToolUse",
+  "lastUserInput": "Run a shell command that writes shellok into shell.txt, then reply SHELLDONE",
+  "modelName": "gemini-3.8-flash-high",
+  "stepIdx": 2,
+  "toolCall": {
+    "args": { "CommandLine": "printf shellok > shell.txt", "WaitMsBeforeAsync": 5000, "toolSummary": "Write shellok to file" },
+    "id": "call_15255972550867731497",
+    "name": "run_command"
+  },
+  "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/de8ca976-a8ed-4181-8af6-41f5af388455/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": ["/work/repo"]
+}
