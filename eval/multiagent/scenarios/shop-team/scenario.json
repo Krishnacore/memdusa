@@ -1,0 +1,28 @@
+{
+  "name": "shop-team",
+  "description": "Coordinator delegates refunds + invoices to workers in different harnesses; opencode crashes mid-refunds and a Claude Code replacement takes over the stale step via the memdusa brief.",
+  "run_name": "release refunds invoices",
+  "crash_task": "refunds",
+  "replacement_prompt": "Continue your delegated task.",
+  "rework_path": "shop/refunds.py",
+  "harnesses": {
+    "worker1": "opencode",
+    "worker2": "codex",
+    "replacement": "claude"
+  },
+  "tasks": [
+    {
+      "key": "refunds",
+      "harness": "opencode",
+      "assignment": "Build the refunds feature for the shop in `shop/refunds.py`.\n- `refund(order_id, amount_cents, reason)` records a ledger entry of kind \"refund\" and returns it. Refunds may be partial, but the total refunded for an order must never exceed the order total in `ORDERS`.\n- Store `reason` lowercased in the ledger entry's `note`.\n- Invalid refunds (amount <= 0, unknown order, empty/whitespace reason, or a refund that would exceed the remaining refundable amount) must raise `RefundError`, defined in `shop/refunds.py` as a subclass of `ValueError`.\n- Add `refunded_cents(order_id)` and `refundable_cents(order_id)` helpers.\n- Finally, add tests in `tests/test_refunds.py` covering the lowercased reason, the over-refund guard and the empty-reason check.",
+      "assignment_tail": "Finally, add tests in `tests/test_refunds.py` covering the lowercased reason, the over-refund guard and the empty-reason check.",
+      "hidden_test": "hidden_refunds.py"
+    },
+    {
+      "key": "invoices",
+      "harness": "codex",
+      "assignment": "Build the invoices feature for the shop in `shop/invoices.py`.\n- `render_invoice(order_id)` returns exactly one line: `INVOICE #<order_id> TOTAL <cents> cents`, using the order total from `ORDERS` (for example `INVOICE #1 TOTAL 5000 cents`).\n- `invoice_lines(order_id)` returns a list of two strings: `INVOICE #<id>` and `TOTAL <cents> cents`.\n- Add tests in `tests/test_invoices.py` covering both functions.\nWhen the task is finished, call the memdusa `task_complete` tool to mark your delegated task done.",
+      "hidden_test": "hidden_invoices.py"
+    }
+  ]
+}

@@ -86,3 +86,58 @@ one MCP call on average and cost about the same ($0.09 vs $0.08 per run).
 - `hidden_test.py`: acceptance tests run against B's final repo (with the repo on `PYTHONPATH`)
 
 Check the fixture first: its own tests pass and the hidden tests fail.
+
+## Multi-agent eval (`multiagent/run.py`)
+
+Where the handoff eval moves one task between agents, this one checks the **coordination machinery**: a coordinator
+delegates several tasks as one durable run, workers in different harnesses claim their own steps, one worker crashes,
+and a replacement in a third harness takes over the *stale* step from a brief that still contains the original
+assignment. It is the scripted version of the setup described under "Multi-agent setups" and "Delegating through a
+durable run" in the top-level README.
+
+```sh
+uv run eval/multiagent/run.py --dry-run      # stub harnesses: exercises orchestration + grading for free
+uv run eval/multiagent/run.py --self-test    # unit checks for the grading functions
+uv run eval/multiagent/run.py                # 1 real trial
+uv run eval/multiagent/run.py --trials 3 --lease-secs 45
+uv run eval/multiagent/run.py --harnesses worker1=opencode,worker2=codex,replacement=claude
+```
+
+Requirements: `cargo`, `uv`, plus **logged-in `claude`, `codex` and `opencode` CLIs**. The real run uses Claude Code
+on Haiku, Codex and OpenCode's free `opencode/hy4-flash-free` model, so one trial costs well under $1. Nothing is
+installed at user scope: memdusa is installed with `--scope project --database-url …` into a fresh scratch repo per
+trial, and every worker environment is stripped of `MEMDUSA_*` except `MEMDUSA_RUN`, `MEMDUSA_TASK`,
+`MEMDUSA_PARENT` and `MEMDUSA_STEP_LEASE_SECS`. OpenCode workers launch with `--standalone` because its shared
+background service does not inherit the worker's environment.
+
+### How a trial works
+
+The `shop-team` scenario starts from a tiny repo with `ORDERS = {1: 5000, 2: 1250}`.
+
+1. The coordinator (the eval script itself) runs `memdusa delegate "release refunds invoices" refunds invoices` and
+   parses the `MEMDUSA_RUN` / `MEMDUSA_TASK` launch lines.
+2. **Worker 1** (OpenCode) gets the full `refunds` assignment in its prompt. The orchestrator polls `memdusa export`
+   and kills the process group as soon as its first `file_change` event appears. Its step goes stale when the 45 s
+   lease expires.
+3. **Worker 2** (Codex) gets the `invoices` assignment in a different harness, runs to completion and calls
+   `task_complete` itself.
+4. After the stale lease is observed, the replacement's brief is captured with `memdusa resume` and its env, then
+   **Claude Code** is launched with only "Continue your delegated task." It sees the full assignment through the
+   worker-scoped brief ("## Your assignment") and claims the stale step.
+
+### Metrics
+
+Results go to `eval/results/<timestamp>-multiagent/`: `report.md`, `results.json`, each agent's log, both versions
+of the coordinator brief, the replacement's brief, the final `memdusa export` and the hidden-test junit files.
+
+| Metric | Meaning |
+|---|---|
+| hidden tests | Per-task acceptance tests the workers never see (refunds behaviour, lowercased reason, over-refund `ValueError`, own tests file; invoice format). The headline number |
+| steps done | Both `refunds` and `invoices` steps are `completed` in the run |
+| assignment | The replacement's brief contains "## Your assignment" and the assignment's distinctive tail: proof the handoff carried the full task, not just "continue" |
+| lines kept | Share of worker 1's `shop/refunds.py` lines the replacement preserved (1 = built on its work, 0 = started over) |
+| attributed | "Who did what" names all three sources (`opencode`, `codex`, `claude-code`) |
+| turns, cost | What Codex/Claude Code report about their own effort |
+
+Use `--keep` to retain each trial's scratch repo, venv and database for inspection. One trial is an anecdote; use
+`--trials 3` or more before drawing conclusions.
