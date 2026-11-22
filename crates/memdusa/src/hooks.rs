@@ -350,6 +350,17 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
         }
         HookEvent::SessionEnd => {
             let reason = input.reason.as_deref().unwrap_or("other");
+            // Harnesses whose prompt/stop hooks don't fire (`cursor-agent -p`) hand over the request and the
+            // agent's last words here. A session that already journaled them (stop, prompt hooks) isn't repeated.
+            if ctx.cfg.journal_prompts
+                && let Some(p) = input.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty())
+                && !has_event(&ctx, "prompt").await?
+            {
+                log(&ctx, "prompt", truncate(p, 200), Some(json!({ "text": truncate(p, MAX_PROMPT_CHARS) }))).await?;
+            }
+            if let Some(m) = input.last_assistant_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                record_agent_message(&ctx, m).await?;
+            }
             auto_checkpoint(&ctx, &format!("session end ({reason})")).await?;
             log(&ctx, "session_end", format!("session ended ({reason})"), None).await?;
             Ok(None)
@@ -565,6 +576,12 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
         _ => {}
     }
     Ok(())
+}
+
+/// Whether this session already has an event of `kind`.
+async fn has_event(ctx: &Ctx<'_>, kind: &str) -> Result<bool> {
+    let Some(session) = &ctx.session else { return Ok(false) };
+    Ok(ctx.store.events_recent(&ctx.project, Some(session), 300).await?.iter().any(|e| e.kind == kind))
 }
 
 /// Journal the agent's last words, unless they repeat the session's previous message.
@@ -822,6 +839,38 @@ mod tests {
             store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content.chars().count(), MAX_MESSAGE_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn session_end_journals_prompt_and_last_words_once() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let end = json!({"reason": "completed", "prompt": "say ok", "last_assistant_message": "ok"});
+        handle(HookEvent::SessionEnd, input(end.clone()), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::SessionEnd, input(end), ctx(&store, &cfg)).await.unwrap();
+        let events = store.events_recent("p", None, 50).await.unwrap();
+        let counts = ["prompt", AGENT_MESSAGE, "session_end"].map(|k| events.iter().filter(|e| e.kind == k).count());
+        assert_eq!(counts, [1, 1, 2], "prompt and last words are not repeated; session_end is");
+
+        // a session whose prompt hook already ran, and whose stop already recorded the message, adds nothing
+        let mut c = ctx(&store, &cfg);
+        c.session = Some("s9".into());
+        handle(HookEvent::UserPromptSubmit, input(json!({"prompt": "first"})), c).await.unwrap();
+        let mut c = ctx(&store, &cfg);
+        c.session = Some("s9".into());
+        handle(HookEvent::Stop, input(json!({"last_assistant_message": "done"})), c).await.unwrap();
+        let mut c = ctx(&store, &cfg);
+        c.session = Some("s9".into());
+        let end = json!({"prompt": "first (again)", "last_assistant_message": "done"});
+        handle(HookEvent::SessionEnd, input(end), c).await.unwrap();
+        let mine: Vec<_> = store
+            .events_recent("p", Some("s9"), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "prompt" || e.kind == AGENT_MESSAGE)
+            .collect();
+        assert_eq!(mine.len(), 2);
     }
 
     #[tokio::test]

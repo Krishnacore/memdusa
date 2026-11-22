@@ -514,6 +514,11 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
         ),
         Harness::Cursor => {
             // Cursor also runs Claude Code hooks ("Third-Party Imports"), so they could fire twice.
+            n.push(
+                "`cursor-agent -p` (headless) only fires the sessionStart, shell/edit and sessionEnd hooks; memdusa \
+                 reads the prompt and the agent's last message from Cursor's transcript at session end."
+                    .into(),
+            );
             let claude = [
                 home_dir()?.join(".claude/settings.json"),
                 ".claude/settings.json".into(),
@@ -540,7 +545,11 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
         Harness::Pi => n.push(
             "pi loads project extensions (.pi/) only after you trust the project; user scope works everywhere.".into(),
         ),
-        Harness::OpenCode => n.push("Restart OpenCode to load the plugin.".into()),
+        Harness::OpenCode => n.push(
+            "Restart OpenCode to load the plugin. OpenCode has no session-end hook, so no session-end event or \
+             fallback checkpoint is recorded there; the agent's last message is journaled when it goes idle."
+                .into(),
+        ),
         Harness::Hermes => n.push(
             "Hermes only runs shell hooks that are allowlisted: run Hermes once with `--accept-hooks` (or approve \
              them at its prompt). `hermes hooks doctor` shows their status. Headless runs never ask."
@@ -974,6 +983,51 @@ mod tests {
         let yaml = crate::hermes_yaml::merge("", BIN, Some(URL), true, false).unwrap();
         assert!(yaml.contains(&format!("hook stop --harness hermes{flag}\"")));
         assert!(yaml.contains(&format!("args: [\"mcp\", \"--agent\", \"hermes\", \"--database-url\", \"{URL}\"]")));
+    }
+
+    /// Event registrations verified against the real tools (OpenCode 2.2.6, pi 0.73.1; fixtures in tests/fixtures/harness).
+    #[test]
+    fn plugin_templates_register_the_events_that_really_fire() {
+        let oc = plugin_source(Harness::OpenCode, BIN);
+        for needle in [
+            r#"ctx.session.hook("prompt""#,
+            r#"ctx.tool.hook("execute.after""#,
+            r#"ctx.session.hook("compaction""#,
+            r#""experimental.idle""#,
+            "ctx.session.context(",
+            "last_assistant_message",
+            "event.background?.length", // `background: []` is truthy
+            "plugin.log",
+        ] {
+            assert!(oc.contains(needle), "OpenCode plugin lacks {needle}");
+        }
+        assert!(!oc.contains("if (event.background) return"));
+        let pi = plugin_source(Harness::Pi, BIN);
+        for needle in [
+            r#"on("agent_end""#,
+            r#"on("agent_before_settle""#,
+            r#"on("session_shutdown""#,
+            r#"on("before_agent_start""#,
+            "last_assistant_message",
+            "plugin.log",
+        ] {
+            assert!(pi.contains(needle), "pi extension lacks {needle}");
+        }
+
+        // the captured payloads carry what the templates read
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/harness");
+        let read = |f: &str| {
+            serde_json::from_str::<Value>(&std::fs::read_to_string(format!("{fixtures}/{f}")).unwrap()).unwrap()
+        };
+        assert!(read("opencode-idle.json")["background"].as_array().unwrap().is_empty());
+        let ctx = read("opencode-session-context.json");
+        let last = ctx.as_array().unwrap().last().unwrap();
+        assert_eq!(last["type"], "assistant");
+        assert!(last["content"].as_array().unwrap().iter().any(|p| p["type"] == "text" && p["text"] == "ok"));
+        let end = read("pi-agent-end.json");
+        let last = end["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert!(last["content"].as_array().unwrap().iter().any(|p| p["type"] == "text" && p["text"] == "ok"));
     }
 
     #[test]
