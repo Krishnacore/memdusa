@@ -10,6 +10,9 @@ use crate::store::Store;
 /// Event kinds written automatically by harness hooks.
 pub const FILE_CHANGE: &str = "file_change";
 pub const COMMAND: &str = "command";
+pub const STOP_GUARD: &str = "stop_guard";
+/// Bookkeeping events that would only be noise in the brief.
+const HIDDEN: &[&str] = &[STOP_GUARD];
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Brief {
@@ -162,7 +165,11 @@ fn render(
             }
         }
         let commands: Vec<_> = events.iter().filter(|e| e.kind == COMMAND).take(5).collect();
-        let others: Vec<_> = events.iter().filter(|e| e.kind != FILE_CHANGE && e.kind != COMMAND).take(12).collect();
+        let others: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind != FILE_CHANGE && e.kind != COMMAND && !HIDDEN.contains(&e.kind.as_str()))
+            .take(12)
+            .collect();
 
         let _ = writeln!(o, "## Recent activity");
         if !files.is_empty() {

@@ -14,13 +14,13 @@
 
 use std::path::Path;
 
-use memdusa_core::brief::{self, COMMAND, FILE_CHANGE};
+use memdusa_core::brief::{self, COMMAND, FILE_CHANGE, STOP_GUARD};
 use memdusa_core::model::*;
 use memdusa_core::{Result, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
@@ -31,21 +31,6 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
-    pub const ALL: [HookEvent; 6] =
-        [Self::SessionStart, Self::UserPromptSubmit, Self::PostToolUse, Self::Stop, Self::PreCompact, Self::SessionEnd];
-
-    /// Name of the event in Claude Code settings.
-    pub fn claude_name(self) -> &'static str {
-        match self {
-            Self::SessionStart => "SessionStart",
-            Self::UserPromptSubmit => "UserPromptSubmit",
-            Self::PostToolUse => "PostToolUse",
-            Self::Stop => "Stop",
-            Self::PreCompact => "PreCompact",
-            Self::SessionEnd => "SessionEnd",
-        }
-    }
-
     /// CLI argument (`memdusa hook <arg>`).
     pub fn arg(self) -> &'static str {
         match self {
@@ -70,14 +55,6 @@ impl HookEvent {
     /// Events that save or compare code state (so the client reads git only then).
     pub fn needs_git(self) -> bool {
         matches!(self, Self::SessionStart | Self::PreCompact | Self::SessionEnd)
-    }
-
-    /// Tool matcher for events that support one.
-    pub fn matcher(self) -> Option<&'static str> {
-        match self {
-            Self::PostToolUse => Some(JOURNALED_TOOLS),
-            _ => None,
-        }
     }
 }
 
@@ -203,6 +180,9 @@ pub async fn handle_request(
     Ok(HookResponse { output: handle(event, input, ctx).await? })
 }
 
+/// How much of a user's request is kept verbatim.
+const MAX_PROMPT_CHARS: usize = 4_000;
+
 /// Claude Code caps `additionalContext` at 10,000 chars (beyond that it only
 /// shows a preview); keep the brief plus wrapper safely under it.
 const MAX_CONTEXT_CHARS: usize = 8_500;
@@ -229,7 +209,9 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
             if ctx.cfg.journal_prompts
                 && let Some(p) = input.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty())
             {
-                log(&ctx, "prompt", truncate(p, 400), None).await?;
+                // Short line for the timeline; the full request is kept for checkpoints and the brief.
+                // (The handoff eval caught this: a 400-char cut dropped half of a task's requirements.)
+                log(&ctx, "prompt", truncate(p, 200), Some(json!({ "text": truncate(p, MAX_PROMPT_CHARS) }))).await?;
             }
             Ok(None)
         }
@@ -299,7 +281,13 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
     let field = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
     match tool {
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
-            if let Some(path) = field("file_path").or_else(|| field("notebook_path")) {
+            // one path, or several (a Codex patch touching many files)
+            let many = input.and_then(|i| i.get("file_paths")).and_then(Value::as_array);
+            let paths: Vec<&str> = match many {
+                Some(list) => list.iter().filter_map(Value::as_str).collect(),
+                None => field("file_path").or_else(|| field("notebook_path")).into_iter().collect(),
+            };
+            for path in paths {
                 let rel = relative(path, ctx.cwd.as_deref());
                 log(ctx, FILE_CHANGE, rel, Some(json!({ "tool": tool, "path": path }))).await?;
             }
@@ -329,6 +317,14 @@ async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>>
     if changed == 0 {
         return Ok(None);
     }
+    // At most once per guard window per session, whatever the harness reports about
+    // loops (some, like Antigravity, have no stop_hook_active): never trap an agent
+    // that can't checkpoint.
+    let window_start = now_ms() - mins * 60_000;
+    if ctx.store.count_events_since(&ctx.project, session, STOP_GUARD, window_start).await? > 0 {
+        return Ok(None);
+    }
+    log(ctx, STOP_GUARD, format!("asked to checkpoint ({changed} file change(s))"), None).await?;
     let reason = format!(
         "memdusa: {changed} file change(s) since the last checkpoint. Before finishing, call the memdusa `checkpoint` \
          tool with the goal, what's done, concrete next steps, blockers and key files, so any agent can pick this up. \
@@ -358,14 +354,21 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    let last_prompt = events.iter().find(|e| e.kind == "prompt").map(|e| e.content.clone());
+    // The session's requests, oldest first, in full: the first is usually the task itself.
+    let prompts: Vec<String> = events
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "prompt")
+        .map(|e| e.data.as_ref().and_then(|d| d["text"].as_str()).unwrap_or(&e.content).to_owned())
+        .collect();
+    let task_line = prompts.first().map(|p| truncate(p.lines().next().unwrap_or(p).trim(), 140));
 
     // Carry the previous checkpoint forward so its plan isn't lost.
     let prev = ctx.store.checkpoints_latest(&ctx.project, 1).await?.into_iter().next();
     let goal = prev
         .as_ref()
         .map(|p| p.goal.clone())
-        .or_else(|| last_prompt.clone())
+        .or(task_line)
         .unwrap_or_else(|| "(unknown: no checkpoint or prompt recorded)".into());
     let mut done = prev.as_ref().map(|p| p.done.clone()).unwrap_or_default();
     done.push(format!("(auto) edited {} file(s) in session {}", files.len(), truncate(session, 8)));
@@ -373,8 +376,15 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
         "Automatic checkpoint written by memdusa at {why}: the agent changed files without saving a checkpoint. \
          Verify the state of the listed files before continuing."
     );
-    if let Some(p) = &last_prompt {
-        notes.push_str(&format!(" Last user request: \"{p}\""));
+    let quote = |p: &str| p.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+    match prompts.as_slice() {
+        [] => {}
+        [only] => notes.push_str(&format!("\n\nThe user's request, verbatim:\n\n{}", quote(only))),
+        [first, .., last] => notes.push_str(&format!(
+            "\n\nThe user's first request, verbatim:\n\n{}\n\nTheir latest request:\n\n{}",
+            quote(first),
+            quote(last)
+        )),
     }
     ctx.store
         .checkpoint_save(NewCheckpoint {

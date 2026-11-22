@@ -1,3 +1,4 @@
+mod adapters;
 mod config;
 mod hooks;
 mod http;
@@ -140,8 +141,12 @@ enum Cmd {
     /// Handle a Claude Code hook event (JSON on stdin). Installed by `memdusa install`.
     Hook {
         event: hooks::HookEvent,
-        #[arg(long, env = "MEMDUSA_AGENT", default_value = "claude-code")]
-        agent: String,
+        /// Which harness is calling (decides the payload and output format).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        harness: adapters::Harness,
+        /// Agent name for attribution. Default: the harness name.
+        #[arg(long, env = "MEMDUSA_AGENT")]
+        agent: Option<String>,
         /// Don't journal user prompts.
         #[arg(long, env = "MEMDUSA_NO_PROMPTS")]
         no_prompts: bool,
@@ -149,10 +154,10 @@ enum Cmd {
         #[arg(long, env = "MEMDUSA_STOP_GUARD_MINS", default_value_t = 15)]
         stop_guard_mins: i64,
     },
-    /// Wire memdusa into a harness (currently: claude-code). Registers the MCP server and installs hooks.
+    /// Wire memdusa into a harness: installs its hooks and registers the MCP server.
     Install {
-        #[arg(value_parser = ["claude-code"])]
-        harness: String,
+        #[arg(value_enum)]
+        harness: adapters::Harness,
         #[arg(long, value_enum, default_value = "user")]
         scope: install::Scope,
         /// Settings file to edit instead of the scope's default.
@@ -170,8 +175,8 @@ enum Cmd {
     },
     /// Remove memdusa's hooks (and MCP registration) from a harness.
     Uninstall {
-        #[arg(value_parser = ["claude-code"])]
-        harness: String,
+        #[arg(value_enum)]
+        harness: adapters::Harness,
         #[arg(long, value_enum, default_value = "user")]
         scope: install::Scope,
         #[arg(long)]
@@ -302,8 +307,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.cmd {
-        Cmd::Install { scope, settings, bin, no_mcp, dry_run, .. } => {
+        Cmd::Install { harness, scope, settings, bin, no_mcp, dry_run } => {
             return install::run(install::InstallOptions {
+                harness,
                 scope,
                 settings,
                 bin,
@@ -312,8 +318,9 @@ async fn main() -> anyhow::Result<()> {
                 uninstall: false,
             });
         }
-        Cmd::Uninstall { scope, settings, no_mcp, .. } => {
+        Cmd::Uninstall { harness, scope, settings, no_mcp } => {
             return install::run(install::InstallOptions {
+                harness,
                 scope,
                 settings,
                 bin: Some("memdusa".into()),
@@ -322,14 +329,17 @@ async fn main() -> anyhow::Result<()> {
                 uninstall: true,
             });
         }
-        Cmd::Hook { event, agent, no_prompts, stop_guard_mins } => {
+        Cmd::Hook { event, harness, agent, no_prompts, stop_guard_mins } => {
             // A hook must never break the user's session: log and exit 0.
+            let agent = agent.unwrap_or_else(|| harness.agent().into());
             let cfg = hooks::HookConfig { agent, journal_prompts: !no_prompts, stop_guard_mins };
-            // Finish well inside Claude Code's hook timeout instead of stalling the session.
-            let deadline = std::time::Duration::from_millis(event.timeout_secs() * 1000 - 500);
-            let result = tokio::time::timeout(deadline, run_hook(event, cfg, cli.project, cli.database_url, deadline))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
+            // Finish well inside the harness's hook timeout instead of stalling the session.
+            let budget = harness.events().iter().filter(|h| h.event == event).map(|h| h.timeout_secs).max();
+            let deadline = Duration::from_millis(budget.unwrap_or(event.timeout_secs()) * 1000 - 500);
+            let result =
+                tokio::time::timeout(deadline, run_hook(event, harness, cfg, cli.project, cli.database_url, deadline))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
             match result {
                 Ok(Some(out)) => println!("{out}"),
                 Ok(None) => {}
@@ -599,6 +609,7 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
 
 async fn run_hook(
     event: hooks::HookEvent,
+    harness: adapters::Harness,
     config: hooks::HookConfig,
     project: Option<String>,
     database_url: Option<String>,
@@ -606,12 +617,17 @@ async fn run_hook(
 ) -> anyhow::Result<Option<String>> {
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
-    let mut input: serde_json::Value =
+    let native: serde_json::Value =
         if raw.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(&raw)? };
+    // Translate the harness's payload into memdusa's canonical one (or ignore this event).
+    let Some(mut input) = harness.normalize(event, native) else { return Ok(None) };
 
     // The project is always detected here, on the machine that has the repo.
+    let project_dir = ["CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR", "GEMINI_PROJECT_DIR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|d| !d.is_empty()));
     if input.get("cwd").and_then(|v| v.as_str()).is_none()
-        && let (Some(obj), Ok(dir)) = (input.as_object_mut(), std::env::var("CLAUDE_PROJECT_DIR"))
+        && let (Some(obj), Some(dir)) = (input.as_object_mut(), project_dir)
     {
         obj.insert("cwd".into(), dir.into());
     }
@@ -646,7 +662,7 @@ async fn run_hook(
             resp
         }
     };
-    Ok(resp.output)
+    Ok(harness.render(event, resp.output))
 }
 
 /// Remote hook with an offline fallback: replay any backlog first, then send

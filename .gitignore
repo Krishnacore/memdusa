@@ -3,3 +3,5 @@
 *.db-wal
 *.db-shm
 .env
+/eval/results/
+__pycache__/
