@@ -116,6 +116,23 @@ in that tool's dialect. Remote mode, the offline queue, redaction and code state
 | pi | TypeScript extension in `~/.pi/agent/extensions/` | ✓ (first run) | ✓ | ✓ | `agent_before_settle` | session_before_compact, session_shutdown |
 | Hermes Agent | shell hooks in `~/.hermes/config.yaml` | ✓ (first turn) | ✓ | ✓ | `pre_verify` (after edits only) | on_session_finalize |
 
+`--database-url URL` (or `MEMDUSA_DATABASE_URL`), when given to `memdusa install`, is written into every generated hook
+command, MCP entry and plugin, so they use that database instead of the default `~/.memdusa/memdusa.db`. Without it the
+generated config is unchanged.
+
+### Trust and first run
+
+Most harnesses refuse to run a project's hooks or MCP servers until you approve them once:
+
+| Harness | One-time step |
+|---|---|
+| Codex | Project hooks run only after trust: approve in `/hooks` (automation: `--dangerously-bypass-hook-trust`). A project `.codex/config.toml` also needs the project trusted (trust prompt / `codex --trust`). |
+| Cursor CLI (`cursor-agent`) | Untrusted folders won't start in print mode: trust the folder interactively or pass `--trust`; `--approve-mcps` auto-approves the MCP server. Cursor runs memdusa through its Claude Code hooks import. |
+| pi | Project extensions (`.pi/`) load only for trusted projects: answer the trust prompt, or pass `--approve` / `-a` for one run. |
+| Hermes | Shell hooks must be allowlisted: run Hermes once with `--accept-hooks` (or approve at its prompt). `hermes hooks doctor` shows their status. |
+| OpenCode v2 | Plugins run in OpenCode's background service, which does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is written into the plugin), not with shell env vars. `opencode run --standalone` uses a private server that does inherit env. |
+| Gemini CLI | Google stopped serving individual accounts in Gemini CLI (June 2026): use Antigravity (`agy`, `memdusa install antigravity`). |
+
 Things to know per tool:
 - **Codex** runs new hooks only after you trust them in `/hooks`.
 - **Cursor** also runs Claude Code hooks by default ("Third-Party Imports"). If both are installed, turn that off so events
@@ -123,8 +140,11 @@ Things to know per tool:
 - **Antigravity** has no session-end or compaction hooks, so there's no fallback checkpoint there; the stop reminder does
   that job. Gemini CLI remains for enterprise and paid-API users (consumer accounts moved to Antigravity in June 2026).
 - **pi** hides MCP tools behind "code mode" by default; memdusa registers its server with `exposure: "direct"`.
-- **Hermes** asks once to approve each hook (headless: `--accept-hooks`). memdusa writes a marked block into
-  `config.yaml`, or prints it for you to merge if the file already has `hooks:` / `mcp_servers:`.
+- **Hermes** hooks need allowlisting (see above). memdusa merges into your existing `config.yaml` by inserting marked
+  `# >>> memdusa` / `# <<< memdusa` blocks (under your existing `hooks:` / `mcp_servers:` keys, or as new sections),
+  leaving the rest of the file untouched; `memdusa uninstall hermes` removes exactly those blocks. Hermes runs hooks from
+  its own install dir, so memdusa reads the session's real workspace from `$HERMES_HOME/state.db` (read-only) to pick the
+  project, falling back to the payload `cwd` and then `MEMDUSA_PROJECT`.
 - The checkpoint reminder fires **at most once per session per window** for every harness, so it can't trap an agent that
   has no way to checkpoint.
 

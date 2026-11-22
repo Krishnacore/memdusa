@@ -32,3 +32,7 @@ tar = { version = "0.4", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 gethostname = "1"
 rmcp.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+yaml-rust2 = "0.10"
