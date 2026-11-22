@@ -105,6 +105,18 @@ impl OAuthConfig {
                 },
             },
         }))
+        .inspect(|cfg| {
+            // The overrides point sign-in at another identity provider and, in test mode, accept
+            // symmetric ID-token keys: fine for the test suite, dangerous on a real server.
+            if let Some(cfg) = cfg
+                && (cfg.upstream.github.has_overrides() || cfg.upstream.google.has_overrides())
+            {
+                tracing::warn!(
+                    "MEMDUSA_TEST_* upstream overrides are set: GitHub/Google sign-in is pointed at test endpoints \
+                     and accepts test keys. Never set these on a real server."
+                );
+            }
+        })
     }
 
     /// Callback URLs to register with GitHub/Google for the enabled providers.
