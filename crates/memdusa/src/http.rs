@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{DefaultBodyLimit, Extension, MatchedPath, Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -23,21 +23,24 @@ use serde_json::{Value, json};
 
 use crate::hooks::{self, HookBatchItem, HookBatchResponse, HookEvent, HookRequest, HookResponse};
 use crate::mcp::{Defaults, MemdusaMcp};
+use crate::oauth::{self, OAuthConfig, OAuthRuntime};
 use crate::ops::{Gauges, Metrics, RateLimiter};
 
 #[derive(Clone)]
-struct AppState {
-    store: Store,
-    metrics: Arc<Metrics>,
-    limiter: Option<Arc<RateLimiter>>,
+pub(crate) struct AppState {
+    pub(crate) store: Store,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) limiter: Option<Arc<RateLimiter>>,
     /// Shared break-glass token (`--token`): full admin access.
-    token: Option<Arc<str>>,
+    pub(crate) token: Option<Arc<str>>,
     /// Latched to true once any user exists (or a token is set). Users can be
     /// created by the CLI while the server runs, so an open server re-checks
     /// on every request until it latches.
-    auth_required: Arc<AtomicBool>,
+    pub(crate) auth_required: Arc<AtomicBool>,
     /// Fallback for users without a matching grant (`MEMDUSA_DEFAULT_ACCESS`).
-    default_access: DefaultPolicy,
+    pub(crate) default_access: DefaultPolicy,
+    /// OAuth authorization server, enabled by `MEMDUSA_PUBLIC_URL`.
+    pub(crate) oauth: Option<OAuthRuntime>,
 }
 
 /// Per-request snapshot of the caller's grants: at most one grants query per
@@ -46,6 +49,8 @@ struct AppState {
 pub(crate) struct AccessCache {
     policy: AccessPolicy,
     store: Store,
+    /// OAuth tokens scoped to `memdusa:read` can never write, whatever the grants say.
+    read_only: bool,
 }
 
 impl AccessCache {
@@ -63,6 +68,17 @@ impl AccessCache {
         needed: Access,
         action: &str,
     ) -> Result<(), Error> {
+        if self.read_only && needed == Access::Write {
+            let detail = json!({ "needed": needed.as_str(), "action": action, "reason": "read_only_token" });
+            if let Err(e) = self
+                .store
+                .audit(NewAuditEvent::denied(identity.actor(), "denied").project(project).detail(detail))
+                .await
+            {
+                tracing::error!("could not audit denied request: {e}");
+            }
+            return Err(Error::Forbidden("read-only token cannot write".into()));
+        }
         if self.policy.allows(identity, project, needed) {
             return Ok(());
         }
@@ -112,9 +128,11 @@ pub struct HttpOptions {
     /// Fallback access for users with no grant (default `write`, via
     /// `MEMDUSA_DEFAULT_ACCESS`).
     pub default_access: DefaultPolicy,
+    /// OAuth authorization server config (`None` disables OAuth endpoints).
+    pub oauth: Option<OAuthConfig>,
 }
 
-struct ApiError(Error);
+pub(crate) struct ApiError(pub(crate) Error);
 
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
@@ -200,6 +218,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         auth_required: Arc::new(AtomicBool::new(opts.token.is_some())),
         token: opts.token.map(Into::into),
         default_access: opts.default_access,
+        oauth: opts.oauth.map(OAuthRuntime::new),
     };
 
     let api = Router::new()
@@ -245,7 +264,16 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
     if serve_metrics {
         public = public.route("/metrics", get(metrics));
     }
-    public.with_state(state).merge(api)
+    let mut all = public.with_state(state.clone()).merge(api);
+    if state.oauth.is_some() {
+        all = all
+            .merge(oauth::public_routes().with_state(state.clone()))
+            .merge(oauth::routes().with_state(state.clone()))
+            .merge(
+                oauth::session_routes().layer(middleware::from_fn_with_state(state.clone(), auth)).with_state(state),
+            );
+    }
+    all
 }
 
 /// Who made the request, filled in by `auth` for the access log.
@@ -287,10 +315,16 @@ async fn shutdown() {
 
 /// Resolve the caller and attach an [`Identity`] to the request (REST
 /// handlers and MCP tools both read it).
-async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+pub(crate) async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
     let unauthorized = |msg: &str| {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-        (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
+        let mut resp = (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response();
+        if let Some(o) = &s.oauth
+            && let Ok(v) = HeaderValue::from_str(&o.config.www_authenticate())
+        {
+            resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+        }
+        resp
     };
     let bearer = req
         .headers()
@@ -299,11 +333,22 @@ async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Respon
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .map(String::from);
+    let path = req.uri().path().to_owned();
+    let unsafe_method = !req.method().is_safe();
 
+    let mut read_only = false;
     let identity = match bearer {
         Some(t) if s.token.as_ref().is_some_and(|tok| constant_time_eq(t.as_bytes(), tok.as_bytes())) => {
             Identity::root()
         }
+        Some(t) if t.starts_with("mdo_") => match s.store.authenticate_access(&t, now_ms()).await {
+            Ok(Some(auth)) => {
+                read_only = auth.read_only;
+                auth.identity
+            }
+            Ok(None) => return unauthorized("invalid, expired or revoked access token"),
+            Err(e) => return ApiError(e).into_response(),
+        },
         Some(t) => match s.store.authenticate(&t).await {
             Ok(Some(id)) => id,
             Ok(None) => return unauthorized("invalid, revoked or disabled API key"),
@@ -315,6 +360,10 @@ async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Respon
             Err(e) => return ApiError(e).into_response(),
         },
     };
+    if read_only && unsafe_method && path.starts_with("/v1/") {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "read-only token cannot write (scope memdusa:read)" })))
+            .into_response();
+    }
     if let Some(slot) = req.extensions().get::<UserSlot>()
         && let Ok(mut u) = slot.0.lock()
     {
@@ -344,7 +393,7 @@ async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Respon
         Err(e) => return ApiError(e).into_response(),
     };
     req.extensions_mut().insert(identity);
-    req.extensions_mut().insert(AccessCache { policy, store: s.store.clone() });
+    req.extensions_mut().insert(AccessCache { policy, store: s.store.clone(), read_only });
     next.run(req).await
 }
 
@@ -1052,6 +1101,7 @@ mod tests {
             rate_limit: 0.0,
             metrics: true,
             default_access,
+            oauth: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1431,6 +1481,7 @@ mod tests {
             rate_limit: 1.0,
             metrics: true,
             default_access: DefaultPolicy::Write,
+            oauth: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

@@ -9,6 +9,7 @@ mod install;
 #[cfg(feature = "local-embed")]
 mod local_embed;
 mod mcp;
+mod oauth;
 mod ops;
 mod project;
 mod proxy;
@@ -194,6 +195,11 @@ enum Cmd {
     },
     /// Revoke a project grant by id (admin).
     RevokeGrant { id: String },
+    /// List or revoke OAuth sign-in sessions (remote mode).
+    Sessions {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// Show the audit log (admin).
     Audit {
         /// Events at or after this unix-millis timestamp, or `7d` / `24h` / `2w` ago.
@@ -440,6 +446,17 @@ enum KeyCmd {
     Revoke { key: String },
 }
 
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// List active sign-in sessions (your own, or everyone's with --user).
+    List {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Revoke a session by id (revokes its whole grant chain).
+    Revoke { id: String },
+}
+
 /// Stack for the main thread and the runtime's workers. Windows gives the main thread only 1 MB
 /// (8 MB on macOS/Linux), and the CLI's async state machine outgrew that ("thread 'main' has
 /// overflowed its stack" in CI), so run everything on threads with an explicit, uniform stack.
@@ -635,6 +652,15 @@ async fn run() -> anyhow::Result<()> {
                 .await?;
             print_grant(&g);
         }
+        Cmd::Sessions { cmd } => match cmd {
+            SessionCmd::List { user } => {
+                store.oauth_sessions_list(user.as_deref()).await?.iter().for_each(print_session)
+            }
+            SessionCmd::Revoke { id } => {
+                let n = store.oauth_session_revoke(&id, None, model::now_ms()).await?;
+                println!("revoked {n} session token(s)");
+            }
+        },
         Cmd::Audit { since, actor, project, limit } => {
             let q = audit_query(since, actor, project, limit)?;
             store.audit_query(q).await?.iter().for_each(print_audit);
@@ -656,6 +682,10 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Serve { addr, token, allowed_hosts, no_auto_prune, rate_limit, no_metrics } => {
             let auto_prune = (!no_auto_prune).then(retention_from_env);
+            let oauth = oauth::OAuthConfig::from_env().context("invalid MEMDUSA_PUBLIC_URL")?;
+            if let Some(c) = &oauth {
+                tracing::info!("OAuth sign-in enabled (issuer {})", c.issuer);
+            }
             let opts = http::HttpOptions {
                 addr,
                 token,
@@ -664,6 +694,7 @@ async fn run() -> anyhow::Result<()> {
                 rate_limit,
                 metrics: !no_metrics,
                 default_access: DefaultPolicy::from_env(),
+                oauth,
             };
             http::serve(store, opts).await?;
         }
@@ -852,6 +883,16 @@ async fn run_remote(
         }
         Cmd::Grants { user } => client()?.grants(user.as_deref()).await?.iter().for_each(print_grant),
         Cmd::RevokeGrant { id } => print_grant(&client()?.grant_revoke(&id).await?),
+        Cmd::Sessions { cmd } => {
+            let c = client()?;
+            match cmd {
+                SessionCmd::List { user } => c.sessions(user.as_deref()).await?.iter().for_each(print_session),
+                SessionCmd::Revoke { id } => {
+                    let r = c.session_revoke(&id).await?;
+                    println!("revoked {} session token(s)", r["revoked"].as_i64().unwrap_or(0));
+                }
+            }
+        }
         Cmd::Audit { since, actor, project, limit } => {
             let q = audit_query(since, actor, project, limit)?;
             client()?.audit(&q).await?.iter().for_each(print_audit);
@@ -1269,6 +1310,14 @@ fn print_created(k: &CreatedKey) {
 
 fn print_grant(g: &ProjectGrant) {
     println!("{:<36} {:<20} {:<6} created by {}  id {}", g.pattern, g.user, g.role.as_str(), g.created_by, g.id);
+}
+
+fn print_session(s: &memdusa_core::oauth::OAuthSession) {
+    let state = s.last_used_at.map_or_else(|| "never used".into(), |u| format!("last used {}", ts(u)));
+    println!(
+        "{:<14} {:<14} {:<20} {:<16} {:<14} {}   id {}",
+        s.prefix, s.kind, s.user, s.client_name, s.scope, state, s.id
+    );
 }
 
 fn print_audit(e: &AuditEvent) {

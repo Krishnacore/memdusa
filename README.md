@@ -515,6 +515,52 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
   --header "X-Memdusa-Project: github.com/org/repo" --header "X-Memdusa-Agent: claude-code"
 ```
 
+## Team server: OAuth sign-in
+
+Set `MEMDUSA_PUBLIC_URL` to the server's external base URL to enable OAuth 2.1 sign-in (it must be `https://`,
+except for `localhost` / `127.0.0.1` in development):
+
+```sh
+export MEMDUSA_PUBLIC_URL=https://memdusa.example.com
+memdusa serve --addr 0.0.0.0:7077 --allowed-host memdusa.example.com
+```
+
+What an MCP client (or any OAuth client) sees:
+
+- `GET /.well-known/oauth-protected-resource` (RFC 9728) and `GET /.well-known/oauth-authorization-server` (RFC 8414).
+  Unauthenticated `/mcp` and `/v1` requests get `401` with `WWW-Authenticate: Bearer resource_metadata="…"`.
+- `POST /oauth/register` (RFC 7591) for public clients: send `redirect_uris` (and optionally `client_name`), get a
+  `client_id`. Only `token_endpoint_auth_method: none` is supported. Redirect URIs must be `https://`, or loopback
+  `http://127.0.0.1:<any port>/…` / `http://localhost:<any port>/…` (RFC 8252).
+- `GET /oauth/authorize` checks `response_type=code`, the registered `redirect_uri`, `code_challenge` with
+  `code_challenge_method=S256` (plain PKCE is rejected), `state`, `scope` and the optional `resource` (RFC 8707). It
+  renders a minimal server-rendered sign-in page: paste an existing memdusa API key, then approve the client and
+  scopes on the consent screen. GitHub/Google buttons are placeholders for H2b.
+- `POST /oauth/token` exchanges the one-time code (10-minute expiry) with the PKCE verifier, and rotates refresh
+  tokens on every use. Reusing a rotated refresh token revokes the whole grant chain (and is audited as theft).
+  `POST /oauth/revoke` is RFC 7009.
+
+Access tokens are opaque `mdo_…` (default **1 hour**); refresh tokens are `mdr_…` (**30 days sliding**, with a
+**365-day absolute** limit from the last interactive sign-in). All are stored hashed like API keys. Scopes are
+`memdusa` (full user access, still limited by H1 project grants) and `memdusa:read` (read-only: writes get `403`).
+API keys and the shared `--token` keep working unchanged. Lifetimes can be shortened for tests with
+`MEMDUSA_OAUTH_ACCESS_SECS`, `MEMDUSA_OAUTH_REFRESH_SECS`, `MEMDUSA_OAUTH_ABSOLUTE_SECS`, `MEMDUSA_OAUTH_CODE_SECS`
+and `MEMDUSA_OAUTH_SIGNIN_SECS`. Failed API-key sign-ins are rate-limited per IP.
+
+Sign-ins, registrations, refresh reuse, revocations and denials are written to the H1 audit log (`memdusa audit`).
+
+Sessions (OAuth sign-ins) can be inspected and revoked from a machine logged in to the server:
+
+```sh
+memdusa sessions list              # your sessions
+memdusa sessions list --user alice # admin: anyone's sessions
+memdusa sessions revoke <id>       # revokes that session's whole grant chain
+```
+
+The same data is available at `GET/DELETE /v1/me/sessions[/{id}]` and `GET/DELETE /v1/admin/sessions[/{id}]`.
+
+CLI browser login (`memdusa login … --browser` / `--device`) is H2c and not implemented yet.
+
 ## MCP tools
 
 `resume`, `memory_save`, `memory_update`, `memory_search`, `memory_review`, `memory_forget`, `checkpoint`, `log_event`, `run_start`,
