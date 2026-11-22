@@ -152,8 +152,12 @@ fn render(
         o.push('\n');
     }
 
-    // A fresh checkpoint already says where things stand: only show what came after it.
-    let since = checkpoints.first().map_or(0, |c| c.created_at);
+    // A checkpoint the agent wrote already says where things stand: only show what came after it.
+    // Automatic fallback checkpoints are written at session end, after the last words, so they don't count.
+    let since = checkpoints
+        .iter()
+        .find(|c| !c.source.as_deref().is_some_and(|s| s.ends_with(" (auto)")))
+        .map_or(0, |c| c.created_at);
     let latest =
         |kind: &str| events.iter().filter(|e| e.kind == kind && e.created_at > since).max_by_key(|e| e.created_at);
     let (message, summary) = (latest(AGENT_MESSAGE), latest(COMPACT_SUMMARY));

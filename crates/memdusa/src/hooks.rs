@@ -668,6 +668,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_checkpoint_at_session_end_doesnt_hide_last_words() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        handle(HookEvent::UserPromptSubmit, input(json!({"prompt": "add refunds"})), ctx(&store, &cfg)).await.unwrap();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+        let stop = json!({"last_assistant_message": "Endpoint done, tests next."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let compact = json!({"trigger": "auto", "compact_summary": "Refund endpoint built."});
+        handle(HookEvent::PostCompact, input(compact), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::SessionEnd, input(json!({"reason": "logout"})), ctx(&store, &cfg)).await.unwrap();
+        let cps = store.checkpoints_latest("p", 5).await.unwrap();
+        assert_eq!(cps[0].source.as_deref(), Some("claude-code (auto)"));
+
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("## Last words from the previous session"), "{md}");
+        assert!(md.contains("> Endpoint done, tests next."), "{md}");
+        assert!(md.contains("> Refund endpoint built."), "{md}");
+    }
+
+    #[tokio::test]
     async fn fallback_checkpoint_includes_last_message() {
         let store = ctx_store().await;
         let cfg = cfg();
