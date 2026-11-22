@@ -559,7 +559,49 @@ memdusa sessions revoke <id>       # revokes that session's whole grant chain
 
 The same data is available at `GET/DELETE /v1/me/sessions[/{id}]` and `GET/DELETE /v1/admin/sessions[/{id}]`.
 
-CLI browser login (`memdusa login … --browser` / `--device`) is H2c and not implemented yet.
+### Sign in from the CLI
+
+On a machine with a browser:
+
+```sh
+memdusa login https://memdusa.example.com --browser
+```
+
+This discovers the authorization server metadata, registers a public client (the `client_id` is cached per server in
+`~/.memdusa/oauth-clients.json`), starts a loopback listener on `127.0.0.1:<random port>`, prints the sign-in URL and
+attempts to open it (`open` / `xdg-open` / `start`). Sign in with an API key and approve the scopes; the authorization
+code comes back to the loopback listener, is exchanged with PKCE S256 + `state`, and the resulting access/refresh tokens
+are saved in `~/.memdusa/config.json` (mode `0600`). Tokens are never printed. If no browser opens, use the printed URL;
+if you don't finish in five minutes the command exits with a clear timeout message (`--device` is the alternative).
+
+On SSH/headless machines (RFC 8628 device authorization grant):
+
+```sh
+memdusa login https://memdusa.example.com --device
+# To sign in, visit:
+#   https://memdusa.example.com/oauth/device?user_code=ABCD-EFGH
+# and enter the code: ABCD-EFGH
+```
+
+The CLI prints the verification URL and short user code, then polls the token endpoint every 5 s, handling
+`authorization_pending`, `slow_down`, `expired_token` and `access_denied`. The code expires after 10 minutes. In the
+browser, the same sign-in + consent pages are used; approvals, denials, token issuance and audit events are recorded.
+
+`--token mdk_…` (API-key login) is unchanged. To check or undo a sign-in:
+
+```sh
+memdusa status      # local/remote, sign-in method (API key or OAuth: user, expires, scopes), reachability, queue
+memdusa logout      # revokes the refresh token at the server (RFC 7009) and deletes local tokens
+```
+
+Access tokens are refreshed transparently by the REST client and the `memdusa mcp` proxy: before expiry (or on a `401`)
+they refresh once, rotation is saved atomically, and a lock file (`~/.memdusa/oauth-refresh.lock`) stops concurrent hook
+processes from racing. If the refresh fails — e.g. the session was revoked with `memdusa sessions revoke` — hooks keep
+the event in the offline spool and exit successfully, and `memdusa status` tells you to run `memdusa login` again. The
+server exposes `POST /oauth/device_authorization`, `GET/POST /oauth/device` and the
+`urn:ietf:params:oauth:grant-type:device_code` grant, advertised in its AS metadata. Device codes and user codes are
+stored hashed; test lifetimes/polling can be shortened with `MEMDUSA_OAUTH_DEVICE_SECS` and
+`MEMDUSA_OAUTH_DEVICE_INTERVAL_SECS`.
 
 ## MCP tools
 

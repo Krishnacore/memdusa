@@ -474,6 +474,29 @@ const MIGRATIONS: &[Migration] = &[
             user_name TEXT,
             created_at BIGINT NOT NULL)",
     ]),
+    // 9: device authorization state (H2c). The v8 table was created but never
+    // used. Rebuild it instead of ADD COLUMN: a database rewound to v3 or
+    // already carrying the new columns must migrate cleanly either way.
+    Migration::Portable(&[
+        "DROP TABLE IF EXISTS oauth_device_codes_v2",
+        "CREATE TABLE oauth_device_codes_v2 (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL UNIQUE,
+            user_code TEXT NOT NULL UNIQUE,
+            client_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT,
+            expires_at BIGINT NOT NULL,
+            interval BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            user_name TEXT,
+            last_polled_at BIGINT,
+            created_at BIGINT NOT NULL)",
+        "INSERT INTO oauth_device_codes_v2 (id, hash, user_code, client_id, scope, resource, expires_at, interval, user_name, created_at) \
+         SELECT id, hash, user_code, client_id, scope, resource, expires_at, interval, user_name, created_at FROM oauth_device_codes",
+        "DROP TABLE oauth_device_codes",
+        "ALTER TABLE oauth_device_codes_v2 RENAME TO oauth_device_codes",
+    ]),
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`

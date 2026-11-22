@@ -34,7 +34,10 @@ pub const REFRESH_SECS: i64 = 30 * 24 * 3600;
 pub const ABSOLUTE_SECS: i64 = 365 * 24 * 3600;
 pub const CODE_SECS: i64 = 600;
 pub const TXN_SECS: i64 = 600;
+pub const DEVICE_SECS: i64 = 600;
+pub const DEVICE_INTERVAL_SECS: i64 = 5;
 
+pub const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 pub const SUPPORTED_SCOPES: &[&str] = &["memdusa", "memdusa:read"];
 const CLIENT_PREFIX: &str = "mdoc_";
 const CSRF_COOKIE: &str = "memdusa_oauth";
@@ -51,6 +54,9 @@ pub struct OAuthConfig {
     pub absolute_secs: i64,
     pub code_secs: i64,
     pub txn_secs: i64,
+    pub device_secs: i64,
+    /// How often a device client may poll the token endpoint (RFC 8628).
+    pub device_interval_secs: i64,
 }
 
 impl OAuthConfig {
@@ -71,6 +77,8 @@ impl OAuthConfig {
             absolute_secs: secs("MEMDUSA_OAUTH_ABSOLUTE_SECS", ABSOLUTE_SECS),
             code_secs: secs("MEMDUSA_OAUTH_CODE_SECS", CODE_SECS),
             txn_secs: secs("MEMDUSA_OAUTH_SIGNIN_SECS", TXN_SECS),
+            device_secs: secs("MEMDUSA_OAUTH_DEVICE_SECS", DEVICE_SECS),
+            device_interval_secs: secs("MEMDUSA_OAUTH_DEVICE_INTERVAL_SECS", DEVICE_INTERVAL_SECS),
         }))
     }
 
@@ -152,6 +160,8 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/signin", post(signin))
         .route("/oauth/consent", post(consent))
+        .route("/oauth/device_authorization", post(device_authorization))
+        .route("/oauth/device", get(device_page).post(device_code_submit))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
 }
@@ -187,8 +197,9 @@ async fn server_metadata(State(s): State<AppState>) -> Response {
         "token_endpoint": c.url("/oauth/token"),
         "registration_endpoint": c.url("/oauth/register"),
         "revocation_endpoint": c.url("/oauth/revoke"),
+        "device_authorization_endpoint": c.url("/oauth/device_authorization"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_GRANT],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "revocation_endpoint_auth_methods_supported": ["none"],
@@ -229,17 +240,19 @@ fn valid_redirect(uri: &str) -> bool {
 }
 
 async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> Response {
-    if b.redirect_uris.is_empty() || !b.redirect_uris.iter().all(|u| valid_redirect(u)) {
+    let grant_types = b.grant_types.unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
+    if grant_types.is_empty()
+        || !grant_types.iter().all(|g| matches!(g.as_str(), "authorization_code" | "refresh_token" | DEVICE_GRANT))
+    {
+        return invalid("unsupported grant_type");
+    }
+    // RFC 8628 clients have no redirect: only they may register without one.
+    let device_only = grant_types.iter().all(|g| g == DEVICE_GRANT);
+    if (b.redirect_uris.is_empty() && !device_only) || !b.redirect_uris.iter().all(|u| valid_redirect(u)) {
         return invalid("redirect_uris must be https URLs or loopback http URLs");
     }
     if b.token_endpoint_auth_method.as_deref().is_some_and(|m| m != "none") {
         return invalid("only public clients (token_endpoint_auth_method=none) are supported");
-    }
-    let grant_types = b.grant_types.unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
-    if grant_types.is_empty()
-        || !grant_types.iter().all(|g| matches!(g.as_str(), "authorization_code" | "refresh_token"))
-    {
-        return invalid("unsupported grant_type");
     }
     if let Some(types) = &b.response_types
         && (types.len() != 1 || types[0] != "code")
@@ -402,6 +415,24 @@ async fn signin(
     };
     let user = identity.user.clone().unwrap_or_default();
     cfg(&s).succeeded(&ip_key);
+    if txn.redirect_uri.is_empty() {
+        // Device flow: remember who signed in, then show the same consent page.
+        if let Err(e) = s.store.oauth_device_set_user(&txn.csrf, &user).await {
+            return internal(&e);
+        }
+        if let Err(e) = s
+            .store
+            .audit(
+                NewAuditEvent::ok(&user, "oauth.device_signin")
+                    .target(&txn.client_id)
+                    .detail(json!({"method": "api_key"})),
+            )
+            .await
+        {
+            tracing::warn!("could not audit device sign-in: {e}");
+        }
+        return Html(consent_html(&user, &client_name, "this device", &txn.scope, &txn.csrf)).into_response();
+    }
     if let Err(e) = s.store.oauth_txn_set_user(&txn.csrf, &user).await {
         return internal(&e);
     }
@@ -428,6 +459,32 @@ async fn consent(State(s): State<AppState>, headers: HeaderMap, Form(f): Form<Co
     };
     let Some(user) = txn.user_name.clone() else { return invalid("sign in first") };
     let clear = cookie_header(&s, "", true, 0);
+    if txn.redirect_uri.is_empty() {
+        let allowed = f.decision == "allow";
+        let status = if allowed { device_status::APPROVED } else { device_status::DENIED };
+        if let Err(e) = s.store.oauth_device_set_status(&txn.csrf, status).await {
+            return internal(&e);
+        }
+        if allowed
+            && let Err(e) = s
+                .store
+                .oauth_grant_find_or_create(&user, &txn.client_id, &txn.scope, txn.resource.as_deref(), "device")
+                .await
+        {
+            return internal(&e);
+        }
+        if let Err(e) = s
+            .store
+            .audit(
+                NewAuditEvent::ok(&user, if allowed { "oauth.device_approved" } else { "oauth.device_denied" })
+                    .target(&txn.client_id),
+            )
+            .await
+        {
+            tracing::warn!("could not audit device consent: {e}");
+        }
+        return ([(header::SET_COOKIE, clear)], Html(device_done_html(allowed))).into_response();
+    }
     if let Err(e) = s.store.oauth_txn_delete(&txn.csrf).await {
         return internal(&e);
     }
@@ -477,6 +534,187 @@ async fn consent(State(s): State<AppState>, headers: HeaderMap, Form(f): Form<Co
         .into_response()
 }
 
+// ----------------------------------------------------------- device flow (H2c)
+
+/// Generate a human-friendly code: 8 characters from an alphabet without
+/// look-alikes, in `XXXX-XXXX` form. Both halves are random.
+fn generate_user_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Still unique enough (storage enforces it); only randomness is degraded.
+        let n = now_ms().unsigned_abs();
+        bytes = std::array::from_fn(|i| (n >> (i * 8)) as u8);
+    }
+    let chars: String = bytes.iter().map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char).collect();
+    format!("{}-{}", &chars[..4], &chars[4..])
+}
+
+/// The device sign-in/consent pages reuse the ordinary ones by presenting the
+/// device request as a transaction with no redirect URI.
+fn device_txn(d: &OAuthDeviceCode) -> OAuthTransaction {
+    OAuthTransaction {
+        csrf: d.id.clone(),
+        client_id: d.client_id.clone(),
+        redirect_uri: String::new(),
+        code_challenge: String::new(),
+        scope: d.scope.clone(),
+        resource: d.resource.clone(),
+        state: String::new(),
+        user_name: d.user_name.clone(),
+        created_at: d.created_at,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationRequest {
+    client_id: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+}
+
+async fn form_or_json<T: serde::de::DeserializeOwned>(req: Request, limit: usize) -> Option<T> {
+    let bytes = to_bytes(req.into_body(), limit).await.ok()?;
+    serde_urlencoded::from_bytes(&bytes).ok().or_else(|| serde_json::from_slice(&bytes).ok())
+}
+
+async fn device_authorization(State(s): State<AppState>, req: Request) -> Response {
+    let Some(b): Option<DeviceAuthorizationRequest> = form_or_json(req, 64 * 1024).await else {
+        return invalid("expected form-encoded or JSON body");
+    };
+    if b.client_id.trim().is_empty() {
+        return invalid("client_id is required");
+    }
+    let client = match s.store.oauth_client_get(&b.client_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return invalid("unknown client_id"),
+        Err(e) => return internal(&e),
+    };
+    if !client.grant_types.iter().any(|g| g == DEVICE_GRANT) {
+        return err(StatusCode::BAD_REQUEST, "unauthorized_client", "client cannot use the device flow");
+    }
+    let scope = b.scope.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "memdusa".into());
+    if !valid_scope(&scope) {
+        return invalid("unsupported scope");
+    }
+    let c = &cfg(&s).config;
+    let device_code = generate_secret(DEVICE_PREFIX).unwrap_or_else(|_| format!("{DEVICE_PREFIX}{}", new_id()));
+    let user_code = generate_user_code();
+    let device = OAuthDeviceCode {
+        id: new_id(),
+        user_code: user_code.clone(),
+        client_id: client.client_id.clone(),
+        scope: scope.clone(),
+        resource: b.resource.filter(|r| !r.is_empty()),
+        expires_at: now_ms() + c.device_secs * 1000,
+        interval: c.device_interval_secs,
+        status: device_status::PENDING.into(),
+        user_name: None,
+        last_polled_at: None,
+        created_at: now_ms(),
+    };
+    if let Err(e) = s.store.oauth_device_create(&device, &device_code).await {
+        return internal(&e);
+    }
+    if let Err(e) = s
+        .store
+        .audit(NewAuditEvent::ok("anonymous", "oauth.device_authorization").target(&client.client_id).detail(json!({
+            "scope": scope, "user_code": user_code
+        })))
+        .await
+    {
+        tracing::warn!("could not audit device authorization: {e}");
+    }
+    Json(json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": c.url("/oauth/device"),
+        "verification_uri_complete": with_params(&c.url("/oauth/device"), &[("user_code", &user_code)]),
+        "expires_in": c.device_secs,
+        "interval": c.device_interval_secs,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicePageQuery {
+    user_code: Option<String>,
+}
+
+async fn device_page(State(s): State<AppState>, Query(q): Query<DevicePageQuery>) -> Response {
+    let csrf = generate_secret("csrf_").unwrap_or_else(|_| format!("csrf_{}", new_id()));
+    let secs = cfg(&s).config.device_secs;
+    let (cookie, html) = match q.user_code.filter(|c| !c.trim().is_empty()) {
+        Some(code) => match s.store.oauth_device_get_by_user_code(&code).await {
+            Ok(Some(d)) if d.status == device_status::PENDING && d.expires_at > now_ms() => {
+                let name =
+                    s.store.oauth_client_get(&d.client_id).await.ok().flatten().map(|c| c.name).unwrap_or_default();
+                (cookie_header(&s, &d.id, false, secs), signin_html(&device_txn(&d), &name, None))
+            }
+            _ => (
+                cookie_header(&s, &csrf, false, secs),
+                device_code_html(&csrf, Some("That code is invalid, already used, or has expired.")),
+            ),
+        },
+        None => (cookie_header(&s, &csrf, false, secs), device_code_html(&csrf, None)),
+    };
+    ([(header::SET_COOKIE, cookie), (header::CACHE_CONTROL, "no-store".to_owned())], Html(html)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeForm {
+    csrf: String,
+    user_code: String,
+}
+
+async fn device_code_submit(State(s): State<AppState>, headers: HeaderMap, Form(f): Form<DeviceCodeForm>) -> Response {
+    if cookie_value(&headers).as_deref() != Some(f.csrf.as_str()) {
+        return invalid("missing or expired device cookie");
+    }
+    match s.store.oauth_device_get_by_user_code(&f.user_code).await {
+        Ok(Some(d)) if d.status == device_status::PENDING && d.expires_at > now_ms() => {
+            let name = s.store.oauth_client_get(&d.client_id).await.ok().flatten().map(|c| c.name).unwrap_or_default();
+            let cookie = cookie_header(&s, &d.id, false, cfg(&s).config.device_secs);
+            (
+                [(header::SET_COOKIE, cookie), (header::CACHE_CONTROL, "no-store".to_owned())],
+                Html(signin_html(&device_txn(&d), &name, None)),
+            )
+                .into_response()
+        }
+        Ok(_) => (StatusCode::BAD_REQUEST, Html(device_code_html(&f.csrf, Some("That code is invalid or expired."))))
+            .into_response(),
+        Err(e) => internal(&e),
+    }
+}
+
+fn device_code_html(csrf: &str, error: Option<&str>) -> String {
+    let error = error.map(|e| format!("<p class=\"err\">{}</p>", esc(e))).unwrap_or_default();
+    html_page(
+        "Sign in · memdusa",
+        format!(
+            "<h1>Sign in to memdusa</h1><p>Enter the code shown on your device.</p>{}\
+             <form method=\"post\" action=\"/oauth/device\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <label for=\"user_code\">Device code</label>\
+             <input id=\"user_code\" name=\"user_code\" autocomplete=\"off\" required>\
+             <button type=\"submit\">Continue</button></form>",
+            error,
+            esc(csrf)
+        ),
+    )
+}
+
+fn device_done_html(approved: bool) -> String {
+    let (title, body) = if approved {
+        ("Device approved", "This device is approved. You can close this window and return to your terminal.")
+    } else {
+        ("Device access denied", "No access was granted. You can close this window.")
+    };
+    html_page("memdusa", format!("<h1>{title}</h1><p>{body}</p>"))
+}
+
 // -------------------------------------------------------------------- token
 
 #[derive(Debug, Deserialize)]
@@ -484,6 +722,8 @@ struct TokenRequest {
     grant_type: String,
     #[serde(default)]
     code: Option<String>,
+    #[serde(default)]
+    device_code: Option<String>,
     #[serde(default)]
     redirect_uri: Option<String>,
     #[serde(default)]
@@ -508,6 +748,7 @@ async fn token(State(s): State<AppState>, req: Request) -> Response {
     match body.grant_type.as_str() {
         "authorization_code" => code_to_token(&s, &body).await,
         "refresh_token" => refresh_to_token(&s, &body).await,
+        g if g == DEVICE_GRANT => device_to_token(&s, &body).await,
         _ => err(StatusCode::BAD_REQUEST, "unsupported_grant_type", "unsupported grant_type"),
     }
 }
@@ -558,6 +799,63 @@ async fn code_to_token(s: &AppState, b: &TokenRequest) -> Response {
         return invalid_grant("grant revoked");
     }
     issue_tokens(s, &grant, None).await
+}
+
+async fn device_to_token(s: &AppState, b: &TokenRequest) -> Response {
+    let (Some(device_code), Some(client_id)) = (b.device_code.as_deref(), b.client_id.as_deref()) else {
+        return invalid("device_code and client_id are required");
+    };
+    let Some(d) = (match s.store.oauth_device_get(device_code).await {
+        Ok(d) => d,
+        Err(e) => return internal(&e),
+    }) else {
+        return invalid_grant("unknown device_code");
+    };
+    if d.client_id != client_id {
+        return invalid_grant("client_id mismatch");
+    }
+    if b.resource.as_deref().is_some() && b.resource != d.resource {
+        return invalid_grant("resource mismatch");
+    }
+    let now = now_ms();
+    if d.expires_at <= now {
+        return err(StatusCode::BAD_REQUEST, "expired_token", "device code expired");
+    }
+    let too_fast = match s.store.oauth_device_poll(&d.id, now, d.interval.max(1) * 1000).await {
+        Ok(v) => v,
+        Err(e) => return internal(&e),
+    };
+    if too_fast {
+        return err(StatusCode::BAD_REQUEST, "slow_down", "poll the token endpoint less often");
+    }
+    match d.status.as_str() {
+        device_status::PENDING | device_status::AUTHENTICATED => {
+            err(StatusCode::BAD_REQUEST, "authorization_pending", "waiting for the user to approve")
+        }
+        device_status::DENIED => err(StatusCode::BAD_REQUEST, "access_denied", "the user denied access"),
+        device_status::APPROVED => {
+            let Some(user) = d.user_name.clone() else { return invalid_grant("device code has no signed-in user") };
+            let grant = match s
+                .store
+                .oauth_grant_find_or_create(&user, &d.client_id, &d.scope, d.resource.as_deref(), "device")
+                .await
+            {
+                Ok(g) => g,
+                Err(e) => return internal(&e),
+            };
+            if let Err(e) = s
+                .store
+                .audit(NewAuditEvent::ok(user, "oauth.device_token").target(&grant.id).detail(json!({
+                    "client_id": d.client_id
+                })))
+                .await
+            {
+                tracing::warn!("could not audit device token issuance: {e}");
+            }
+            issue_tokens(s, &grant, None).await
+        }
+        _ => invalid_grant("unknown device code state"),
+    }
 }
 
 async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
@@ -791,17 +1089,26 @@ fn user_of(id: &Identity) -> Result<&str, Error> {
 
 // ----------------------------------------------------------------- helpers
 
-async fn check_csrf(s: &AppState, headers: &HeaderMap, csrf: &str) -> Option<OAuthTransaction> {
+fn cookie_value(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    let value = cookie.split(';').find_map(|part| {
+    cookie.split(';').find_map(|part| {
         let (k, v) = part.trim().split_once('=')?;
-        (k == CSRF_COOKIE).then_some(v)
-    })?;
-    if value != csrf {
+        (k == CSRF_COOKIE).then(|| v.to_owned())
+    })
+}
+
+async fn check_csrf(s: &AppState, headers: &HeaderMap, csrf: &str) -> Option<OAuthTransaction> {
+    if cookie_value(headers).as_deref() != Some(csrf) {
         return None;
     }
-    let txn = s.store.oauth_txn_get(csrf).await.ok().flatten()?;
-    (now_ms() - txn.created_at <= cfg(s).config.txn_secs * 1000).then_some(txn)
+    if let Some(txn) = s.store.oauth_txn_get(csrf).await.ok().flatten()
+        && now_ms() - txn.created_at <= cfg(s).config.txn_secs * 1000
+    {
+        return Some(txn);
+    }
+    // Device sign-ins have no authorization transaction; their id is the CSRF.
+    let d = s.store.oauth_device_get_by_csrf(csrf).await.ok().flatten()?;
+    (now_ms() - d.created_at <= cfg(s).config.device_secs * 1000 && d.expires_at > now_ms()).then(|| device_txn(&d))
 }
 
 fn cookie_header(s: &AppState, csrf: &str, clear: bool, secs: i64) -> String {
@@ -935,6 +1242,8 @@ mod tests {
             absolute_secs: 365 * 24 * 3600,
             code_secs: 600,
             txn_secs: 600,
+            device_secs: DEVICE_SECS,
+            device_interval_secs: DEVICE_INTERVAL_SECS,
         }
     }
 
@@ -1403,6 +1712,8 @@ mod tests {
             .unwrap();
         assert_eq!(as_doc["code_challenge_methods_supported"], json!(["S256"]));
         assert_eq!(as_doc["token_endpoint_auth_methods_supported"], json!(["none"]));
+        assert!(as_doc["grant_types_supported"].as_array().unwrap().iter().any(|g| g == DEVICE_GRANT));
+        assert_eq!(as_doc["device_authorization_endpoint"], json!("http://127.0.0.1:1/oauth/device_authorization"));
 
         for path in ["/v1/whoami", "/mcp"] {
             let r = client().get(format!("{url}{path}")).send().await.unwrap();
@@ -1538,6 +1849,170 @@ mod tests {
                 assert_eq!(st, 401, "failed sign-in {i}");
             }
         }
+    }
+
+    async fn device_client(url: &str) -> String {
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({
+                "client_name": "Device CLI",
+                "token_endpoint_auth_method": "none",
+                "grant_types": [DEVICE_GRANT],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body: Value = r.json().await.unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        body["client_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn start_device(url: &str, client_id: &str) -> Value {
+        let r = client()
+            .post(format!("{url}/oauth/device_authorization"))
+            .form(&[("client_id", client_id), ("scope", "memdusa")])
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body: Value = r.json().await.unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        assert!(body["interval"].as_i64().is_some_and(|i| i >= 1));
+        body
+    }
+
+    async fn poll_device(url: &str, client_id: &str, device_code: &str) -> (u16, Value) {
+        let r = client()
+            .post(format!("{url}/oauth/token"))
+            .form(&[("grant_type", DEVICE_GRANT), ("client_id", client_id), ("device_code", device_code)])
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or_default())
+    }
+
+    /// Drive the human side through the same sign-in + consent pages a browser sees.
+    async fn approve_device(url: &str, key: &str, user_code: &str, decision: &str) {
+        let r = client().get(format!("{url}/oauth/device")).query(&[("user_code", user_code)]).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let cookie =
+            r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_owned();
+        let html = r.text().await.unwrap();
+        assert!(html.contains("Sign in to memdusa"));
+        let csrf = hidden(&html, "csrf");
+
+        let r = client()
+            .post(format!("{url}/oauth/signin"))
+            .header(header::COOKIE, &cookie)
+            .form(&[("csrf", csrf.as_str()), ("api_key", key)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        let html = r.text().await.unwrap();
+        assert!(html.contains("Authorize") && html.contains("this device"));
+        let csrf = hidden(&html, "csrf");
+
+        let r = client()
+            .post(format!("{url}/oauth/consent"))
+            .header(header::COOKIE, &cookie)
+            .form(&[("csrf", csrf.as_str()), ("decision", decision)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn device_flow_pending_approved_and_token() {
+        let mut fast = config();
+        fast.device_interval_secs = 1;
+        let (url, store) = spawn(fast, DefaultPolicy::Write).await;
+        let key = new_user(&store, "device-user", false).await;
+        let client_id = device_client(&url).await;
+        let d = start_device(&url, &client_id).await;
+        let (code, user_code) = (d["device_code"].as_str().unwrap(), d["user_code"].as_str().unwrap());
+        assert!(code.starts_with(DEVICE_PREFIX) && user_code.contains('-'));
+        assert_eq!(d["verification_uri"], json!("http://127.0.0.1:1/oauth/device"));
+
+        let (st, body) = poll_device(&url, &client_id, code).await;
+        assert_eq!(st, 400);
+        assert_eq!(body["error"], json!("authorization_pending"));
+
+        approve_device(&url, &key, user_code, "allow").await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (st, body) = poll_device(&url, &client_id, code).await;
+        assert_eq!(st, 200, "{body}");
+        let access = body["access_token"].as_str().unwrap();
+        assert!(
+            access.starts_with(ACCESS_PREFIX) && body["refresh_token"].as_str().unwrap().starts_with(REFRESH_PREFIX)
+        );
+        assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(access).send().await.unwrap().status(), 200);
+        let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
+        for action in
+            ["oauth.device_authorization", "oauth.device_signin", "oauth.device_approved", "oauth.device_token"]
+        {
+            assert!(audit.iter().any(|e| e.action == action), "missing audit event {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn device_flow_denied_expired_and_slow_down() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "device-deny", false).await;
+        let client_id = device_client(&url).await;
+        let d = start_device(&url, &client_id).await;
+        let code = d["device_code"].as_str().unwrap().to_owned();
+        approve_device(&url, &key, d["user_code"].as_str().unwrap(), "deny").await;
+        let (_, body) = poll_device(&url, &client_id, &code).await;
+        assert_eq!(body["error"], json!("access_denied"));
+
+        // Polling twice in quick succession is throttled.
+        let d = start_device(&url, &client_id).await;
+        let code = d["device_code"].as_str().unwrap().to_owned();
+        assert_eq!(poll_device(&url, &client_id, &code).await.1["error"], json!("authorization_pending"));
+        assert_eq!(poll_device(&url, &client_id, &code).await.1["error"], json!("slow_down"));
+
+        let mut short = config();
+        short.device_secs = 0;
+        let (url2, store2) = spawn(short, DefaultPolicy::Write).await;
+        let _key2 = new_user(&store2, "device-expired", false).await;
+        let client_id2 = device_client(&url2).await;
+        let d = start_device(&url2, &client_id2).await;
+        let (_, body) = poll_device(&url2, &client_id2, d["device_code"].as_str().unwrap()).await;
+        assert_eq!(body["error"], json!("expired_token"));
+    }
+
+    #[tokio::test]
+    async fn device_flow_over_postgres() {
+        let Ok(url) = std::env::var("MEMDUSA_TEST_POSTGRES_URL") else { return };
+        let dir = std::env::temp_dir().join(format!("memdusa-device-pg-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::connect(&url).await.unwrap();
+        let opts = HttpOptions {
+            addr: String::new(),
+            token: None,
+            allowed_hosts: vec![],
+            auto_prune: None,
+            rate_limit: 0.0,
+            metrics: false,
+            default_access: DefaultPolicy::Write,
+            oauth: Some(config()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::http::app(store.clone(), opts);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let user = format!("dp{}", new_id()).replace('-', "");
+        store.user_create(&user, false).await.unwrap();
+        let key = store.key_create(&user, "signin").await.unwrap().secret;
+        let client_id = device_client(&base).await;
+        let d = start_device(&base, &client_id).await;
+        approve_device(&base, &key, d["user_code"].as_str().unwrap(), "allow").await;
+        let (st, body) = poll_device(&base, &client_id, d["device_code"].as_str().unwrap()).await;
+        assert_eq!(st, 200, "{body}");
     }
 
     #[test]

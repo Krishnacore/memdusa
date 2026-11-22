@@ -17,6 +17,15 @@ use crate::{Error, Result};
 pub const ACCESS_PREFIX: &str = "mdo_";
 pub const REFRESH_PREFIX: &str = "mdr_";
 pub const CODE_PREFIX: &str = "mdc_";
+pub const DEVICE_PREFIX: &str = "mdd_";
+
+/// Lifecycle of a device authorization request. Only `approved` mints tokens.
+pub mod device_status {
+    pub const PENDING: &str = "pending";
+    pub const AUTHENTICATED: &str = "authenticated";
+    pub const APPROVED: &str = "approved";
+    pub const DENIED: &str = "denied";
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthClient {
@@ -66,6 +75,26 @@ pub struct OAuthCode {
     pub grant_id: String,
     pub expires_at: Millis,
     pub used_at: Option<Millis>,
+    pub created_at: Millis,
+}
+
+/// A pending RFC 8628 device authorization. `id` doubles as the CSRF token
+/// for the sign-in/consent pages; both the device code and the short user code
+/// are stored only as hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthDeviceCode {
+    pub id: String,
+    /// The code as shown to the user (e.g. `ABCD-EFGH`); never stored raw.
+    pub user_code: String,
+    pub client_id: String,
+    pub scope: String,
+    pub resource: Option<String>,
+    pub expires_at: Millis,
+    /// Minimum seconds between token polls.
+    pub interval: i64,
+    pub status: String,
+    pub user_name: Option<String>,
+    pub last_polled_at: Option<Millis>,
     pub created_at: Millis,
 }
 
@@ -131,6 +160,11 @@ fn strings(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// User codes are case-insensitive and may be typed with or without the dash.
+fn normalize_user_code(s: &str) -> String {
+    s.trim().to_ascii_uppercase().replace([' ', '-'], "")
+}
+
 fn row_to_client(r: &AnyRow) -> Result<OAuthClient> {
     Ok(OAuthClient {
         id: r.try_get("id")?,
@@ -183,6 +217,23 @@ fn row_to_code(r: &AnyRow) -> Result<OAuthCode> {
         grant_id: r.try_get("grant_id")?,
         expires_at: r.try_get("expires_at")?,
         used_at: r.try_get("used_at")?,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+fn row_to_device(r: &AnyRow) -> Result<OAuthDeviceCode> {
+    Ok(OAuthDeviceCode {
+        id: r.try_get("id")?,
+        // Never returned to callers; only the hash lives in the database.
+        user_code: String::new(),
+        client_id: r.try_get("client_id")?,
+        scope: r.try_get("scope")?,
+        resource: r.try_get("resource")?,
+        expires_at: r.try_get("expires_at")?,
+        interval: r.try_get("interval")?,
+        status: r.try_get("status")?,
+        user_name: r.try_get("user_name")?,
+        last_polled_at: r.try_get("last_polled_at")?,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -312,6 +363,102 @@ impl Store {
         let (t, h) = (q.int(at), q.text(hash_secret(secret)));
         q.push(&format!("{t} WHERE hash = {h} AND used_at IS NULL"));
         Ok(q.build().execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    // ---------------------------------------------------------- device codes
+
+    /// Store a device authorization. Both secrets are hashed; `user_code` is
+    /// kept on the struct for display and for the hash written here.
+    pub async fn oauth_device_create(&self, d: &OAuthDeviceCode, device_secret: &str) -> Result<()> {
+        let mut q = Q::new(
+            "INSERT INTO oauth_device_codes (id, hash, user_code, client_id, scope, resource, expires_at, \
+             interval, status, user_name, last_polled_at, created_at) VALUES (",
+        );
+        let vals = [
+            q.text(&d.id),
+            q.text(hash_secret(device_secret)),
+            q.text(hash_secret(&normalize_user_code(&d.user_code))),
+            q.text(&d.client_id),
+            q.text(&d.scope),
+            q.opt_text(d.resource.clone()),
+            q.int(d.expires_at),
+            q.int(d.interval),
+            q.text(&d.status),
+            q.opt_text(d.user_name.clone()),
+            q.opt_int(d.last_polled_at),
+            q.int(d.created_at),
+        ];
+        q.push(&vals.join(", ")).push(")");
+        q.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Look up by the long device code (token endpoint).
+    pub async fn oauth_device_get(&self, device_secret: &str) -> Result<Option<OAuthDeviceCode>> {
+        let mut q = Q::new("SELECT * FROM oauth_device_codes WHERE hash = ");
+        let h = q.text(hash_secret(device_secret));
+        q.push(&h);
+        q.build().fetch_optional(&self.pool).await?.map(|r| row_to_device(&r)).transpose()
+    }
+
+    /// Look up by the short user code (the human enters it on the device page).
+    pub async fn oauth_device_get_by_user_code(&self, user_code: &str) -> Result<Option<OAuthDeviceCode>> {
+        let mut q = Q::new("SELECT * FROM oauth_device_codes WHERE user_code = ");
+        let h = q.text(hash_secret(&normalize_user_code(user_code)));
+        q.push(&h);
+        q.build().fetch_optional(&self.pool).await?.map(|r| row_to_device(&r)).transpose()
+    }
+
+    /// The device row's id is its sign-in CSRF token.
+    pub async fn oauth_device_get_by_csrf(&self, csrf: &str) -> Result<Option<OAuthDeviceCode>> {
+        let mut q = Q::new("SELECT * FROM oauth_device_codes WHERE id = ");
+        let i = q.text(csrf);
+        q.push(&i);
+        q.build().fetch_optional(&self.pool).await?.map(|r| row_to_device(&r)).transpose()
+    }
+
+    pub async fn oauth_device_set_user(&self, id: &str, user: &str) -> Result<()> {
+        let mut q = Q::new("UPDATE oauth_device_codes SET user_name = ");
+        let u = q.text(user);
+        let s = q.text(device_status::AUTHENTICATED);
+        q.push(&format!("{u}, status = {s} WHERE id = "));
+        let i = q.text(id);
+        q.push(&i);
+        q.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn oauth_device_set_status(&self, id: &str, status: &str) -> Result<()> {
+        let mut q = Q::new("UPDATE oauth_device_codes SET status = ");
+        let s = q.text(status);
+        q.push(&format!("{s} WHERE id = "));
+        let i = q.text(id);
+        q.push(&i);
+        q.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Mark a poll, returning whether this poll was within the interval and
+    /// must be answered with `slow_down`.
+    pub async fn oauth_device_poll(&self, id: &str, at: Millis, interval_ms: i64) -> Result<bool> {
+        let mut q = Q::new("SELECT last_polled_at FROM oauth_device_codes WHERE id = ");
+        let i = q.text(id);
+        q.push(&i);
+        let last: Option<i64> = q
+            .build()
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|r| r.try_get::<Option<i64>, _>("last_polled_at"))
+            .transpose()?
+            .flatten();
+        let too_fast = last.is_some_and(|t| at.saturating_sub(t) < interval_ms);
+        let mut q = Q::new("UPDATE oauth_device_codes SET last_polled_at = ");
+        let t = q.int(at);
+        q.push(&format!("{t} WHERE id = "));
+        let i = q.text(id);
+        q.push(&i);
+        q.build().execute(&self.pool).await?;
+        Ok(too_fast)
     }
 
     // ----------------------------------------------------------------- grants
