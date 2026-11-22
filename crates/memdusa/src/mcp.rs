@@ -329,7 +329,7 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let patch = MemoryPatch { content: a.content, kind: a.kind, tags: a.tags, source: self.agent(&ctx) };
-        json(self.store.memory_update(&a.id, patch).await.map_err(err)?)
+        json(self.store.memory_update_as(&a.id, patch, &identity(&ctx)).await.map_err(err)?)
     }
 
     #[tool(description = "Search memories (project + global) by words, optionally filtered by kind.")]
@@ -349,8 +349,8 @@ impl MemdusaMcp {
     }
 
     #[tool(description = "Delete a memory that is wrong or obsolete.")]
-    async fn memory_forget(&self, Parameters(a): Parameters<IdArg>) -> ToolResult {
-        self.store.memory_forget(&a.id).await.map_err(err)?;
+    async fn memory_forget(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        self.store.memory_forget_as(&a.id, &identity(&ctx)).await.map_err(err)?;
         Ok(format!("forgot {}", a.id))
     }
 

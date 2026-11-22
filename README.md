@@ -278,7 +278,8 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 ### Memory hygiene
 
 - `memory_update` (REST: `PATCH /v1/memories/{id}`) corrects a memory in place: any of `content`, `kind`, `tags`.
-  Redaction applies and the search index follows.
+  Redaction applies and the search index follows. On a multi-user server, a global memory can only be updated or
+  forgotten by its owner or an admin (403 otherwise); project memories stay editable by any user.
 - Saving a near-duplicate merges instead of adding: a memory of the same kind and scope (project, or your globals)
   whose significant words overlap by at least 75% (Jaccard; short words and stopwords ignored, "auth" ~
   "authentication") is updated with the newer text and merged tags. The result says so (`merged: true` in REST/JSON).

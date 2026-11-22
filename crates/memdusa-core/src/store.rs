@@ -547,14 +547,40 @@ impl Store {
         Ok(())
     }
 
-    /// Correct or refine a memory in place. Only the fields set in `patch` change;
-    /// content and tags are redacted like on save.
-    pub async fn memory_update(&self, id: &str, patch: MemoryPatch) -> Result<Memory> {
+    async fn memory_get(&self, id: &str) -> Result<Memory> {
         let mut q = Q::new(&format!("SELECT {MEMORY_COLS} FROM memories WHERE id = "));
         let id_p = q.text(id);
         q.push(&id_p);
         let row = q.build().fetch_optional(&self.pool).await?.ok_or_else(|| Error::NotFound(format!("memory {id}")))?;
-        let mut mem = Self::row_to_memory(&row)?;
+        Self::row_to_memory(&row)
+    }
+
+    /// A global memory may only be changed by its owner or an admin; project memories by anyone.
+    /// The root identity (no user, admin) is an admin.
+    fn memory_check(mem: &Memory, actor: &Identity) -> Result<()> {
+        let allowed = actor.admin || mem.project.is_some() || (actor.user.is_some() && mem.user == actor.user);
+        if allowed {
+            Ok(())
+        } else {
+            Err(Error::Forbidden("global memories can only be changed by their owner".into()))
+        }
+    }
+
+    async fn memory_authorize(&self, id: &str, actor: &Identity) -> Result<()> {
+        Self::memory_check(&self.memory_get(id).await?, actor)
+    }
+
+    /// Correct or refine a memory in place, with full access (local use).
+    pub async fn memory_update(&self, id: &str, patch: MemoryPatch) -> Result<Memory> {
+        self.memory_update_as(id, patch, &Identity::root()).await
+    }
+
+    /// Correct or refine a memory in place on behalf of `actor`. Only the fields set in
+    /// `patch` change; content and tags are redacted like on save. A global memory can
+    /// only be changed by its owner or an admin (else [`Error::Forbidden`]).
+    pub async fn memory_update_as(&self, id: &str, patch: MemoryPatch, actor: &Identity) -> Result<Memory> {
+        let mut mem = self.memory_get(id).await?;
+        Self::memory_check(&mem, actor)?;
 
         if let Some(c) = patch.content {
             let c = self.redactor.string(c.trim().to_owned());
@@ -649,7 +675,14 @@ impl Store {
         rows.iter().map(|r| Ok((Self::row_to_memory(r)?, r.try_get::<f64, _>("score")?))).collect()
     }
 
+    /// Delete a memory, with full access (local use).
     pub async fn memory_forget(&self, id: &str) -> Result<()> {
+        self.memory_forget_as(id, &Identity::root()).await
+    }
+
+    /// Delete a memory on behalf of `actor`; see [`Store::memory_update_as`] for who may.
+    pub async fn memory_forget_as(&self, id: &str, actor: &Identity) -> Result<()> {
+        self.memory_authorize(id, actor).await?;
         let mut q = Q::new("DELETE FROM memories WHERE id = ");
         let id_p = q.text(id);
         q.push(&id_p);

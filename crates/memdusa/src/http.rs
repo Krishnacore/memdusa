@@ -563,7 +563,7 @@ async fn memory_update(
     Json(mut p): Json<MemoryPatch>,
 ) -> ApiResult<Memory> {
     p.source = attribute(&id, None);
-    Ok(Json(s.store.memory_update(&mid, p).await?))
+    Ok(Json(s.store.memory_update_as(&mid, p, &id).await?))
 }
 
 async fn memory_search(
@@ -575,8 +575,12 @@ async fn memory_search(
     Ok(Json(s.store.memory_search(q).await?))
 }
 
-async fn memory_forget(State(s): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
-    s.store.memory_forget(&id).await?;
+async fn memory_forget(
+    State(s): State<AppState>,
+    Extension(who): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    s.store.memory_forget_as(&id, &who).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -844,6 +848,51 @@ mod tests {
         assert_eq!(st, 404);
         let (st, _) = call(M::PATCH, &u(&format!("/v1/memories/{id}")), None, Some(json!({"content": "  "}))).await;
         assert_eq!(st, 400);
+    }
+
+    #[tokio::test]
+    async fn global_memories_can_only_be_changed_by_owner_or_admin() {
+        use reqwest::Method as M;
+        let (url, store) = spawn(Some("shared")).await;
+        let u = |p: &str| format!("{url}{p}");
+        let mut keys = std::collections::HashMap::new();
+        for (name, admin) in [("alice", false), ("bob", false), ("carol", true)] {
+            store.user_create(name, admin).await.unwrap();
+            keys.insert(name, store.key_create(name, "k").await.unwrap().secret);
+        }
+        let save = |who: &'static str, content: &'static str, project: Option<&'static str>| {
+            let (u, k) = (u("/v1/memories"), keys[who].clone());
+            async move { call(M::POST, &u, Some(&k), Some(json!({"content": content, "project": project}))).await.1 }
+        };
+        let patch = |who: &str, id: &str| {
+            let (url, key) = (u(&format!("/v1/memories/{id}")), keys[who].clone());
+            async move { call(M::PATCH, &url, Some(&key), Some(json!({"content": "edited"}))).await }
+        };
+        let forget = |who: &str, id: &str| {
+            let (url, key) = (u(&format!("/v1/memories/{id}")), keys[who].clone());
+            async move { call(M::DELETE, &url, Some(&key), None).await }
+        };
+
+        let g = save("alice", "alice's private preference", None).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(patch("bob", &g).await.0, 403, "bob can't update alice's global");
+        assert_eq!(forget("bob", &g).await.0, 403, "bob can't forget alice's global");
+        assert_eq!(patch("alice", &g).await.0, 200, "owner can update");
+        assert_eq!(patch("carol", &g).await.0, 200, "admin can update");
+        assert_eq!(patch("bob", "missing").await.0, 404);
+        assert_eq!(forget("bob", &g).await.0, 403, "still there after the failed attempts");
+        assert_eq!(forget("alice", &g).await.0, 204, "owner can forget");
+        let g2 = save("alice", "another global", None).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(forget("carol", &g2).await.0, 204, "admin can forget");
+
+        // project memories stay editable by any authenticated user
+        let p = save("alice", "API uses JWT", Some("shop")).await["id"].as_str().unwrap().to_owned();
+        assert_eq!(patch("bob", &p).await.0, 200);
+        assert_eq!(forget("bob", &p).await.0, 204);
+
+        // the shared token (root) keeps full access
+        let g3 = save("alice", "third global", None).await["id"].as_str().unwrap().to_owned();
+        let (st, _) = call(M::DELETE, &u(&format!("/v1/memories/{g3}")), Some("shared"), None).await;
+        assert_eq!(st, 204);
     }
 
     #[tokio::test]
