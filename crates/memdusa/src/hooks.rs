@@ -18,7 +18,7 @@ use std::path::Path;
 
 use memdusa_core::brief::{self, AGENT_MESSAGE, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, MEMORY_RECALL, STOP_GUARD};
 use memdusa_core::model::*;
-use memdusa_core::store::words;
+use memdusa_core::store::{significant_words, words};
 use memdusa_core::{Result, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -460,15 +460,13 @@ const RECALL_TERMS: usize = 16;
 /// Longest memory shown, in characters.
 const RECALL_MEMORY_CHARS: usize = 500;
 
-/// Words too common to say anything about what a prompt is about.
-const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was", "one", "our", "out",
-    "has", "him", "his", "how", "its", "may", "new", "now", "old", "see", "two", "way", "who", "did", "get", "got",
-    "let", "put", "say", "she", "too", "use", "that", "with", "have", "this", "will", "your", "from", "they", "been",
-    "were", "what", "when", "where", "which", "while", "would", "could", "should", "there", "their", "about", "into",
-    "than", "then", "them", "these", "those", "some", "such", "only", "also", "just", "like", "make", "does", "dont",
-    "want", "need", "please", "thanks", "thank", "here", "more", "most", "very", "much", "each", "other", "over",
-    "after", "before", "again", "still", "work", "code", "file", "files",
+/// Prompt jargon that is too generic to recall on, on top of the shared language filter in
+/// [`significant_words`]. Applying the core filter first means every term counted toward `need`
+/// is also a term the full-text query keeps — the two filters agree by construction.
+const RECALL_STOPWORDS: &[&str] = &[
+    "her", "one", "out", "him", "his", "may", "new", "now", "old", "see", "two", "way", "get", "got", "put", "say",
+    "she", "too", "use", "been", "while", "these", "those", "such", "only", "like", "make", "dont", "thanks", "thank",
+    "much", "each", "other", "over", "after", "before", "again", "still", "work", "code", "file", "files",
 ];
 
 /// Memories relevant to the user's prompt, as `additionalContext`. Needs a
@@ -476,9 +474,9 @@ const STOPWORDS: &[&str] = &[
 /// matches well enough or everything relevant was shown before.
 async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
     let Some(session) = &ctx.session else { return Ok(None) };
-    let terms: Vec<String> = words(prompt)
+    let terms: Vec<String> = significant_words(prompt)
         .into_iter()
-        .filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str()))
+        .filter(|w| !RECALL_STOPWORDS.contains(&w.as_str()))
         .take(RECALL_TERMS)
         .collect();
     if terms.is_empty() {
