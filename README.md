@@ -249,6 +249,19 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 `resume`, `memory_save`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`, `run_step`,
 `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
 
+### MCP resources and prompts
+
+For clients that surface resources and prompts better than tool calls, the brief is also exposed as:
+
+- Resources (Markdown): `memdusa://brief` (the same text `resume` returns, for the default project),
+  `memdusa://memories` (project and visible global memories, grouped by kind), and the template
+  `memdusa://brief/{project}` for an explicit, URL-encoded project key (`memdusa://brief/github.com%2Facme%2Fshop`).
+  Unknown URIs return an MCP "resource not found" error.
+- Prompts: `resume` (optional `project` argument; the brief plus "continue from this brief") and `checkpoint`
+  (asks the agent to save a checkpoint and `memory_save` its decisions). Many clients show these as slash commands.
+
+The stdio→HTTP proxy forwards resources and prompts to the remote server, like tools.
+
 ### Durable run protocol
 
 ```
@@ -321,6 +334,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
 - [x] Handoff eval with real agents (`eval/`)
 - [x] Git hooks (commits, branch switches) as events
+- [x] MCP resources and prompts (brief, memories, /resume)
 - [ ] Transcript import (Claude Code, Codex, pi, OpenCode sessions)
 - [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories

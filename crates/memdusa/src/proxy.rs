@@ -14,10 +14,11 @@ use std::collections::HashMap;
 use anyhow::Context;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse,
+    Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
 };
-use rmcp::service::{RequestContext, RunningService};
+use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData as McpError, RoleClient, RoleServer, ServerHandler, ServiceExt};
@@ -32,10 +33,20 @@ struct Proxy {
     project: Option<String>,
 }
 
+/// Upstream protocol errors (e.g. resource not found) pass through unchanged;
+/// transport failures become a readable error.
+fn upstream_err(e: ServiceError) -> McpError {
+    match e {
+        ServiceError::McpError(e) => e,
+        e => McpError::internal_error(format!("memdusa server unreachable: {e}"), None),
+    }
+}
+
 impl ServerHandler for Proxy {
     fn get_info(&self) -> ServerConfig {
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("memdusa", env!("CARGO_PKG_VERSION")));
+        let info =
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().enable_prompts().build())
+                .with_server_info(Implementation::new("memdusa", env!("CARGO_PKG_VERSION")));
         match &self.instructions {
             Some(i) => info.with_instructions(i.clone()),
             None => info,
@@ -51,6 +62,46 @@ impl ServerHandler for Proxy {
             .list_tools(request)
             .await
             .map_err(|e| McpError::internal_error(format!("memdusa server unreachable: {e}"), None))
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        self.upstream.list_resources(request).await.map_err(upstream_err)
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        self.upstream.list_resource_templates(request).await.map_err(upstream_err)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        self.upstream.read_resource(request).await.map(Into::into).map_err(upstream_err)
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        self.upstream.list_prompts(request).await.map_err(upstream_err)
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        self.upstream.get_prompt(request).await.map(Into::into).map_err(upstream_err)
     }
 
     async fn call_tool(
