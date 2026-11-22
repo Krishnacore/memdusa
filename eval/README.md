@@ -48,12 +48,30 @@ transcript, the brief B would see (`brief-after-a.md`), and both B repos for ins
 One trial is an anecdote: agents are nondeterministic, and *when* A is interrupted matters a lot. Compare conditions
 over 5+ trials, and compare changes to memdusa (brief format, hooks) against the same settings.
 
+### Scenarios
+
+| Scenario | What it tests |
+|---|---|
+| `refunds` | The baseline scenario: A is interrupted mid-task while implementing partial refunds. Its default `a_mode` is `interrupt`. |
+| `audit-trail` | A finishes only part 1 (the event queue) and stops; B must add the audit trail. The decisions about part 2 live only in A's last message, and a project convention lives only in a seeded memory. Its `a_mode` is `complete`. |
+
 ### Adding a scenario
 
 `scenarios/<name>/` with:
 - `repo/`: the starting project
-- `scenario.json`: `task_prompt` (state constraints that leave no trace in the code until they're implemented: that's
-  what memory has to carry), `resume_prompt`, and `checks` (`hidden_tests`, `forbidden_patterns`, `unchanged_files`)
+- `scenario.json`: `name`, `task_prompt` (state constraints that leave no trace in the code until they're implemented:
+  that's what memory has to carry), `resume_prompt`, and `checks` (`hidden_tests`, `forbidden_patterns`,
+  `unchanged_files`), plus these optional fields:
+  - `a_mode`: `"interrupt"` (default) stops A mid-task after `--interrupt-after-edits` edits (the timer is a safety
+    limit); `"complete"` lets A run until it ends its turn naturally so the Stop hook records A's
+    `last_assistant_message` for the brief. In both modes `--interrupt-after` is the safety timeout. The mode and
+    whether A ended naturally are recorded in `results.json` and `report.md`.
+  - `seed_memories`: a list of `{"content": "...", "kind": "...", "scope": "project"}` objects written with
+    `memdusa remember` into the trial's database **before A runs**. They are project-scoped by default; use
+    `"scope": "global"` for a global memory. They live only in the database (not the repo), so they appear in B's
+    `brief-after-a.md` for the `memdusa` condition and are invisible to the `baseline` condition. `kind` is passed
+    through to `memdusa remember --kind` (`fact`, `preference`, `decision`, `todo`, `note`; unknown values such as
+    `convention` are stored as `fact`). This is how a convention stated in an earlier session is seeded.
 - `hidden_test.py`: acceptance tests run against B's final repo (with the repo on `PYTHONPATH`)
 
 Check the fixture first: its own tests pass and the hidden tests fail.
