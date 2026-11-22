@@ -69,7 +69,13 @@ your other hooks, and backs the file up to `settings.json.memdusa-backup` first:
 | `UserPromptSubmit` | Journals what you asked for (turn off with `MEMDUSA_NO_PROMPTS=1`) |
 | `PostToolUse` (`Edit\|MultiEdit\|Write\|NotebookEdit\|Bash`) | Journals changed files and shell commands |
 | `Stop` | If files changed and the last checkpoint is >15 min old, asks Claude once to save a `checkpoint` before finishing (`MEMDUSA_STOP_GUARD_MINS`, 0 = off) |
-| `PreCompact`, `SessionEnd` | Fallback: if files changed but no checkpoint was saved, writes an automatic one (last request, changed files, previous plan carried forward) |
+| `PreCompact`, `SessionEnd` | Fallback: if files changed but no checkpoint was saved, writes an automatic one (last request, changed files, previous plan carried forward, the agent's last message) |
+| `PostCompact` | Records the compaction summary Claude Code generated (`compact_summary`, up to 4000 chars) |
+
+`Stop` also records the agent's **last words** (`last_assistant_message`, up to 1500 chars, skipped if identical to the
+session's previous one) as an `agent_message` event. Gemini (`AfterAgent`) and Hermes (`pre_verify`) supply it too.
+The resume brief shows the latest message and compaction summary under "Last words from the previous session", but
+only when they are newer than the latest checkpoint.
 
 Hooks never break a session. Any error is logged to stderr, the hook exits 0, and it gives up well inside Claude
 Code's timeout. A hook takes about 15 ms. In remote mode they call the server instead (see below).
@@ -89,7 +95,7 @@ in that tool's dialect. Remote mode, the offline queue, redaction and code state
 
 | Harness | How memdusa plugs in | Brief at start | Prompts | Edits / commands | Checkpoint reminder | Fallback checkpoint |
 |---|---|---|---|---|---|---|
-| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, SessionEnd |
+| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, PostCompact (summary), SessionEnd |
 | Codex CLI | `~/.codex/hooks.json` + `config.toml` | ✓ (also after compaction) | ✓ | ✓ (patch → files) | Stop | PreCompact, SessionEnd |
 | Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
 | Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | (no such hooks) |
@@ -350,7 +356,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 
 - [x] Claude Code hooks: auto-resume, journaling, checkpoint guard, fallback checkpoints
 - [x] Remote mode: `memdusa login`, hooks over REST, stdio→HTTP MCP proxy
-- [ ] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
+- [x] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
 - [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
 - [x] Handoff eval with real agents (`eval/`)
 - [x] Git hooks (commits, branch switches) as events

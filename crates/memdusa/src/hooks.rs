@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use memdusa_core::brief::{self, COMMAND, FILE_CHANGE, STOP_GUARD};
+use memdusa_core::brief::{self, AGENT_MESSAGE, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, STOP_GUARD};
 use memdusa_core::model::*;
 use memdusa_core::{Result, Store};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub enum HookEvent {
     PostToolUse,
     Stop,
     PreCompact,
+    /// Claude Code: after compaction, with the summary the harness generated.
+    PostCompact,
     SessionEnd,
     /// Commits, branch switches and merges, collected by `memdusa git-hook`.
     Git,
@@ -43,6 +45,7 @@ impl HookEvent {
             Self::PostToolUse => "post-tool-use",
             Self::Stop => "stop",
             Self::PreCompact => "pre-compact",
+            Self::PostCompact => "post-compact",
             Self::SessionEnd => "session-end",
             Self::Git => "git",
         }
@@ -52,7 +55,7 @@ impl HookEvent {
     /// explicit timeout raises that budget.
     pub fn timeout_secs(self) -> u64 {
         match self {
-            Self::SessionStart | Self::SessionEnd | Self::PreCompact => 10,
+            Self::SessionStart | Self::SessionEnd | Self::PreCompact | Self::PostCompact => 10,
             Self::Git => 3,
             _ => 5,
         }
@@ -87,7 +90,13 @@ pub struct HookInput {
     /// Stop: true when Claude is already continuing because of a Stop hook.
     #[serde(default)]
     pub stop_hook_active: Option<bool>,
-    /// PreCompact: manual | auto
+    /// Stop: the agent's final message of the turn (Claude Code, Codex; adapters normalize others).
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// PostCompact: the summary the harness generated.
+    #[serde(default)]
+    pub compact_summary: Option<String>,
+    /// PreCompact / PostCompact: manual | auto
     #[serde(default)]
     pub trigger: Option<String>,
     /// SessionEnd
@@ -153,7 +162,15 @@ impl HookEvent {
     /// unreachable now. SessionStart and Stop produce output that is only
     /// useful in the moment, so they aren't queued.
     pub fn queueable(self) -> bool {
-        matches!(self, Self::UserPromptSubmit | Self::PostToolUse | Self::PreCompact | Self::SessionEnd | Self::Git)
+        matches!(
+            self,
+            Self::UserPromptSubmit
+                | Self::PostToolUse
+                | Self::PreCompact
+                | Self::PostCompact
+                | Self::SessionEnd
+                | Self::Git
+        )
     }
 }
 
@@ -197,6 +214,11 @@ pub async fn handle_request(
 
 /// How much of a user's request is kept verbatim.
 const MAX_PROMPT_CHARS: usize = 4_000;
+/// The agent's last message and a compaction summary, as stored.
+const MAX_MESSAGE_CHARS: usize = 1_500;
+const MAX_SUMMARY_CHARS: usize = 4_000;
+/// How much of the last message goes into a fallback checkpoint's notes.
+const MAX_NOTE_MESSAGE_CHARS: usize = 800;
 
 /// Claude Code caps `additionalContext` at 10,000 chars (beyond that it only
 /// shows a preview); keep the brief plus wrapper safely under it.
@@ -234,7 +256,19 @@ pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<
             post_tool_use(&ctx, input.tool_name.as_deref().unwrap_or_default(), input.tool_input.as_ref()).await?;
             Ok(None)
         }
-        HookEvent::Stop => stop(&ctx, input.stop_hook_active.unwrap_or(false)).await,
+        HookEvent::Stop => {
+            if let Some(m) = input.last_assistant_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                record_agent_message(&ctx, m).await?;
+            }
+            stop(&ctx, input.stop_hook_active.unwrap_or(false)).await
+        }
+        HookEvent::PostCompact => {
+            if let Some(s) = input.compact_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let trigger = input.trigger.as_deref().unwrap_or("auto");
+                log(&ctx, COMPACT_SUMMARY, truncate(s, MAX_SUMMARY_CHARS), Some(json!({ "trigger": trigger }))).await?;
+            }
+            Ok(None)
+        }
         HookEvent::PreCompact => {
             let trigger = input.trigger.as_deref().unwrap_or("auto");
             auto_checkpoint(&ctx, &format!("context compaction ({trigger})")).await?;
@@ -329,6 +363,18 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
     Ok(())
 }
 
+/// Journal the agent's last words, unless they repeat the session's previous message.
+async fn record_agent_message(ctx: &Ctx<'_>, message: &str) -> Result<()> {
+    let content = truncate(message, MAX_MESSAGE_CHARS);
+    if let Some(session) = &ctx.session {
+        let recent = ctx.store.events_recent(&ctx.project, Some(session), 300).await?;
+        if recent.iter().find(|e| e.kind == AGENT_MESSAGE).is_some_and(|e| e.content == content) {
+            return Ok(());
+        }
+    }
+    log(ctx, AGENT_MESSAGE, content, None).await
+}
+
 async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>> {
     let (Some(session), mins) = (&ctx.session, ctx.cfg.stop_guard_mins) else { return Ok(None) };
     if already_continuing || mins <= 0 {
@@ -410,6 +456,12 @@ async fn auto_checkpoint(ctx: &Ctx<'_>, why: &str) -> Result<()> {
             quote(first),
             quote(last)
         )),
+    }
+    if let Some(m) = events.iter().find(|e| e.kind == AGENT_MESSAGE) {
+        notes.push_str(&format!(
+            "\n\nThe agent's last message:\n\n{}",
+            quote(&truncate(&m.content, MAX_NOTE_MESSAGE_CHARS))
+        ));
     }
     ctx.store
         .checkpoint_save(NewCheckpoint {
@@ -526,6 +578,90 @@ mod tests {
             assert!(ctx_text.contains(needle), "missing {needle}:\n{ctx_text}");
         }
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    }
+
+    #[tokio::test]
+    async fn stop_records_last_message_once_and_guard_still_fires() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+
+        let stop = json!({"last_assistant_message": "  Done with the endpoint; next: partial refunds.  "});
+        let out = handle(HookEvent::Stop, input(stop.clone()), ctx(&store, &cfg)).await.unwrap();
+        assert!(out.is_some(), "guard fires regardless of the message");
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 1, "identical repeated stop doesn't duplicate");
+        assert_eq!(msgs[0].content, "Done with the endpoint; next: partial refunds.");
+
+        let next = json!({"last_assistant_message": "x".repeat(2000)});
+        handle(HookEvent::Stop, input(next), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content.chars().count(), MAX_MESSAGE_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn post_compact_records_summary() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        assert!(HookEvent::PostCompact.queueable());
+        assert!(!HookEvent::PostCompact.needs_git());
+        assert_eq!(HookEvent::PostCompact.timeout_secs(), 10);
+        assert_eq!(HookEvent::PostCompact.arg(), "post-compact");
+        let payload = json!({"trigger": "manual", "compact_summary": "We built refunds."});
+        let out = handle(HookEvent::PostCompact, input(payload), ctx(&store, &cfg)).await.unwrap();
+        assert!(out.is_none());
+        let events = store.events_recent("p", None, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind.as_str(), events[0].content.as_str()), (COMPACT_SUMMARY, "We built refunds."));
+    }
+
+    #[tokio::test]
+    async fn brief_shows_last_words_and_hides_them_from_events() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let stop = json!({"last_assistant_message": "Endpoint done, tests next."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let payload = json!({"compact_summary": "S".repeat(2000)});
+        handle(HookEvent::PostCompact, input(payload), ctx(&store, &cfg)).await.unwrap();
+
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("## Last words from the previous session"), "{md}");
+        assert!(md.contains("> Endpoint done, tests next."), "{md}");
+        assert!(md.contains(&format!("{}…", "S".repeat(1500))) && !md.contains(&"S".repeat(1501)), "{md}");
+        assert!(!md.contains("agent_message") && !md.contains("compact_summary"), "hidden from Events:\n{md}");
+
+        // a checkpoint newer than the message makes it redundant
+        let mut c = ctx(&store, &cfg);
+        c.at = now_ms() + 10_000;
+        store
+            .checkpoint_save(NewCheckpoint {
+                project: "p".into(),
+                goal: "refunds".into(),
+                created_at: Some(c.at),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let md = brief::build(&store, "p", None, None).await.unwrap().markdown;
+        assert!(md.contains("Where things stand") && !md.contains("Last words"), "{md}");
+    }
+
+    #[tokio::test]
+    async fn fallback_checkpoint_includes_last_message() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/repo/a.rs"}});
+        handle(HookEvent::PostToolUse, input(edit), ctx(&store, &cfg)).await.unwrap();
+        let stop = json!({"last_assistant_message": "Left off at the refund validation."});
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::SessionEnd, input(json!({})), ctx(&store, &cfg)).await.unwrap();
+        let notes = store.checkpoints_latest("p", 1).await.unwrap()[0].notes.clone().unwrap();
+        assert!(notes.contains("The agent's last message:\n\n> Left off at the refund validation."), "{notes}");
     }
 
     #[tokio::test]

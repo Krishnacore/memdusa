@@ -9,10 +9,14 @@ use crate::store::Store;
 
 /// Event kinds written automatically by harness hooks.
 pub const FILE_CHANGE: &str = "file_change";
+pub const AGENT_MESSAGE: &str = "agent_message";
+pub const COMPACT_SUMMARY: &str = "compact_summary";
 pub const COMMAND: &str = "command";
 pub const STOP_GUARD: &str = "stop_guard";
 /// Bookkeeping events that would only be noise in the brief.
-const HIDDEN: &[&str] = &[STOP_GUARD];
+const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY];
+/// How much of a compaction summary the brief quotes.
+const SUMMARY_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Brief {
@@ -144,6 +148,32 @@ fn render(
             if let Some(n) = &c.notes {
                 let _ = writeln!(o, "**Notes:** {n}");
             }
+        }
+        o.push('\n');
+    }
+
+    // A fresh checkpoint already says where things stand: only show what came after it.
+    let since = checkpoints.first().map_or(0, |c| c.created_at);
+    let latest =
+        |kind: &str| events.iter().filter(|e| e.kind == kind && e.created_at > since).max_by_key(|e| e.created_at);
+    let (message, summary) = (latest(AGENT_MESSAGE), latest(COMPACT_SUMMARY));
+    if message.is_some() || summary.is_some() {
+        let _ = writeln!(o, "## Last words from the previous session");
+        let quote = |t: &str| t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+        if let Some(m) = message {
+            let by = m.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
+            let _ = writeln!(o, "\n_last message{by}, {}_\n\n{}", ago(m.created_at), quote(&m.content));
+        }
+        if let Some(s) = summary {
+            let text = if s.content.chars().count() > SUMMARY_CHARS {
+                let mut t: String = s.content.chars().take(SUMMARY_CHARS).collect();
+                t.push('…');
+                t
+            } else {
+                s.content.clone()
+            };
+            let by = s.source.as_deref().map(|s| format!(" by {s}")).unwrap_or_default();
+            let _ = writeln!(o, "\n_compaction summary{by}, {}_\n\n{}", ago(s.created_at), quote(&text));
         }
         o.push('\n');
     }

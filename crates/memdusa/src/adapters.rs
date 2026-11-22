@@ -72,6 +72,7 @@ impl Harness {
                 hook("PostToolUse", PostToolUse, Some(crate::hooks::JOURNALED_TOOLS), 5),
                 hook("Stop", Stop, None, 5),
                 hook("PreCompact", PreCompact, None, 10),
+                hook("PostCompact", PostCompact, None, 10),
                 hook("SessionEnd", SessionEnd, None, 10),
             ],
             // SessionStart re-fires with source "compact" after compaction: the brief is re-injected.
@@ -228,11 +229,19 @@ impl Harness {
                     HookEvent::SessionEnd => {
                         o.insert("reason".into(), extra.get("reason").cloned().unwrap_or(json!("other")));
                     }
+                    HookEvent::Stop => {
+                        if let Some(m) = extra.get("assistant_response").filter(|m| m.is_string()) {
+                            o.insert("last_assistant_message".into(), m.clone());
+                        }
+                    }
                     _ => {}
                 }
             }
             Self::OpenCode | Self::Pi => {} // their plugins already send canonical payloads
             Self::Gemini => {
+                if event == HookEvent::Stop {
+                    rename(&mut o, "prompt_response", "last_assistant_message");
+                }
                 if event == HookEvent::PostToolUse {
                     let canonical = match o.get("tool_name").and_then(Value::as_str) {
                         Some("write_file" | "replace") => Some("Edit"),
@@ -389,6 +398,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["tool_name"], "Bash");
+    }
+
+    #[test]
+    fn gemini_and_hermes_last_message() {
+        let v = Harness::Gemini
+            .normalize(HookEvent::Stop, json!({"session_id": "g", "prompt": "q", "prompt_response": "All done."}))
+            .unwrap();
+        assert_eq!(v["last_assistant_message"], "All done.");
+        let v = Harness::Hermes
+            .normalize(HookEvent::Stop, json!({"session_id": "h", "extra": {"assistant_response": "Fixed it."}}))
+            .unwrap();
+        assert_eq!(v["last_assistant_message"], "Fixed it.");
+        let v = Harness::Hermes.normalize(HookEvent::Stop, json!({"session_id": "h", "extra": {}})).unwrap();
+        assert!(v.get("last_assistant_message").is_none());
+    }
+
+    #[test]
+    fn claude_code_registers_post_compact_but_codex_does_not() {
+        let has =
+            |h: Harness| h.events().iter().any(|e| e.native == "PostCompact" && e.event == HookEvent::PostCompact);
+        assert!(has(Harness::ClaudeCode));
+        assert!(!has(Harness::Codex));
     }
 
     #[test]
