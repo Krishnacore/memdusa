@@ -225,7 +225,7 @@ impl Store {
                     for s in rw.steps {
                         let mut q = Q::new(
                             "INSERT INTO steps (run_id, step_key, seq, status, input, output, error, attempts, started_at, \
-                             completed_at) VALUES (",
+                             completed_at, owner, lease_until) VALUES (",
                         );
                         let vals = [
                             q.text(&s.run_id),
@@ -238,6 +238,8 @@ impl Store {
                             q.int(s.attempts),
                             q.int(s.started_at),
                             s.completed_at.map_or("NULL".into(), |t| q.int(t)),
+                            q.opt_text(s.owner),
+                            s.lease_until.map_or("NULL".into(), |t| q.int(t)),
                         ];
                         q.push(&vals.join(", ")).push(") ON CONFLICT DO NOTHING");
                         rep.steps += q.build().execute(&mut *tx).await?.rows_affected() as usize;

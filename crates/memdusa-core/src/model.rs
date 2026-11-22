@@ -393,6 +393,8 @@ impl RunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
+    /// Created by a coordinator (`run_delegate`), not started by anyone yet.
+    Pending,
     Running,
     Completed,
     Failed,
@@ -401,6 +403,7 @@ pub enum StepStatus {
 impl StepStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -408,11 +411,33 @@ impl StepStatus {
     }
     pub fn parse(s: &str) -> Self {
         match s {
+            "pending" => Self::Pending,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             _ => Self::Running,
         }
     }
+}
+
+/// Marker in a run's `input` that tells delegated runs (steps are tasks with their own leases) from
+/// single-agent durable runs (one lease on the whole run).
+pub const DELEGATED_MARKER: &str = "memdusa_delegated";
+
+/// Whether a run's stored `input` marks it as created by `run_delegate`.
+pub fn is_delegated_input(input: Option<&Value>) -> bool {
+    input.and_then(|i| i.get(DELEGATED_MARKER)).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// `MEMDUSA_RUN=<run> MEMDUSA_TASK=<task>`: what launches a worker on one task of a delegated run.
+pub fn worker_env_line(run_id: &str, task: &str) -> String {
+    let quote = |s: &str| {
+        if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')) {
+            s.to_owned()
+        } else {
+            format!("'{}'", s.replace('\'', r"'\''"))
+        }
+    };
+    format!("MEMDUSA_RUN={} MEMDUSA_TASK={}", quote(run_id), quote(task))
 }
 
 /// A durable, resumable unit of multi-step work. Steps are journaled so that
@@ -450,6 +475,35 @@ pub struct Step {
     pub attempts: i64,
     pub started_at: Millis,
     pub completed_at: Option<Millis>,
+    /// Worker holding the step's lease (delegated runs). Kept after completion as "done by".
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// When the worker's lease expires; cleared when the step completes or fails.
+    #[serde(default)]
+    pub lease_until: Option<Millis>,
+    /// True when the step is `running` under a lease that expired: its worker is gone and anyone may claim it.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// Outcome of a worker claiming its step of a delegated run.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ClaimResult {
+    /// The step is now running under the caller's lease.
+    Claimed {
+        attempt: i64,
+        /// The previous holder, when the caller took the step over from it.
+        previous_owner: Option<String>,
+        /// The previous holder's lease had expired (it crashed or was rate limited), as opposed to a forced takeover.
+        stale: bool,
+        /// Why the previous attempt failed, if it did.
+        previous_error: Option<String>,
+    },
+    /// The step already completed: do NOT redo it.
+    AlreadyDone { output: Option<Value> },
+    /// Another worker holds a live lease on the step.
+    HeldBy { owner: String, lease_until: Millis },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

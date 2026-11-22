@@ -667,6 +667,9 @@ async fn v3_database_migrates_to_v4_and_backfills() {
         "DROP TRIGGER memories_fts_ad",
         "DROP TRIGGER memories_fts_au",
         "DROP TABLE memories_fts",
+        // v5 columns, so the migrations from v3 on all run again
+        "ALTER TABLE steps DROP COLUMN owner",
+        "ALTER TABLE steps DROP COLUMN lease_until",
         "UPDATE memdusa_meta SET value = '3' WHERE key = 'schema_version'",
         "INSERT INTO memories (id, project, kind, content, tags, created_at, updated_at) \
          VALUES ('legacy-1', 'PROJECT', 'note', 'legacy cache invalidation notes', '[\"perf\"]', 1, 1)",
@@ -677,7 +680,13 @@ async fn v3_database_migrates_to_v4_and_backfills() {
     raw.close().await;
 
     let s = Store::connect(&url).await.unwrap();
-    assert_eq!(s.migrate().await.unwrap(), 4);
+    assert_eq!(s.migrate().await.unwrap(), 5);
+    // v5: steps can be delegated and leased
+    let run = s.run_delegate(&p, "after migration", vec!["t".into()], None).await.unwrap();
+    assert!(matches!(
+        s.step_claim(&run.run.id, "t", "w", 60, false).await.unwrap(),
+        ClaimResult::Claimed { attempt: 1, .. }
+    ));
     let found = s.memory_search(query(&p, "cache")).await.unwrap();
     assert_eq!(found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["legacy-1"], "backfilled");
     assert_eq!(s.memory_search(query(&p, "ledger")).await.unwrap().len(), 1);
@@ -900,5 +909,215 @@ async fn brief_without_focus_lists_recent_memories() {
         assert!(mine[0].content.starts_with("filler27"), "{name}");
         assert!(mine[29].content.starts_with("Zebra migration"), "{name}");
         assert!(!b.markdown.contains("more memories not shown"), "{name}");
+    }
+}
+
+// ---------------------------------------------------------------- delegated runs
+
+fn tasks(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+fn step<'a>(run: &'a RunWithSteps, key: &str) -> &'a Step {
+    run.steps.iter().find(|s| s.key == key).unwrap_or_else(|| panic!("no step {key}"))
+}
+
+#[tokio::test]
+async fn delegate_creates_pending_steps_and_reuse_adds_missing_tasks() {
+    for (name, s) in stores().await {
+        let p = project();
+        let run = s.run_delegate(&p, "release", tasks(&["install", " docs ", "install", ""]), None).await.unwrap();
+        assert_eq!(run.run.status, RunStatus::Running, "{name}");
+        assert_eq!(run.steps.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), vec!["install", "docs"], "{name}");
+        assert!(run.steps.iter().all(|s| s.status == StepStatus::Pending && s.owner.is_none()), "{name}");
+        assert!(run.steps.iter().all(|s| s.lease_until.is_none() && !s.stale && s.attempts == 0), "{name}");
+        assert_eq!(run.steps.iter().map(|s| s.seq).collect::<Vec<_>>(), vec![1, 2], "{name}");
+        assert!(!run.run.stale, "{name}: a delegated run has no run-level lease to expire");
+
+        // same name while running: the same run, with the missing task added; existing steps untouched
+        s.step_claim(&run.run.id, "install", "w1", 600, false).await.unwrap();
+        let again = s.run_delegate(&p, "release", tasks(&["docs", "tests"]), None).await.unwrap();
+        assert_eq!(again.run.id, run.run.id, "{name}");
+        assert_eq!(again.steps.len(), 3, "{name}");
+        assert_eq!(step(&again, "tests").status, StepStatus::Pending, "{name}");
+        assert_eq!(step(&again, "install").status, StepStatus::Running, "{name}");
+
+        // an idempotency key finds the run whatever its name
+        let keyed = s.run_delegate(&p, "first", tasks(&["a"]), Some(format!("key-{p}"))).await.unwrap();
+        let keyed2 = s.run_delegate(&p, "renamed", tasks(&["a", "b"]), Some(format!("key-{p}"))).await.unwrap();
+        assert_eq!((keyed2.run.id.clone(), keyed2.steps.len()), (keyed.run.id.clone(), 2), "{name}");
+
+        // a finished run isn't reused by name
+        s.run_finish(&run.run.id, RunOutcome::Completed, None, None).await.unwrap();
+        let fresh = s.run_delegate(&p, "release", tasks(&["install"]), None).await.unwrap();
+        assert_ne!(fresh.run.id, run.run.id, "{name}");
+
+        assert!(matches!(s.run_delegate(&p, "empty", tasks(&[" "]), None).await, Err(Error::Invalid(_))), "{name}");
+        // delegated runs don't show up as a run to take over
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(b.active_runs.is_empty(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn claim_hold_force_stale_takeover_and_done() {
+    for (name, s) in stores().await {
+        let p = project();
+        let run = s.run_delegate(&p, "release", tasks(&["a", "b"]), None).await.unwrap();
+        let id = &run.run.id;
+
+        // pending → running under our lease
+        match s.step_claim(id, "a", "w1", 600, false).await.unwrap() {
+            ClaimResult::Claimed { attempt: 1, previous_owner: None, stale: false, previous_error: None } => {}
+            c => panic!("{name}: {c:?}"),
+        }
+        let st = step(&s.run_get(id).await.unwrap(), "a").clone();
+        assert_eq!((st.status, st.owner.as_deref(), st.attempts), (StepStatus::Running, Some("w1"), 1), "{name}");
+        assert!(st.lease_until.unwrap() > now_ms() && !st.stale, "{name}");
+
+        // renewing our own claim isn't a new attempt
+        match s.step_claim(id, "a", "w1", 600, false).await.unwrap() {
+            ClaimResult::Claimed { attempt: 1, previous_owner: None, .. } => {}
+            c => panic!("{name}: {c:?}"),
+        }
+
+        // a second worker sees the live lease
+        match s.step_claim(id, "a", "w2", 600, false).await.unwrap() {
+            ClaimResult::HeldBy { owner, lease_until } => {
+                assert_eq!(owner, "w1", "{name}");
+                assert!(lease_until > now_ms(), "{name}");
+            }
+            c => panic!("{name}: {c:?}"),
+        }
+        assert_eq!(step(&s.run_get(id).await.unwrap(), "a").owner.as_deref(), Some("w1"), "{name}: unchanged");
+
+        // force takes it anyway
+        match s.step_claim(id, "a", "w2", 600, true).await.unwrap() {
+            ClaimResult::Claimed { attempt: 2, previous_owner: Some(p), stale: false, .. } => assert_eq!(p, "w1"),
+            c => panic!("{name}: {c:?}"),
+        }
+        assert!(matches!(s.step_claim(id, "a", "w1", 600, false).await.unwrap(), ClaimResult::HeldBy { .. }), "{name}");
+
+        // an expired lease makes the step stale, and a replacement takes over
+        s.step_claim(id, "b", "w1", 0, false).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let stale = step(&s.run_get(id).await.unwrap(), "b").clone();
+        assert!(stale.stale && stale.status == StepStatus::Running, "{name}");
+        assert!(!step(&s.run_get(id).await.unwrap(), "a").stale, "{name}");
+        match s.step_claim(id, "b", "w3", 600, false).await.unwrap() {
+            ClaimResult::Claimed { attempt: 2, previous_owner: Some(p), stale: true, .. } => assert_eq!(p, "w1"),
+            c => panic!("{name}: {c:?}"),
+        }
+        let st = step(&s.run_get(id).await.unwrap(), "b").clone();
+        assert_eq!((st.owner.as_deref(), st.stale), (Some("w3"), false), "{name}");
+
+        // completed: never redone; the recorded output comes back
+        s.step_complete(id, "a", Some(json!("installers built"))).await.unwrap();
+        for who in ["w2", "w4"] {
+            for force in [false, true] {
+                match s.step_claim(id, "a", who, 600, force).await.unwrap() {
+                    ClaimResult::AlreadyDone { output } => {
+                        assert_eq!(output, Some(json!("installers built")), "{name}")
+                    }
+                    c => panic!("{name}: {c:?}"),
+                }
+            }
+        }
+        let done = step(&s.run_get(id).await.unwrap(), "a").clone();
+        assert_eq!(
+            (done.status, done.owner.as_deref(), done.lease_until),
+            (StepStatus::Completed, Some("w2"), None),
+            "{name}"
+        );
+
+        assert!(matches!(s.step_claim(id, "nope", "w1", 60, false).await, Err(Error::NotFound(_))), "{name}");
+        s.run_finish(id, RunOutcome::Cancelled, None, None).await.unwrap();
+        assert!(matches!(s.step_claim(id, "b", "w5", 60, false).await, Err(Error::Conflict(_))), "{name}");
+        assert!(
+            matches!(s.step_claim(id, "a", "w5", 60, false).await.unwrap(), ClaimResult::AlreadyDone { .. }),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn heartbeat_extends_only_for_the_owner_and_complete_or_fail_clear_the_lease() {
+    for (name, s) in stores().await {
+        let p = project();
+        let run = s.run_delegate(&p, "release", tasks(&["a", "b"]), None).await.unwrap();
+        let id = &run.run.id;
+
+        // nothing to renew before a claim; strangers can't renew
+        assert!(!s.step_heartbeat(id, "a", "w1", 600).await.unwrap(), "{name}: pending");
+        s.step_claim(id, "a", "w1", 10, false).await.unwrap();
+        let before = step(&s.run_get(id).await.unwrap(), "a").lease_until.unwrap();
+        assert!(!s.step_heartbeat(id, "a", "w2", 3600).await.unwrap(), "{name}: not the owner");
+        assert_eq!(step(&s.run_get(id).await.unwrap(), "a").lease_until.unwrap(), before, "{name}");
+        assert!(s.step_heartbeat(id, "a", "w1", 3600).await.unwrap(), "{name}");
+        assert!(step(&s.run_get(id).await.unwrap(), "a").lease_until.unwrap() > before + 3_000_000, "{name}");
+
+        // a taken-over worker's heartbeat no longer counts
+        s.step_claim(id, "a", "w2", 600, true).await.unwrap();
+        assert!(!s.step_heartbeat(id, "a", "w1", 3600).await.unwrap(), "{name}");
+
+        // complete and fail release the lease (the owner stays as "done by")
+        s.step_complete(id, "a", None).await.unwrap();
+        let a = step(&s.run_get(id).await.unwrap(), "a").clone();
+        assert_eq!((a.status, a.lease_until, a.stale), (StepStatus::Completed, None, false), "{name}");
+        assert!(!s.step_heartbeat(id, "a", "w2", 600).await.unwrap(), "{name}: finished");
+
+        s.step_claim(id, "b", "w1", 600, false).await.unwrap();
+        s.step_fail(id, "b", "no network").await.unwrap();
+        let b = step(&s.run_get(id).await.unwrap(), "b").clone();
+        assert_eq!(
+            (b.status, b.lease_until, b.error.as_deref()),
+            (StepStatus::Failed, None, Some("no network")),
+            "{name}"
+        );
+
+        // a failed task can be claimed again; the notice carries why the last attempt failed
+        match s.step_claim(id, "b", "w2", 600, false).await.unwrap() {
+            ClaimResult::Claimed { attempt: 2, previous_owner: None, previous_error: Some(e), .. } => {
+                assert_eq!(e, "no network", "{name}")
+            }
+            c => panic!("{name}: {c:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn coordinator_brief_shows_each_tasks_step_status() {
+    for (name, s) in stores().await {
+        let p = project();
+        let run = s.run_delegate(&p, "windows release", tasks(&["a", "b", "c", "d", "e"]), None).await.unwrap();
+        let id = &run.run.id;
+        s.step_claim(id, "a", "w-live", 600, false).await.unwrap();
+        s.step_claim(id, "b", "w-gone", 0, false).await.unwrap();
+        s.step_claim(id, "c", "w3", 600, false).await.unwrap();
+        s.step_complete(id, "c", Some(json!("built the installers"))).await.unwrap();
+        s.step_claim(id, "d", "w4", 600, false).await.unwrap();
+        s.step_fail(id, "d", "no signing key").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let md = brief::build(&s, &p, None, None, None).await.unwrap().markdown;
+        assert!(md.contains("## Delegated work"), "{name}\n{md}");
+        assert!(md.contains("- **a**: running by w-live"), "{name}\n{md}");
+        assert!(md.contains("- **b**: stale (owner w-gone, lease expired "), "{name}\n{md}");
+        assert!(md.contains("- **c**: done\n  - result: built the installers"), "{name}\n{md}");
+        assert!(md.contains("- **d**: failed: no signing key"), "{name}\n{md}");
+        assert!(md.contains("- **e**: pending"), "{name}\n{md}");
+        assert!(!md.contains("### windows release"), "{name}: a single run gets no sub-heading\n{md}");
+        assert!(!md.contains("Unfinished durable runs"), "{name}\n{md}");
+
+        // a second run: grouped under the run names
+        s.run_delegate(&p, "docs sprint", tasks(&["x"]), None).await.unwrap();
+        let md = brief::build(&s, &p, None, None, None).await.unwrap().markdown;
+        assert!(md.contains("### docs sprint\n- **x**: pending"), "{name}\n{md}");
+        assert!(md.contains("### windows release\n- **a**: running by w-live"), "{name}\n{md}");
+        assert!(md.find("### docs sprint").unwrap() < md.find("### windows release").unwrap(), "{name}\n{md}");
+
+        // a worker's own brief has no coordinator section
+        let w = brief::build(&s, &p, None, None, Some("a")).await.unwrap();
+        assert!(w.delegated.is_empty() && !w.markdown.contains("Delegated work"), "{name}");
     }
 }

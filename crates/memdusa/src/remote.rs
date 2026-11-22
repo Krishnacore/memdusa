@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-use memdusa_core::model::{ApiKey, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, User};
+use memdusa_core::model::{
+    ApiKey, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, RunWithSteps, Step, User,
+};
 use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -109,6 +111,38 @@ impl Client {
         Ok(self.send(self.request(Method::GET, "/v1/resume").query(&q)).await?)
     }
 
+    /// Delegate `tasks` as one durable run (a pending step per task).
+    pub async fn delegate(
+        &self,
+        project: &str,
+        name: &str,
+        tasks: &[String],
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<RunWithSteps> {
+        let body = json!({ "project": project, "name": name, "tasks": tasks, "idempotency_key": idempotency_key });
+        Ok(self.send(self.request(Method::POST, "/v1/delegate").json(&body)).await?)
+    }
+
+    /// A worker marks its task done (`error: None`) or failed.
+    pub async fn task_finish(
+        &self,
+        run: &str,
+        task: &str,
+        outcome: Result<Option<Value>, String>,
+    ) -> anyhow::Result<Step> {
+        let base = format!("/v1/runs/{}/steps/{}", path_segment(run), path_segment(task));
+        Ok(match outcome {
+            Ok(output) => {
+                let body = json!({ "output": output });
+                self.send(self.request(Method::POST, &format!("{base}/complete")).json(&body)).await?
+            }
+            Err(error) => {
+                let body = json!({ "error": error });
+                self.send(self.request(Method::POST, &format!("{base}/fail")).json(&body)).await?
+            }
+        })
+    }
+
     pub async fn memory_save(&self, m: &NewMemory) -> anyhow::Result<Memory> {
         Ok(self.send(self.request(Method::POST, "/v1/memories").json(m)).await?)
     }
@@ -190,6 +224,16 @@ impl Client {
         let path = if admin { format!("/v1/admin/keys/{key}") } else { format!("/v1/me/keys/{key}") };
         Ok(self.send(self.request(Method::DELETE, &path)).await?)
     }
+}
+
+/// A value as one URL path segment (everything but unreserved characters percent-encoded).
+fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// `MemoryQuery` as URL query parameters (enums as their snake_case names).

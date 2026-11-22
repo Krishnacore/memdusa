@@ -28,7 +28,9 @@ Use `global: true` for things that apply to every project.
 4. For multi-step work with side effects (migrations, deploys, batch edits) use a durable run: \
 `run_start`, then for each step call `run_step`. If it says `replay`, the step already happened: use the recorded \
 output and do NOT redo it. If it says `execute`, do the work, then call `run_step_complete` (or `run_step_fail`). \
-Finish with `run_finish`. A run whose owner disappeared shows as STALE in `resume`; take it over with `run_claim`.";
+Finish with `run_finish`. A run whose owner disappeared shows as STALE in `resume`; take it over with `run_claim`.
+5. To split work between agents, call `delegate` with the task names and launch each worker with the env line it \
+returns. A worker finishes with `task_complete` (or `task_fail`); `resume` shows every task's status.";
 
 #[derive(Clone)]
 pub struct Defaults {
@@ -41,6 +43,8 @@ pub struct Defaults {
     /// `MEMDUSA_TASK` (stdio): this agent is a worker on that delegated task. Over HTTP the
     /// `memdusa mcp` proxy sends it as the `task` argument instead.
     pub task: Option<String>,
+    /// `MEMDUSA_RUN` (stdio): the delegated run `task` is a step of.
+    pub run: Option<String>,
 }
 
 #[derive(Clone)]
@@ -228,6 +232,42 @@ pub struct RunClaimArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct DelegateArgs {
+    /// Name of the piece of work being split up, e.g. "windows release".
+    pub name: String,
+    /// One short, stable name per task (e.g. "install-scripts"): it becomes the worker's `MEMDUSA_TASK`.
+    pub tasks: Vec<String>,
+    /// Calling again with the same key (or, without one, the same name) reuses the run and adds missing tasks.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskCompleteArgs {
+    /// What was done and where to find it (short): shown to the coordinator and to anyone who starts this task again.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Defaults to the `MEMDUSA_RUN` this worker was launched with.
+    #[serde(default)]
+    pub run: Option<String>,
+    /// Defaults to the `MEMDUSA_TASK` this worker was launched with.
+    #[serde(default)]
+    pub task: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskFailArgs {
+    /// Why the task can't be finished.
+    pub reason: String,
+    #[serde(default)]
+    pub run: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct RunListArgs {
     /// running | completed | failed | cancelled
     #[serde(default)]
@@ -272,6 +312,16 @@ impl MemdusaMcp {
     /// The explicit task, else the one this worker was launched with. Blank counts as none.
     fn task(&self, explicit: Option<String>) -> Option<String> {
         explicit.or_else(|| self.defaults.task.clone()).map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+    }
+
+    /// The (run, task) a worker's `task_complete` / `task_fail` is about: explicit, else the launch environment.
+    fn run_task(&self, run: Option<String>, task: Option<String>) -> Result<(String, String), String> {
+        let run = run.or_else(|| self.defaults.run.clone()).map(|r| r.trim().to_owned()).filter(|r| !r.is_empty());
+        match (run, self.task(task)) {
+            (Some(r), Some(t)) => Ok((r, t)),
+            _ => Err("no delegated task: this agent wasn't launched with MEMDUSA_RUN and MEMDUSA_TASK; pass `run` and `task`"
+                .into()),
+        }
     }
 }
 
@@ -454,6 +504,34 @@ impl MemdusaMcp {
     )]
     async fn run_claim(&self, Parameters(a): Parameters<RunClaimArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         json(self.store.run_claim(&a.run_id, &self.agent_name(&ctx), None, a.force).await.map_err(err)?)
+    }
+
+    #[tool(
+        description = "Coordinator: split work into tasks for other agents (any harness). Creates one durable run with a pending step per task and returns, per task, the env line (MEMDUSA_RUN=... MEMDUSA_TASK=...) to launch its worker with. Workers claim their task with a lease; a crashed worker's task goes stale and a replacement takes it over; finished tasks are never redone. `resume` shows each task's status."
+    )]
+    async fn delegate(&self, Parameters(a): Parameters<DelegateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        let project = self.project(&ctx, a.project)?;
+        let run = self.store.run_delegate(&project, &a.name, a.tasks, a.idempotency_key).await.map_err(err)?;
+        Ok(brief::delegate_report(&run))
+    }
+
+    #[tool(
+        description = "Worker: mark your delegated task (MEMDUSA_RUN / MEMDUSA_TASK) as done, with a short summary of what was done and where. Do this once, when the task is finished."
+    )]
+    async fn task_complete(&self, Parameters(a): Parameters<TaskCompleteArgs>) -> ToolResult {
+        let (run, task) = self.run_task(a.run, a.task)?;
+        let output = a.summary.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).map(Value::String);
+        self.store.step_complete(&run, &task, output).await.map_err(err)?;
+        Ok(format!("task {task} marked done"))
+    }
+
+    #[tool(
+        description = "Worker: give up on your delegated task (MEMDUSA_RUN / MEMDUSA_TASK) with the reason. A replacement worker can claim it again."
+    )]
+    async fn task_fail(&self, Parameters(a): Parameters<TaskFailArgs>) -> ToolResult {
+        let (run, task) = self.run_task(a.run, a.task)?;
+        self.store.step_fail(&run, &task, &a.reason).await.map_err(err)?;
+        Ok(format!("task {task} marked failed"))
     }
 
     #[tool(description = "Get a durable run with its full step journal.")]
@@ -666,6 +744,7 @@ mod tests {
                 agent: "test".into(),
                 cwd: None,
                 task: task.map(String::from),
+                run: None,
             },
         );
         let (a, b) = tokio::io::duplex(65536);

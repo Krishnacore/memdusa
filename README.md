@@ -167,6 +167,43 @@ MEMDUSA_TASK=install-scripts MEMDUSA_PARENT=lead-session claude   # or opencode,
   latest checkpoint goal and next steps, and the worker's last message. Workers' checkpoints and messages are kept out
   of the coordinator's own "Where things stand" and "Last words".
 
+### Delegating through a durable run
+
+`MEMDUSA_TASK` alone only records who works on what. To also stop two workers doing the same task, and to take over
+from a worker that died, delegate through a durable run: each task is a step with its own lease.
+
+```sh
+memdusa delegate "windows release" install-scripts docs     # or the `delegate` MCP tool
+# Delegated run `0198…` (windows release): 2 task(s).
+# - MEMDUSA_RUN=0198… MEMDUSA_TASK=install-scripts
+# - MEMDUSA_RUN=0198… MEMDUSA_TASK=docs
+```
+
+The coordinator launches each worker (any harness) with its env line. Delegating again with the same name (or
+`--key`) while the run is running reuses it and adds the missing tasks.
+
+- **Claim at session start.** With `MEMDUSA_RUN` and `MEMDUSA_TASK` set, the worker's SessionStart hook claims its step
+  (owner: agent name and session id) with a 15 minute lease, and the brief opens with a notice: *claimed* (and, when it
+  took over, *the previous attempt by X went stale*), *already done* (with the recorded result: stop, or confirm with
+  the user) or *held by another live worker* (coordinate, don't duplicate). Restarting a worker with `/clear` or after
+  compaction re-claims its own step.
+- **Every other hook event renews the lease** (prompts, tool use, stop), so a working agent never goes stale.
+  `SessionEnd` does not finish the task: the lease just expires, which is what a worker that stopped mid-task should look
+  like.
+- **Finishing is explicit:** the `task_complete` MCP tool or `memdusa task done --summary "..."`; `task_fail` /
+  `memdusa task fail <reason>` gives the task up (a replacement can claim it and is told why it failed). Run and task
+  default to `MEMDUSA_RUN`/`MEMDUSA_TASK` (the `memdusa mcp` proxy passes them over a hosted server). A finished task is
+  never redone: a worker started on it is told so.
+- **Stale takeover.** A `running` step whose lease expired is *stale*; a replacement launched with the same env line, in
+  any harness, claims it. A live lease is never taken silently.
+- **The coordinator's "Delegated work" shows each task's step status** instead of the session-based guess:
+  `pending`, `running by X`, `stale (owner X, lease expired 12m ago)`, `done` (with the result) or `failed: reason`. With
+  several runs, tasks are grouped under the run's name. Tasks delegated by `MEMDUSA_TASK` alone keep the earlier
+  behaviour. Close the run with `run_finish` when the work is over.
+
+`MEMDUSA_STEP_LEASE_SECS` overrides the lease length (default 900, read where the claim happens: on the server when
+hosted); it exists for tests and tuning.
+
 ## Importing past sessions
 
 Work done before memdusa was installed, or in a tool without hooks, can still reach memdusa:
@@ -456,7 +493,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
     coordinator's checkpoint, and a worker's replacement resumes exactly that task
   - worktree/branch awareness: workers in different worktrees share the project key, but code-state warnings and
     "files changed" should be per worktree/branch, not mixed
-  - durable runs as the coordination primitive: the coordinator creates a run whose steps are the delegated tasks;
+  - [x] durable runs as the coordination primitive: the coordinator creates a run whose steps are the delegated tasks;
     workers claim steps with leases, so a crashed or rate-limited worker's step is visibly stale and can be
     claimed by another harness, and finished steps are never redone
   - attribution in the brief: which agent (and harness) did what, across the whole team

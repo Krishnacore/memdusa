@@ -71,7 +71,19 @@ pub struct DelegatedWork {
     pub checkpoint: Option<Checkpoint>,
     /// The last thing any worker of this task said (truncated).
     pub last_message: Option<String>,
+    /// The delegated run this task is a step of (`run_delegate`); `None` for tasks delegated by env alone.
+    pub run_id: Option<String>,
+    pub run_name: Option<String>,
+    /// The task's step: its status (`pending`, running by someone, stale, done, failed) replaces the
+    /// session-based `active` guess.
+    pub step: Option<Step>,
 }
+
+/// Most delegated runs, and steps per run, the coordinator's brief lists.
+const DELEGATED_MAX_RUNS: usize = 5;
+const DELEGATED_MAX_STEPS: usize = 20;
+/// How much of a finished task's result the coordinator's brief quotes.
+const DELEGATED_OUTPUT_CHARS: usize = 300;
 
 fn event_str<'a>(e: &'a Event, key: &str) -> Option<&'a str> {
     e.data.as_ref()?.get(key)?.as_str()
@@ -99,9 +111,18 @@ pub async fn delegated_task_names(store: &Store, project: &str) -> Result<HashSe
 /// The coordinator's view: recent delegated tasks (newest first) with status, checkpoint and last words.
 async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Result<Vec<DelegatedWork>> {
     let since = now_ms() - DELEGATED_WINDOW_MS;
+    let mut runs = vec![];
+    for run in store.run_list(Some(project), None, 50).await? {
+        if runs.len() >= DELEGATED_MAX_RUNS {
+            break;
+        }
+        if is_delegated_input(run.input.as_ref()) && run.updated_at >= since {
+            runs.push(store.run_get(&run.id).await?);
+        }
+    }
     let recent: Vec<&Event> =
         starts.iter().filter(|e| e.created_at >= since && event_str(e, "task").is_some()).collect();
-    if recent.is_empty() {
+    if recent.is_empty() && runs.is_empty() {
         return Ok(vec![]);
     }
     let ended: HashSet<String> = store
@@ -111,17 +132,42 @@ async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Resul
         .filter_map(|e| e.session)
         .collect();
     let messages = store.events_recent_kind(project, None, AGENT_MESSAGE, 500).await?;
+    let last_message = |task: &str| {
+        let sessions = task_sessions(starts, Some(task));
+        messages
+            .iter()
+            .find(|m| m.session.as_deref().is_some_and(|s| sessions.contains(s)))
+            .map(|m| truncate(&m.content, DELEGATED_MESSAGE_CHARS))
+    };
+
     let mut out: Vec<DelegatedWork> = vec![];
+    // Tasks of delegated runs: their step says where they stand, even before any worker started.
+    for rw in runs {
+        for step in rw.steps.into_iter().take(DELEGATED_MAX_STEPS) {
+            let latest = starts.iter().find(|e| event_str(e, "task") == Some(step.key.as_str()));
+            out.push(DelegatedWork {
+                task: step.key.clone(),
+                parent: latest.and_then(|e| event_str(e, "parent")).map(String::from),
+                harness: latest.and_then(|e| event_str(e, "harness").or(e.source.as_deref())).map(String::from),
+                active: step.status == StepStatus::Running && !step.stale,
+                started_at: step.started_at,
+                checkpoint: store.checkpoints_for_task(project, &step.key, 1).await?.into_iter().next(),
+                last_message: last_message(&step.key),
+                run_id: Some(rw.run.id.clone()),
+                run_name: Some(rw.run.name.clone()),
+                step: Some(step),
+            });
+        }
+    }
+    let in_runs = out.len();
     for e in recent {
         let task = event_str(e, "task").unwrap_or_default();
         if out.iter().any(|d| d.task == task) {
             continue;
         }
-        if out.len() >= DELEGATED_MAX {
+        if out.len() - in_runs >= DELEGATED_MAX {
             break;
         }
-        let sessions = task_sessions(starts, Some(task));
-        let last = messages.iter().find(|m| m.session.as_deref().is_some_and(|s| sessions.contains(s)));
         out.push(DelegatedWork {
             task: task.to_owned(),
             parent: event_str(e, "parent").map(String::from),
@@ -129,7 +175,10 @@ async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Resul
             active: e.session.as_deref().is_none_or(|s| !ended.contains(s)),
             started_at: e.created_at,
             checkpoint: store.checkpoints_for_task(project, task, 1).await?.into_iter().next(),
-            last_message: last.map(|m| truncate(&m.content, DELEGATED_MESSAGE_CHARS)),
+            last_message: last_message(task),
+            run_id: None,
+            run_name: None,
+            step: None,
         });
     }
     Ok(out)
@@ -216,7 +265,10 @@ pub async fn build_with_budget(
     };
     let mut active_runs = vec![];
     for run in store.run_list(Some(project), Some(RunStatus::Running), 10).await? {
-        active_runs.push(store.run_get(&run.id).await?);
+        // delegated runs are the coordinator's "Delegated work", not a run to take over
+        if !is_delegated_input(run.input.as_ref()) {
+            active_runs.push(store.run_get(&run.id).await?);
+        }
     }
     let mut recent_events = store.events_recent(project, None, 100).await?;
     if let Some(t) = task {
@@ -344,6 +396,93 @@ fn ago(ts: Millis) -> String {
         60..3600 => format!("{}m ago", s / 60),
         3600..86400 => format!("{}h ago", s / 3600),
         _ => format!("{}d ago", s / 86400),
+    }
+}
+
+/// What `delegate` tells the coordinator: the run and, per task, the environment to launch its worker with.
+pub fn delegate_report(rw: &RunWithSteps) -> String {
+    let mut o = format!("Delegated run `{}` ({}): {} task(s).\n", rw.run.id, rw.run.name, rw.steps.len());
+    let _ = writeln!(
+        o,
+        "Launch one worker per task with its environment (any harness; `MEMDUSA_PARENT=<you>` is optional):\n"
+    );
+    for s in &rw.steps {
+        let state = match s.status {
+            StepStatus::Pending => String::new(),
+            _ => format!("   # {}", step_status(s)),
+        };
+        let _ = writeln!(o, "- {}{state}", worker_env_line(&rw.run.id, &s.key));
+    }
+    let _ = writeln!(
+        o,
+        "\nA worker claims its task when its session starts and renews the lease while it works; a crashed or \
+         rate-limited worker's task turns stale and a replacement launched with the same line takes it over. Workers \
+         finish with `task_complete`. `resume` shows every task's status."
+    );
+    o
+}
+
+/// The notice at the top of a worker's SessionStart brief about its claim on its step of a delegated run.
+pub fn claim_notice(task: &str, claim: &ClaimResult) -> String {
+    match claim {
+        ClaimResult::Claimed { previous_owner, stale, previous_error, .. } => {
+            let mut s = format!("**You claimed the delegated task `{task}`.** ");
+            match (previous_owner, stale) {
+                (Some(p), true) => s.push_str(&format!(
+                    "The previous attempt by {p} went stale (its lease expired), so you took it over: check the \
+                     checkpoint and the files below before redoing anything. "
+                )),
+                (Some(p), false) => {
+                    s.push_str(&format!("You took it over from {p}, whose lease was still live (forced). "))
+                }
+                _ => {}
+            }
+            if let Some(e) = previous_error {
+                s.push_str(&format!("An earlier attempt failed: {e}. "));
+            }
+            s.push_str(
+                "Your lease renews while you work. When the task is finished call the memdusa `task_complete` tool \
+                 (or `memdusa task done`) with a short summary; if you can't finish it, call `task_fail` with the reason.",
+            );
+            s
+        }
+        ClaimResult::AlreadyDone { output } => {
+            let result = output
+                .as_ref()
+                .map(|o| o.as_str().map(String::from).unwrap_or_else(|| o.to_string()))
+                .map(|t| {
+                    format!(" Recorded result: {}", truncate(&t.split_whitespace().collect::<Vec<_>>().join(" "), 500))
+                })
+                .unwrap_or_default();
+            format!(
+                "**The delegated task `{task}` is already done.**{result}\nDo NOT redo it: stop here, or confirm with the \
+                 user what they want before doing any more work on it."
+            )
+        }
+        ClaimResult::HeldBy { owner, lease_until } => {
+            let secs = (lease_until - now_ms()).max(0) / 1000;
+            format!(
+                "**The delegated task `{task}` is held by another live worker: {owner}** (lease renewed for another \
+                 {}m). Do NOT duplicate its work: coordinate with the user or the coordinator first. If that worker is gone \
+                 its lease expires, the task shows as stale, and a new session on it takes over.",
+                (secs + 59) / 60
+            )
+        }
+    }
+}
+
+/// Where a delegated task's step stands, for the coordinator.
+fn step_status(s: &Step) -> String {
+    let owner = s.owner.as_deref().unwrap_or("?");
+    match s.status {
+        StepStatus::Pending => "pending".into(),
+        StepStatus::Running if s.stale => {
+            let expired = s.lease_until.map(|t| format!(", lease expired {}", ago(t))).unwrap_or_default();
+            format!("stale (owner {owner}{expired})")
+        }
+        StepStatus::Running => format!("running by {owner}"),
+        StepStatus::Completed => "done".into(),
+        StepStatus::Failed => format!("failed: {}", s.error.as_deref().unwrap_or("no reason given")),
     }
 }
 
@@ -524,11 +663,36 @@ fn render(parts: &Parts) -> String {
 
     if !delegated.is_empty() {
         let _ = writeln!(o, "## Delegated work");
+        // Tasks of delegated runs come first (grouped by run); the run's name is a sub-heading when there are several.
+        let mut run_ids: Vec<&str> = vec![];
+        for id in delegated.iter().filter_map(|d| d.run_id.as_deref()) {
+            if !run_ids.contains(&id) {
+                run_ids.push(id);
+            }
+        }
+        let headings = run_ids.len() > 1;
+        let mut heading: Option<Option<&str>> = None;
         for d in delegated {
-            let status = if d.active { "active" } else { "ended" };
-            let who = d.harness.as_deref().map(|h| format!(" by {h}")).unwrap_or_default();
+            if headings && heading != Some(d.run_id.as_deref()) {
+                heading = Some(d.run_id.as_deref());
+                let title = d.run_name.as_deref().unwrap_or("Tasks without a run");
+                let _ = writeln!(o, "\n### {title}");
+            }
             let parent = d.parent.as_deref().map(|p| format!(" (for {p})")).unwrap_or_default();
-            let _ = writeln!(o, "- **{}**{who}{parent}: {status}, started {}", d.task, ago(d.started_at));
+            if let Some(step) = &d.step {
+                let _ = writeln!(o, "- **{}**{parent}: {}", d.task, step_status(step));
+                if step.status == StepStatus::Completed
+                    && let Some(out) = step.output.as_ref()
+                {
+                    let text = out.as_str().map(String::from).unwrap_or_else(|| out.to_string());
+                    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let _ = writeln!(o, "  - result: {}", truncate(&text, DELEGATED_OUTPUT_CHARS));
+                }
+            } else {
+                let status = if d.active { "active" } else { "ended" };
+                let who = d.harness.as_deref().map(|h| format!(" by {h}")).unwrap_or_default();
+                let _ = writeln!(o, "- **{}**{who}{parent}: {status}, started {}", d.task, ago(d.started_at));
+            }
             if let Some(c) = &d.checkpoint {
                 let _ = writeln!(o, "  - goal: {} (checkpoint {})", c.goal, ago(c.created_at));
                 if !c.next.is_empty() {

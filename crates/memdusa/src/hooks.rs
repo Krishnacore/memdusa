@@ -153,6 +153,9 @@ pub struct HookRequest {
     /// `MEMDUSA_PARENT`: free text naming the coordinator that delegated it.
     #[serde(default)]
     pub parent: Option<String>,
+    /// `MEMDUSA_RUN`: the delegated run `task` is a step of; the worker claims that step and keeps its lease alive.
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 /// One queued hook, replayed through `POST /v1/hooks/batch`.
@@ -223,6 +226,7 @@ pub async fn handle_request(
         at: req.at.map_or_else(now_ms, |t| t.min(now_ms())),
         task: req.task.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
         parent: req.parent.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()),
+        run: req.run.map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()),
         cfg: &req.config,
     };
     Ok(HookResponse { output: handle(event, input, ctx).await? })
@@ -254,11 +258,53 @@ pub struct Ctx<'a> {
     /// The delegated task this session works on (`MEMDUSA_TASK`), if it is a worker.
     pub task: Option<String>,
     pub parent: Option<String>,
+    /// The delegated run the task belongs to (`MEMDUSA_RUN`); with `task`, the worker holds that step's lease.
+    pub run: Option<String>,
     pub cfg: &'a HookConfig,
+}
+
+/// Who holds a worker's step lease: the agent and its session, so a replacement session (or harness) is told apart.
+fn step_owner(ctx: &Ctx<'_>) -> String {
+    match &ctx.session {
+        Some(s) => format!("{}:{s}", ctx.cfg.agent),
+        None => ctx.cfg.agent.clone(),
+    }
+}
+
+/// Keep the worker's step lease alive. Cheap, and a failure never matters to the session.
+async fn heartbeat(ctx: &Ctx<'_>) {
+    let (Some(run), Some(task)) = (&ctx.run, &ctx.task) else { return };
+    let lease = memdusa_core::store::step_lease_secs();
+    if let Err(e) = ctx.store.step_heartbeat(run, task, &step_owner(ctx), lease).await {
+        eprintln!("memdusa: could not renew the lease on task {task}: {e}");
+    }
+}
+
+/// Claim the worker's step at session start; the notice for the top of its brief says how that went.
+async fn claim_step(ctx: &Ctx<'_>, source: &str) -> Option<String> {
+    let (run, task) = (ctx.run.as_deref()?, ctx.task.as_deref()?);
+    // /clear and compaction restart the same worker in the same terminal, not a rival: its own lease is not a conflict
+    let force = matches!(source, "clear" | "compact");
+    let lease = memdusa_core::store::step_lease_secs();
+    Some(match ctx.store.step_claim(run, task, &step_owner(ctx), lease, force).await {
+        Ok(claim) => brief::claim_notice(task, &claim),
+        Err(e) => {
+            eprintln!("memdusa: could not claim task {task} of run {run}: {e}");
+            format!(
+                "**memdusa could not claim the delegated task `{task}` of run `{run}`: {e}.** Check MEMDUSA_RUN and \
+                 MEMDUSA_TASK; until then nothing stops another worker from taking the same task."
+            )
+        }
+    })
 }
 
 /// Handle one hook event. Returns what to print on stdout (if anything).
 pub async fn handle(event: HookEvent, input: HookInput, ctx: Ctx<'_>) -> Result<Option<String>> {
+    // Every event of a worker is a sign of life. SessionEnd is not: the lease is left to expire, so a worker
+    // that stopped mid-task shows as stale (completion is explicit: `task_complete`).
+    if !matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd | HookEvent::Git) {
+        heartbeat(&ctx).await;
+    }
     match event {
         HookEvent::SessionStart => session_start(&ctx, input.source.as_deref().unwrap_or("startup")).await,
         HookEvent::UserPromptSubmit => {
@@ -337,6 +383,7 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
 }
 
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
+    let notice = claim_step(ctx, source).await;
     // Build the brief before journaling, so it doesn't report its own start.
     let b = brief::build(ctx.store, &ctx.project, ctx.user.as_deref(), ctx.git.as_ref(), ctx.task.as_deref()).await?;
     log(ctx, "session_start", format!("session started ({source})"), None).await?;
@@ -346,7 +393,7 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     }
 
     let empty = b.checkpoints.is_empty() && b.active_runs.is_empty() && b.memories.is_empty() && b.delegated.is_empty();
-    if empty && b.recent_events.is_empty() {
+    if empty && b.recent_events.is_empty() && notice.is_none() {
         return Ok(None);
     }
     let mut md = b.markdown;
@@ -357,6 +404,9 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     }
     // The memories in the brief count as already shown: don't recall them again this session.
     let shown: Vec<&str> = b.memories.iter().filter(|m| md.contains(&m.content)).map(|m| m.id.as_str()).collect();
+    if let Some(n) = &notice {
+        md = format!("## Your delegated task\n{n}\n\n{md}");
+    }
     if ctx.session.is_some() && !shown.is_empty() {
         let n = shown.len();
         if let Err(e) =
@@ -662,6 +712,7 @@ mod tests {
             at: now_ms(),
             task: None,
             parent: None,
+            run: None,
             cfg,
         }
     }

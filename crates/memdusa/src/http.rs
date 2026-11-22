@@ -132,7 +132,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
             Ok(MemdusaMcp::new(
                 mcp_store.clone(),
                 // Remote clients have no cwd: they must name the project.
-                Defaults { project: None, agent: "mcp-http".into(), cwd: None, task: None },
+                Defaults { project: None, agent: "mcp-http".into(), cwd: None, task: None, run: None },
             ))
         },
         Arc::new(LocalSessionManager::default()),
@@ -169,6 +169,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/events", post(event_append).get(events_recent))
         .route("/v1/checkpoints", post(checkpoint_save).get(checkpoints_latest))
         .route("/v1/runs", post(run_start).get(run_list))
+        .route("/v1/delegate", post(delegate))
         .route("/v1/runs/{id}", get(run_get))
         .route("/v1/runs/{id}/claim", post(run_claim))
         .route("/v1/runs/{id}/finish", post(run_finish))
@@ -623,6 +624,20 @@ async fn run_start(
 }
 
 #[derive(Deserialize)]
+struct DelegateBody {
+    project: String,
+    name: String,
+    tasks: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// A coordinator splits work into tasks: one durable run with a pending step per task.
+async fn delegate(State(s): State<AppState>, Json(b): Json<DelegateBody>) -> ApiResult<RunWithSteps> {
+    Ok(Json(s.store.run_delegate(&b.project, &b.name, b.tasks, b.idempotency_key).await?))
+}
+
+#[derive(Deserialize)]
 struct RunListQ {
     project: Option<String>,
     status: Option<RunStatus>,
@@ -756,6 +771,7 @@ mod tests {
             at: None,
             task: task.map(String::from),
             parent: task.map(|_| "lead".into()),
+            run: None,
         };
         c.hook(HookEvent::SessionStart, &req(Some("docs"), json!({"session_id": "W", "source": "startup"})))
             .await
@@ -800,6 +816,7 @@ mod tests {
             at: None,
             task: None,
             parent: None,
+            run: None,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -1046,6 +1063,7 @@ mod tests {
             at: Some(at),
             task: None,
             parent: None,
+            run: None,
         };
         let item = |event: &str, input: Value, at: i64| HookBatchItem { event: event.into(), request: req(input, at) };
         let t0 = now_ms() - 60_000;
