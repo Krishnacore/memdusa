@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use memdusa_core::model::{self, ApiKey, CreatedKey, MemoryKind, MemoryQuery, NewMemory, User};
+use memdusa_core::model::{
+    self, ApiKey, AuditEvent, AuditQuery, CreatedKey, DefaultPolicy, MemoryKind, MemoryQuery, NewMemory, ProjectGrant,
+    Role, User,
+};
 use memdusa_core::redact::Redactor;
 use memdusa_core::retention::RetentionPolicy;
 use memdusa_core::transfer;
@@ -176,6 +179,32 @@ enum Cmd {
     Key {
         #[command(subcommand)]
         cmd: KeyCmd,
+    },
+    /// Grant a user access to a project key or a prefix ending in `/*` (admin).
+    Grant {
+        user: String,
+        pattern: String,
+        #[arg(long, default_value = "write")]
+        role: String,
+    },
+    /// List project grants (admin).
+    Grants {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Revoke a project grant by id (admin).
+    RevokeGrant { id: String },
+    /// Show the audit log (admin).
+    Audit {
+        /// Events at or after this unix-millis timestamp, or `7d` / `24h` / `2w` ago.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
     /// Handle a Claude Code hook event (JSON on stdin). Installed by `memdusa install`.
     Hook {
@@ -331,8 +360,13 @@ fn print_import(r: &transfer::ImportReport) {
 fn print_prune(r: &memdusa_core::retention::PruneReport) {
     let verb = if r.dry_run { "would" } else { "did" };
     println!(
-        "{verb} summarize {} session(s) ({} activity events), delete {} checkpoint(s), {} run(s) ({} steps)",
-        r.sessions_summarized, r.events_deleted, r.checkpoints_deleted, r.runs_deleted, r.steps_deleted
+        "{verb} summarize {} session(s) ({} activity events), delete {} checkpoint(s), {} run(s) ({} steps), {} audit event(s)",
+        r.sessions_summarized,
+        r.events_deleted,
+        r.checkpoints_deleted,
+        r.runs_deleted,
+        r.steps_deleted,
+        r.audit_events_deleted
     );
 }
 
@@ -406,8 +440,19 @@ enum KeyCmd {
     Revoke { key: String },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Stack for the main thread and the runtime's workers. Windows gives the main thread only 1 MB
+/// (8 MB on macOS/Linux), and the CLI's async state machine outgrew that ("thread 'main' has
+/// overflowed its stack" in CI), so run everything on threads with an explicit, uniform stack.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    let worker = std::thread::Builder::new().name("memdusa".into()).stack_size(STACK_SIZE).spawn(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(STACK_SIZE).build()?.block_on(run())
+    })?;
+    worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // stdout is the MCP channel in stdio mode: logs must go to stderr.
@@ -574,6 +619,26 @@ async fn main() -> anyhow::Result<()> {
             KeyCmd::List { user } => store.key_list(user.as_deref()).await?.iter().for_each(print_key),
             KeyCmd::Revoke { key } => print_key(&store.key_revoke(&key, None).await?),
         },
+        Cmd::Grant { user, pattern, role } => {
+            let role = Role::parse(&role).context("--role must be read, write or none")?;
+            let g = store.grant_create(&pattern, &user, role, "root").await?;
+            store
+                .audit(memdusa_core::model::NewAuditEvent::ok("root", "grant.create").project(&g.pattern).target(&g.id))
+                .await?;
+            print_grant(&g);
+        }
+        Cmd::Grants { user } => store.grants_for_user(user.as_deref()).await?.iter().for_each(print_grant),
+        Cmd::RevokeGrant { id } => {
+            let g = store.grant_delete(&id).await?;
+            store
+                .audit(memdusa_core::model::NewAuditEvent::ok("root", "grant.delete").project(&g.pattern).target(&g.id))
+                .await?;
+            print_grant(&g);
+        }
+        Cmd::Audit { since, actor, project, limit } => {
+            let q = audit_query(since, actor, project, limit)?;
+            store.audit_query(q).await?.iter().for_each(print_audit);
+        }
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
             let server = mcp::MemdusaMcp::new(
@@ -591,7 +656,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Serve { addr, token, allowed_hosts, no_auto_prune, rate_limit, no_metrics } => {
             let auto_prune = (!no_auto_prune).then(retention_from_env);
-            let opts = http::HttpOptions { addr, token, allowed_hosts, auto_prune, rate_limit, metrics: !no_metrics };
+            let opts = http::HttpOptions {
+                addr,
+                token,
+                allowed_hosts,
+                auto_prune,
+                rate_limit,
+                metrics: !no_metrics,
+                default_access: DefaultPolicy::from_env(),
+            };
             http::serve(store, opts).await?;
         }
         Cmd::Prune { dry_run, only_project, policy } => {
@@ -772,6 +845,16 @@ async fn run_remote(
                 KeyCmd::List { user } => c.key_list(user.as_deref()).await?.iter().for_each(print_key),
                 KeyCmd::Revoke { key } => print_key(&c.key_revoke(&key).await?),
             }
+        }
+        Cmd::Grant { user, pattern, role } => {
+            let role = Role::parse(&role).context("--role must be read, write or none")?;
+            print_grant(&client()?.grant_create(&user, &pattern, role).await?);
+        }
+        Cmd::Grants { user } => client()?.grants(user.as_deref()).await?.iter().for_each(print_grant),
+        Cmd::RevokeGrant { id } => print_grant(&client()?.grant_revoke(&id).await?),
+        Cmd::Audit { since, actor, project, limit } => {
+            let q = audit_query(since, actor, project, limit)?;
+            client()?.audit(&q).await?.iter().for_each(print_audit);
         }
         Cmd::Mcp { agent } => proxy::run(r, project, &agent).await?,
         Cmd::Resume { json } => {
@@ -1182,6 +1265,49 @@ fn print_key(k: &ApiKey) {
 fn print_created(k: &CreatedKey) {
     println!("\nAPI key for {} ({}). Shown once, store it now:\n\n  {}\n", k.key.user, k.key.name, k.secret);
     println!("Use it on a machine with:  memdusa login <server-url> --token {}", k.secret);
+}
+
+fn print_grant(g: &ProjectGrant) {
+    println!("{:<36} {:<20} {:<6} created by {}  id {}", g.pattern, g.user, g.role.as_str(), g.created_by, g.id);
+}
+
+fn print_audit(e: &AuditEvent) {
+    let scope = e.project.as_deref().or(e.target.as_deref()).unwrap_or("-");
+    println!(
+        "{:<12} {:<16} {:<20} {:<7} {:<28} {}",
+        ts(e.at),
+        e.actor,
+        e.action,
+        e.outcome.as_str(),
+        scope,
+        e.detail.as_ref().map(|d| d.to_string()).unwrap_or_default()
+    );
+}
+
+/// `--since` accepts unix millis or a relative `7d` / `24h` / `2w`.
+fn parse_since(s: &str) -> anyhow::Result<i64> {
+    let s = s.trim();
+    if let Ok(ms) = s.parse::<i64>() {
+        return Ok(ms);
+    }
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let mult = match unit {
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => anyhow::bail!("invalid --since '{s}': use unix millis or a value like 24h / 7d / 2w"),
+    };
+    let n: i64 = n.parse().context("invalid --since number")?;
+    Ok(model::now_ms() - n * mult)
+}
+
+fn audit_query(
+    since: Option<String>,
+    actor: Option<String>,
+    project: Option<String>,
+    limit: i64,
+) -> anyhow::Result<AuditQuery> {
+    Ok(AuditQuery { since: since.as_deref().map(parse_since).transpose()?, actor, project, limit: Some(limit) })
 }
 
 #[cfg(test)]

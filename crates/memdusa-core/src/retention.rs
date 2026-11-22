@@ -16,6 +16,7 @@ use serde_json::json;
 use sqlx::Row;
 
 use crate::Result;
+use crate::access::audit_retention_days;
 use crate::model::*;
 use crate::store::{Q, Store};
 
@@ -63,6 +64,7 @@ pub struct Cutoffs {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct PruneReport {
     pub dry_run: bool,
     pub sessions_summarized: usize,
@@ -70,6 +72,8 @@ pub struct PruneReport {
     pub checkpoints_deleted: usize,
     pub runs_deleted: usize,
     pub steps_deleted: usize,
+    /// Old audit events (`MEMDUSA_AUDIT_DAYS`, 365 by default).
+    pub audit_events_deleted: usize,
 }
 
 fn cutoff(days: i64) -> Option<Millis> {
@@ -260,6 +264,12 @@ impl Store {
         }
 
         if !dry_run && project.is_none() {
+            // Audit retention is server-wide and independent of the data
+            // retention windows; the daily prune job takes care of it.
+            let days = audit_retention_days();
+            if days > 0 {
+                report.audit_events_deleted = self.audit_delete_before(now_ms() - days * DAY_MS).await?;
+            }
             let mut q = Q::new("INSERT INTO memdusa_meta (key, value) VALUES (");
             let (k, v) = (q.text(LAST_PRUNE_KEY), q.text(now_ms().to_string()));
             q.push(&format!("{k}, {v}) ON CONFLICT (key) DO UPDATE SET value = excluded.value"));

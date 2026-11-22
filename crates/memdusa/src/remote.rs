@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use memdusa_core::model::{
-    ApiKey, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, RunWithSteps, Step, User,
+    ApiKey, AuditEvent, AuditQuery, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, ProjectGrant, Role,
+    RunWithSteps, Step, User,
 };
 use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
@@ -196,6 +197,30 @@ impl Client {
     pub async fn import(&self, jsonl: &str) -> anyhow::Result<memdusa_core::transfer::ImportReport> {
         let req = self.request(Method::POST, "/v1/admin/import").header("content-type", "application/x-ndjson");
         Ok(self.send(req.body(jsonl.to_owned())).await?)
+    }
+
+    // ------------------------------------------------------------ access control
+
+    pub async fn grant_create(&self, user: &str, pattern: &str, role: Role) -> anyhow::Result<ProjectGrant> {
+        let body = json!({ "user": user, "pattern": pattern, "role": role.as_str() });
+        Ok(self.send(self.request(Method::POST, "/v1/admin/grants").json(&body)).await?)
+    }
+
+    pub async fn grants(&self, user: Option<&str>) -> anyhow::Result<Vec<ProjectGrant>> {
+        let mut req = self.request(Method::GET, "/v1/admin/grants");
+        if let Some(u) = user {
+            req = req.query(&[("user", u)]);
+        }
+        Ok(self.send(req).await?)
+    }
+
+    pub async fn grant_revoke(&self, id: &str) -> anyhow::Result<ProjectGrant> {
+        let path = format!("/v1/admin/grants/{}", path_segment(id));
+        Ok(self.send(self.request(Method::DELETE, &path)).await?)
+    }
+
+    pub async fn audit(&self, q: &AuditQuery) -> anyhow::Result<Vec<AuditEvent>> {
+        Ok(self.send(self.request(Method::GET, "/v1/admin/audit").query(q)).await?)
     }
 
     // ------------------------------------------------------------ users & keys

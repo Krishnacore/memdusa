@@ -10,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use memdusa_core::access::AccessPolicy;
 use memdusa_core::model::*;
 use memdusa_core::retention::{PruneReport, RetentionPolicy};
 use memdusa_core::transfer;
@@ -35,6 +36,54 @@ struct AppState {
     /// created by the CLI while the server runs, so an open server re-checks
     /// on every request until it latches.
     auth_required: Arc<AtomicBool>,
+    /// Fallback for users without a matching grant (`MEMDUSA_DEFAULT_ACCESS`).
+    default_access: DefaultPolicy,
+}
+
+/// Per-request snapshot of the caller's grants: at most one grants query per
+/// request, however many endpoints/tools check access. Inserted by `auth`.
+#[derive(Clone)]
+pub(crate) struct AccessCache {
+    policy: AccessPolicy,
+    store: Store,
+}
+
+impl AccessCache {
+    /// Filter to readable projects using this request's cached grants.
+    pub(crate) async fn readable_projects(&self, store: &Store, identity: &Identity) -> Result<Vec<String>, Error> {
+        Ok(self.policy.readable(identity, &store.distinct_projects().await?))
+    }
+
+    /// Check `needed` access on `project`; denials are returned as 403 and
+    /// written to the audit log.
+    pub(crate) async fn authorize(
+        &self,
+        identity: &Identity,
+        project: &str,
+        needed: Access,
+        action: &str,
+    ) -> Result<(), Error> {
+        if self.policy.allows(identity, project, needed) {
+            return Ok(());
+        }
+        let detail = json!({ "needed": needed.as_str(), "action": action });
+        if let Err(e) =
+            self.store.audit(NewAuditEvent::denied(identity.actor(), "denied").project(project).detail(detail)).await
+        {
+            tracing::error!("could not audit denied request: {e}");
+        }
+        Err(Error::Forbidden(format!("access denied to project '{project}' (needs {})", needed.as_str())))
+    }
+}
+
+async fn check(
+    access: &AccessCache,
+    identity: &Identity,
+    project: &str,
+    needed: Access,
+    action: &str,
+) -> Result<(), ApiError> {
+    Ok(access.authorize(identity, project, needed, action).await?)
 }
 
 impl AppState {
@@ -60,6 +109,9 @@ pub struct HttpOptions {
     pub rate_limit: f64,
     /// Serve Prometheus metrics at `/metrics`.
     pub metrics: bool,
+    /// Fallback access for users with no grant (default `write`, via
+    /// `MEMDUSA_DEFAULT_ACCESS`).
+    pub default_access: DefaultPolicy,
 }
 
 struct ApiError(Error);
@@ -99,6 +151,7 @@ pub async fn serve(store: Store, opts: HttpOptions) -> anyhow::Result<()> {
         (0, Some(_)) => tracing::info!("auth: shared token only"),
         (n, t) => tracing::info!("auth: API keys ({n} users){}", if t.is_some() { " + shared token" } else { "" }),
     }
+    tracing::info!("default project access: {} (MEMDUSA_DEFAULT_ACCESS)", opts.default_access.as_str());
     if let Some(policy) = opts.auto_prune {
         let store = store.clone();
         tokio::spawn(async move {
@@ -146,12 +199,16 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         limiter: (opts.rate_limit > 0.0).then(|| Arc::new(RateLimiter::new(opts.rate_limit, opts.rate_limit * 10.0))),
         auth_required: Arc::new(AtomicBool::new(opts.token.is_some())),
         token: opts.token.map(Into::into),
+        default_access: opts.default_access,
     };
 
     let api = Router::new()
         .route("/v1/whoami", get(whoami))
         .route("/v1/me/keys", get(my_keys).post(my_key_create))
         .route("/v1/me/keys/{id}", delete(my_key_revoke))
+        .route("/v1/admin/grants", get(admin_grants).post(admin_grant_create))
+        .route("/v1/admin/grants/{id}", delete(admin_grant_delete))
+        .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/users", get(admin_users).post(admin_user_create))
         .route("/v1/admin/users/{name}/disable", post(admin_user_disable))
         .route("/v1/admin/users/{name}/enable", post(admin_user_enable))
@@ -282,7 +339,12 @@ async fn auth(State(s): State<AppState>, mut req: Request, next: Next) -> Respon
                 .into_response();
         }
     }
+    let policy = match s.store.access_policy(identity.user.as_deref(), s.default_access).await {
+        Ok(p) => p,
+        Err(e) => return ApiError(e).into_response(),
+    };
     req.extensions_mut().insert(identity);
+    req.extensions_mut().insert(AccessCache { policy, store: s.store.clone() });
     next.run(req).await
 }
 
@@ -292,21 +354,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ---------------------------------------------------------------- handlers
 
-async fn whoami(State(s): State<AppState>, Extension(id): Extension<Identity>) -> Json<Value> {
+async fn whoami(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+) -> ApiResult<Value> {
     let backend = match s.store.backend() {
         memdusa_core::Backend::Sqlite => "sqlite",
         memdusa_core::Backend::Postgres => "postgres",
     };
     // semantic search status; a failing count must not break whoami
     let semantic = s.store.embedding_stats().await.unwrap_or_default();
-    Json(json!({
+    Ok(Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "backend": backend,
         "user": id.user,
         "admin": id.admin,
+        "default_access": s.default_access.as_str(),
+        "grants": access.policy.grants(),
         "semantic": { "model": semantic.model, "embedded": semantic.embedded, "total": semantic.total },
-    }))
+    })))
 }
 
 #[derive(Deserialize, Default)]
@@ -321,19 +389,27 @@ struct BackfillBody {
 async fn embeddings_backfill(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     body: Option<Json<BackfillBody>>,
 ) -> ApiResult<memdusa_core::embed::BackfillReport> {
     admin(&id)?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    Ok(Json(s.store.embeddings_backfill(body.all, body.project.as_deref()).await?))
+    if let Some(project) = &body.project {
+        check(&access, &id, project, Access::Write, "backfill").await?;
+    }
+    let report = s.store.embeddings_backfill(body.all, body.project.as_deref()).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "backfill").project(body.project.as_deref().unwrap_or(""))).await?;
+    Ok(Json(report))
 }
 
 async fn hook(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Path(event): Path<String>,
     Json(req): Json<HookRequest>,
 ) -> ApiResult<HookResponse> {
+    check(&access, &id, &req.project, Access::Write, "hook").await?;
     let event: HookEvent = event.parse().map_err(|e: String| Error::Invalid(format!("unknown hook event: {e}")))?;
     s.metrics.hook(event.arg());
     Ok(Json(hooks::handle_request(&s.store, event, req, &id).await?))
@@ -351,6 +427,7 @@ struct BatchBody {
 async fn hook_batch(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Json(b): Json<BatchBody>,
 ) -> ApiResult<HookBatchResponse> {
     if b.items.len() > 1000 {
@@ -358,6 +435,7 @@ async fn hook_batch(
     }
     let mut resp = HookBatchResponse::default();
     for (i, mut item) in b.items.into_iter().enumerate() {
+        check(&access, &id, &item.request.project, Access::Write, "hook.batch").await?;
         // replayed prompts can't inject anything any more
         item.request.config.recall = false;
         let event: HookEvent = match item.event.parse() {
@@ -389,6 +467,62 @@ fn admin(id: &Identity) -> Result<(), Error> {
     if id.admin { Ok(()) } else { Err(Error::Forbidden("admin only".into())) }
 }
 
+// ---------------------------------------------------------------- grants & audit
+
+#[derive(Deserialize)]
+struct GrantBody {
+    pattern: String,
+    user: String,
+    role: Role,
+}
+
+async fn admin_grant_create(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Json(b): Json<GrantBody>,
+) -> ApiResult<ProjectGrant> {
+    admin(&id)?;
+    let g = s.store.grant_create(&b.pattern, &b.user, b.role, id.actor()).await?;
+    s.store
+        .audit(
+            NewAuditEvent::ok(id.actor(), "grant.create")
+                .project(&g.pattern)
+                .target(&g.id)
+                .detail(json!({"user": g.user, "role": g.role.as_str(), "pattern": g.pattern})),
+        )
+        .await?;
+    Ok(Json(g))
+}
+
+async fn admin_grants(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(q): Query<KeysQ>,
+) -> ApiResult<Vec<ProjectGrant>> {
+    admin(&id)?;
+    Ok(Json(s.store.grants_for_user(q.user.as_deref()).await?))
+}
+
+async fn admin_grant_delete(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Path(gid): Path<String>,
+) -> ApiResult<ProjectGrant> {
+    admin(&id)?;
+    let g = s.store.grant_delete(&gid).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "grant.delete").project(&g.pattern).target(&g.id)).await?;
+    Ok(Json(g))
+}
+
+async fn admin_audit(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Vec<AuditEvent>> {
+    admin(&id)?;
+    Ok(Json(s.store.audit_query(q).await?))
+}
+
 #[derive(Deserialize, Default)]
 struct KeyBody {
     #[serde(default)]
@@ -404,7 +538,9 @@ async fn my_key_create(
     Extension(id): Extension<Identity>,
     Json(b): Json<KeyBody>,
 ) -> ApiResult<CreatedKey> {
-    Ok(Json(s.store.key_create(me(&id)?, &b.name).await?))
+    let key = s.store.key_create(me(&id)?, &b.name).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "key.create").target(&key.key.id)).await?;
+    Ok(Json(key))
 }
 
 async fn my_key_revoke(
@@ -412,7 +548,9 @@ async fn my_key_revoke(
     Extension(id): Extension<Identity>,
     Path(key): Path<String>,
 ) -> ApiResult<ApiKey> {
-    Ok(Json(s.store.key_revoke(&key, Some(me(&id)?)).await?))
+    let revoked = s.store.key_revoke(&key, Some(me(&id)?)).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "key.revoke").target(&revoked.id)).await?;
+    Ok(Json(revoked))
 }
 
 async fn admin_users(State(s): State<AppState>, Extension(id): Extension<Identity>) -> ApiResult<Vec<User>> {
@@ -444,6 +582,9 @@ async fn admin_user_create(
     let user = s.store.user_create(&b.name, b.admin).await?;
     let key = s.store.key_create(&user.name, b.key_name.as_deref().unwrap_or("default")).await?;
     s.auth_required.store(true, Ordering::Relaxed);
+    s.store
+        .audit(NewAuditEvent::ok(id.actor(), "user.create").target(&user.name).detail(json!({"admin": user.admin})))
+        .await?;
     Ok(Json(NewUserResponse { user, key }))
 }
 
@@ -453,7 +594,9 @@ async fn admin_user_disable(
     Path(name): Path<String>,
 ) -> ApiResult<User> {
     admin(&id)?;
-    Ok(Json(s.store.user_set_disabled(&name, true).await?))
+    let user = s.store.user_set_disabled(&name, true).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "user.disable").target(&name)).await?;
+    Ok(Json(user))
 }
 
 async fn admin_user_enable(
@@ -462,7 +605,9 @@ async fn admin_user_enable(
     Path(name): Path<String>,
 ) -> ApiResult<User> {
     admin(&id)?;
-    Ok(Json(s.store.user_set_disabled(&name, false).await?))
+    let user = s.store.user_set_disabled(&name, false).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "user.enable").target(&name)).await?;
+    Ok(Json(user))
 }
 
 async fn admin_key_create(
@@ -472,7 +617,9 @@ async fn admin_key_create(
     Json(b): Json<KeyBody>,
 ) -> ApiResult<CreatedKey> {
     admin(&id)?;
-    Ok(Json(s.store.key_create(&name, &b.name).await?))
+    let key = s.store.key_create(&name, &b.name).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "key.create").target(&key.key.id)).await?;
+    Ok(Json(key))
 }
 
 #[derive(Deserialize)]
@@ -483,10 +630,22 @@ struct ExportQ {
 async fn admin_export(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Query(q): Query<ExportQ>,
 ) -> Result<Response, ApiError> {
-    admin(&id)?;
+    // A single project only needs read access; the full corpus stays admin-only.
+    match &q.project {
+        Some(project) => check(&access, &id, project, Access::Read, "export").await?,
+        None => admin(&id)?,
+    }
     let body = transfer::to_jsonl(&s.store.export(q.project.as_deref()).await?);
+    s.store
+        .audit(
+            NewAuditEvent::ok(id.actor(), "export")
+                .project(q.project.as_deref().unwrap_or(""))
+                .detail(json!({"full": q.project.is_none()})),
+        )
+        .await?;
     Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
 }
 
@@ -496,7 +655,9 @@ async fn admin_import(
     body: String,
 ) -> ApiResult<transfer::ImportReport> {
     admin(&id)?;
-    Ok(Json(s.store.import(transfer::parse_jsonl(&body)?).await?))
+    let report = s.store.import(transfer::parse_jsonl(&body)?).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "import")).await?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
@@ -514,7 +675,15 @@ async fn admin_prune(
     Json(b): Json<PruneBody>,
 ) -> ApiResult<PruneReport> {
     admin(&id)?;
-    Ok(Json(s.store.prune(&b.policy, b.project.as_deref(), b.dry_run).await?))
+    let report = s.store.prune(&b.policy, b.project.as_deref(), b.dry_run).await?;
+    s.store
+        .audit(
+            NewAuditEvent::ok(id.actor(), "prune")
+                .project(b.project.as_deref().unwrap_or(""))
+                .detail(json!({"dry_run": b.dry_run})),
+        )
+        .await?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
@@ -537,7 +706,9 @@ async fn admin_key_revoke(
     Path(key): Path<String>,
 ) -> ApiResult<ApiKey> {
     admin(&id)?;
-    Ok(Json(s.store.key_revoke(&key, None).await?))
+    let revoked = s.store.key_revoke(&key, None).await?;
+    s.store.audit(NewAuditEvent::ok(id.actor(), "key.revoke").target(&revoked.id)).await?;
+    Ok(Json(revoked))
 }
 
 // ---------------------------------------------------------------- data
@@ -561,8 +732,10 @@ struct ResumeQ {
 async fn resume(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Query(q): Query<ResumeQ>,
 ) -> ApiResult<memdusa_core::Brief> {
+    check(&access, &id, &q.project, Access::Read, "resume").await?;
     let git: Option<GitState> =
         q.git.map(|g| serde_json::from_str(&g)).transpose().map_err(|e| Error::Invalid(format!("git: {e}")))?;
     let task = q.task.as_deref().map(str::trim).filter(|t| !t.is_empty());
@@ -577,8 +750,13 @@ fn attribute(id: &Identity, source: Option<String>) -> Option<String> {
 async fn memory_save(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Json(mut m): Json<NewMemory>,
 ) -> ApiResult<Memory> {
+    // Global memories (project NULL) keep their private-to-owner rule.
+    if let Some(project) = &m.project {
+        check(&access, &id, project, Access::Write, "memory.save").await?;
+    }
     m.source = attribute(&id, m.source);
     m.user = id.user;
     Ok(Json(s.store.memory_save(m).await?))
@@ -587,9 +765,13 @@ async fn memory_save(
 async fn memory_update(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Path(mid): Path<String>,
     Json(mut p): Json<MemoryPatch>,
 ) -> ApiResult<Memory> {
+    if let Some(project) = s.store.memory_project(&mid).await? {
+        check(&access, &id, &project, Access::Write, "memory.update").await?;
+    }
     p.source = attribute(&id, None);
     Ok(Json(s.store.memory_update_as(&mid, p, &id).await?))
 }
@@ -597,8 +779,16 @@ async fn memory_update(
 async fn memory_search(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Query(mut q): Query<MemoryQuery>,
 ) -> ApiResult<Vec<Memory>> {
+    q.allowed_projects = match &q.project {
+        Some(project) => {
+            check(&access, &id, project, Access::Read, "memory.search").await?;
+            None
+        }
+        None => Some(access.readable_projects(&s.store, &id).await?),
+    };
     q.user = id.user;
     Ok(Json(s.store.memory_search(q).await?))
 }
@@ -611,51 +801,79 @@ struct ReviewQuery {
 async fn memory_review(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Query(q): Query<ReviewQuery>,
 ) -> ApiResult<memdusa_core::review::MemoryReview> {
+    check(&access, &id, &q.project, Access::Read, "memory.review").await?;
     Ok(Json(s.store.memory_review(&q.project, id.user.as_deref()).await?))
 }
 
 async fn memory_forget(
     State(s): State<AppState>,
     Extension(who): Extension<Identity>,
-    Path(id): Path<String>,
+    Extension(access): Extension<AccessCache>,
+    Path(mid): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    s.store.memory_forget_as(&id, &who).await?;
+    let project = s.store.memory_project(&mid).await?;
+    if let Some(project) = &project {
+        check(&access, &who, project, Access::Write, "memory.forget").await?;
+    }
+    s.store.memory_forget_as(&mid, &who).await?;
+    s.store
+        .audit(NewAuditEvent::ok(who.actor(), "memory.forget").project(project.as_deref().unwrap_or("")).target(&mid))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn event_append(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Json(mut e): Json<NewEvent>,
 ) -> ApiResult<Event> {
+    check(&access, &id, &e.project, Access::Write, "event.append").await?;
     e.source = attribute(&id, e.source);
     Ok(Json(s.store.event_append(e).await?))
 }
 
-async fn events_recent(State(s): State<AppState>, Query(q): Query<ProjectQ>) -> ApiResult<Vec<Event>> {
+async fn events_recent(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Query(q): Query<ProjectQ>,
+) -> ApiResult<Vec<Event>> {
+    check(&access, &id, &q.project, Access::Read, "events.recent").await?;
     Ok(Json(s.store.events_recent(&q.project, q.session.as_deref(), q.limit.unwrap_or(50)).await?))
 }
 
 async fn checkpoint_save(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Json(mut c): Json<NewCheckpoint>,
 ) -> ApiResult<Checkpoint> {
+    check(&access, &id, &c.project, Access::Write, "checkpoint.save").await?;
     c.source = attribute(&id, c.source);
     Ok(Json(s.store.checkpoint_save(c).await?))
 }
 
-async fn checkpoints_latest(State(s): State<AppState>, Query(q): Query<ProjectQ>) -> ApiResult<Vec<Checkpoint>> {
+async fn checkpoints_latest(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Query(q): Query<ProjectQ>,
+) -> ApiResult<Vec<Checkpoint>> {
+    check(&access, &id, &q.project, Access::Read, "checkpoints.latest").await?;
     Ok(Json(s.store.checkpoints_latest(&q.project, q.limit.unwrap_or(10)).await?))
 }
 
 async fn run_start(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
     Json(mut r): Json<NewRun>,
 ) -> ApiResult<RunWithSteps> {
+    check(&access, &id, &r.project, Access::Write, "run.start").await?;
     r.owner = Some(id.qualify(r.owner.as_deref().unwrap_or("anonymous")));
     Ok(Json(s.store.run_start(r).await?))
 }
@@ -670,7 +888,13 @@ struct DelegateBody {
 }
 
 /// A coordinator splits work into tasks: one durable run with a pending step per task.
-async fn delegate(State(s): State<AppState>, Json(b): Json<DelegateBody>) -> ApiResult<RunWithSteps> {
+async fn delegate(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Json(b): Json<DelegateBody>,
+) -> ApiResult<RunWithSteps> {
+    check(&access, &id, &b.project, Access::Write, "delegate").await?;
     Ok(Json(s.store.run_delegate(&b.project, &b.name, b.tasks, b.idempotency_key).await?))
 }
 
@@ -681,12 +905,31 @@ struct RunListQ {
     limit: Option<i64>,
 }
 
-async fn run_list(State(s): State<AppState>, Query(q): Query<RunListQ>) -> ApiResult<Vec<Run>> {
-    Ok(Json(s.store.run_list(q.project.as_deref(), q.status, q.limit.unwrap_or(50)).await?))
+async fn run_list(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Query(q): Query<RunListQ>,
+) -> ApiResult<Vec<Run>> {
+    let allowed = match &q.project {
+        Some(project) => {
+            check(&access, &id, project, Access::Read, "run.list").await?;
+            None
+        }
+        None => Some(access.readable_projects(&s.store, &id).await?),
+    };
+    Ok(Json(s.store.run_list_visible(q.project.as_deref(), allowed.as_deref(), q.status, q.limit.unwrap_or(50)).await?))
 }
 
-async fn run_get(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<RunWithSteps> {
-    Ok(Json(s.store.run_get(&id).await?))
+async fn run_get(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path(rid): Path<String>,
+) -> ApiResult<RunWithSteps> {
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &id, &project, Access::Read, "run.get").await?;
+    Ok(Json(s.store.run_get(&rid).await?))
 }
 
 #[derive(Deserialize)]
@@ -700,10 +943,13 @@ struct ClaimBody {
 async fn run_claim(
     State(s): State<AppState>,
     Extension(who): Extension<Identity>,
-    Path(id): Path<String>,
+    Extension(access): Extension<AccessCache>,
+    Path(rid): Path<String>,
     Json(b): Json<ClaimBody>,
 ) -> ApiResult<RunWithSteps> {
-    Ok(Json(s.store.run_claim(&id, &who.qualify(&b.owner), b.lease_secs, b.force).await?))
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "run.claim").await?;
+    Ok(Json(s.store.run_claim(&rid, &who.qualify(&b.owner), b.lease_secs, b.force).await?))
 }
 
 #[derive(Deserialize)]
@@ -715,10 +961,20 @@ struct FinishBody {
 
 async fn run_finish(
     State(s): State<AppState>,
-    Path(id): Path<String>,
+    Extension(who): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path(rid): Path<String>,
     Json(b): Json<FinishBody>,
 ) -> ApiResult<RunWithSteps> {
-    Ok(Json(s.store.run_finish(&id, b.outcome, b.output, b.error).await?))
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "run.finish").await?;
+    if let (Some(user), Some(owner)) = (who.user.as_deref(), s.store.run_owner(&rid).await?)
+        && owner != user
+        && !owner.starts_with(&format!("{user}/"))
+    {
+        s.store.audit(NewAuditEvent::ok(who.actor(), "run.finish_foreign").project(&project).target(&rid)).await?;
+    }
+    Ok(Json(s.store.run_finish(&rid, b.outcome, b.output, b.error).await?))
 }
 
 #[derive(Deserialize)]
@@ -730,10 +986,13 @@ struct BeginBody {
 async fn step_begin(
     State(s): State<AppState>,
     Extension(who): Extension<Identity>,
-    Path((id, key)): Path<(String, String)>,
+    Extension(access): Extension<AccessCache>,
+    Path((rid, key)): Path<(String, String)>,
     Json(b): Json<BeginBody>,
 ) -> ApiResult<StepDecision> {
-    Ok(Json(s.store.step_begin(&id, &key, b.input, &who.qualify(&b.owner)).await?))
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "step.begin").await?;
+    Ok(Json(s.store.step_begin(&rid, &key, b.input, &who.qualify(&b.owner)).await?))
 }
 
 #[derive(Deserialize)]
@@ -743,10 +1002,14 @@ struct CompleteBody {
 
 async fn step_complete(
     State(s): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
+    Extension(who): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path((rid, key)): Path<(String, String)>,
     Json(b): Json<CompleteBody>,
 ) -> ApiResult<Step> {
-    Ok(Json(s.store.step_complete(&id, &key, b.output).await?))
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "step.complete").await?;
+    Ok(Json(s.store.step_complete(&rid, &key, b.output).await?))
 }
 
 #[derive(Deserialize)]
@@ -756,10 +1019,14 @@ struct FailBody {
 
 async fn step_fail(
     State(s): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
+    Extension(who): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path((rid, key)): Path<(String, String)>,
     Json(b): Json<FailBody>,
 ) -> ApiResult<Step> {
-    Ok(Json(s.store.step_fail(&id, &key, &b.error).await?))
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "step.fail").await?;
+    Ok(Json(s.store.step_fail(&rid, &key, &b.error).await?))
 }
 
 #[cfg(test)]
@@ -773,7 +1040,7 @@ mod tests {
     use crate::hooks::HookConfig;
     use crate::remote::Client;
 
-    async fn spawn(token: Option<&str>) -> (String, Store) {
+    async fn spawn_with(token: Option<&str>, default_access: DefaultPolicy) -> (String, Store) {
         let dir = std::env::temp_dir().join(format!("memdusa-http-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
@@ -784,12 +1051,17 @@ mod tests {
             auto_prune: None,
             rate_limit: 0.0,
             metrics: true,
+            default_access,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = app(store.clone(), opts);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, store)
+    }
+
+    async fn spawn(token: Option<&str>) -> (String, Store) {
+        spawn_with(token, DefaultPolicy::Write).await
     }
 
     fn client(url: &str, token: Option<&str>) -> Client {
@@ -896,6 +1168,7 @@ mod tests {
             kind: Some(MemoryKind::Decision),
             limit: Some(5),
             user: None,
+            allowed_projects: None,
         };
         assert_eq!(c.memory_search(&q).await.unwrap().len(), 1);
         assert!(c.resume("p", None, None).await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
@@ -1157,6 +1430,7 @@ mod tests {
             auto_prune: None,
             rate_limit: 1.0,
             metrics: true,
+            default_access: DefaultPolicy::Write,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1195,5 +1469,211 @@ mod tests {
         assert!(text.contains("memdusa_rate_limited_total 1"), "{text}");
         assert!(text.contains("memdusa_runs_running 0"), "{text}");
         assert!(!text.contains("127.0.0.1"), "no addresses or ids in labels");
+    }
+
+    // ---------------------------------------------------------------- access control
+
+    async fn admin_and_user(store: &Store, user: &str, admin: bool) -> (String, String) {
+        let a = store.user_create("admin", true).await.unwrap();
+        let admin_key = store.key_create(&a.name, "k").await.unwrap().secret;
+        let u = store.user_create(user, admin).await.unwrap();
+        let key = store.key_create(&u.name, "k").await.unwrap().secret;
+        (admin_key, key)
+    }
+
+    #[tokio::test]
+    async fn read_grant_allows_reads_but_not_writes_and_audits_denials() {
+        use reqwest::Method as M;
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::None).await;
+        let (admin, alice) = admin_and_user(&store, "alice", false).await;
+        let g = store.grant_create("proj/read/*", "alice", Role::Read, "admin").await.unwrap();
+        let u = |p: &str| format!("{url}{p}");
+
+        assert_eq!(call(M::GET, &u("/v1/resume?project=proj/read/app"), Some(&alice), None).await.0, 200);
+        assert_eq!(call(M::GET, &u("/v1/memories?project=proj/read/app"), Some(&alice), None).await.0, 200);
+
+        let (st, _) =
+            call(M::POST, &u("/v1/memories"), Some(&alice), Some(json!({"project": "proj/read/app", "content": "x"})))
+                .await;
+        assert_eq!(st, 403, "read grant can't write memories");
+        let hook = json!({
+            "project": "proj/read/app",
+            "agent": "codex", "journal_prompts": false, "stop_guard_mins": 0,
+            "input": {}
+        });
+        assert_eq!(call(M::POST, &u("/v1/hooks/post-tool-use"), Some(&alice), Some(hook)).await.0, 403, "hook writes");
+        assert_eq!(call(M::GET, &u("/v1/resume?project=proj/secret"), Some(&alice), None).await.0, 403);
+
+        // whoami shows the effective grants and the server default
+        let (_, me) = call(M::GET, &u("/v1/whoami"), Some(&alice), None).await;
+        assert_eq!(me["default_access"], "none");
+        assert_eq!(me["grants"][0]["id"].as_str(), Some(g.id.as_str()));
+
+        // every denial is in the audit log, with project and needed access
+        let (_, audit) = call(M::GET, &u("/v1/admin/audit?actor=alice"), Some(&admin), None).await;
+        let audit = audit.as_array().unwrap();
+        assert!(audit.iter().all(|e| e["outcome"] == "denied"), "{audit:?}");
+        assert!(audit.iter().any(|e| e["project"] == "proj/read/app" && e["detail"]["needed"] == "write"), "{audit:?}");
+        assert!(audit.iter().any(|e| e["project"] == "proj/secret"), "{audit:?}");
+    }
+
+    #[tokio::test]
+    async fn no_grant_under_none_is_denied_everywhere() {
+        use reqwest::Method as M;
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::None).await;
+        let (admin, bob) = admin_and_user(&store, "bob", false).await;
+        let u = |p: &str| format!("{url}{p}");
+
+        for (method, path, body) in [
+            (M::GET, "/v1/resume?project=any/project", None),
+            (M::GET, "/v1/memories?project=any/project", None),
+            (M::GET, "/v1/events?project=any/project", None),
+            (M::GET, "/v1/checkpoints?project=any/project", None),
+            (M::GET, "/v1/runs?project=any/project", None),
+            (M::POST, "/v1/checkpoints", Some(json!({"project": "any/project", "goal": "x"}))),
+            (M::POST, "/v1/delegate", Some(json!({"project": "any/project", "name": "x", "tasks": ["t"]}))),
+        ] {
+            let (st, res) = call(method.clone(), &u(path), Some(&bob), body).await;
+            assert_eq!(st, 403, "{path}: {res}");
+        }
+        // non-project endpoints still work
+        assert_eq!(call(M::GET, &u("/v1/whoami"), Some(&bob), None).await.0, 200);
+        let (_, audit) = call(M::GET, &u("/v1/admin/audit?actor=bob&limit=50"), Some(&admin), None).await;
+        assert_eq!(audit.as_array().unwrap().len(), 7, "one denial per request");
+    }
+
+    #[tokio::test]
+    async fn run_endpoints_authorize_against_the_runs_stored_project() {
+        use reqwest::Method as M;
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::None).await;
+        let (_, alice) = admin_and_user(&store, "alice", false).await;
+        store.grant_create("proj/a", "alice", Role::Write, "admin").await.unwrap();
+        let run_a = store
+            .run_start(NewRun { project: "proj/a".into(), name: "a".into(), lease_secs: Some(0), ..Default::default() })
+            .await
+            .unwrap()
+            .run;
+        let run_b = store
+            .run_start(NewRun { project: "proj/b".into(), name: "b".into(), ..Default::default() })
+            .await
+            .unwrap()
+            .run;
+        let u = |p: &str| format!("{url}{p}");
+
+        assert_eq!(call(M::GET, &u(&format!("/v1/runs/{}", run_a.id)), Some(&alice), None).await.0, 200);
+        assert_eq!(
+            call(
+                M::POST,
+                &u(&format!("/v1/runs/{}/steps/s/begin", run_a.id)),
+                Some(&alice),
+                Some(json!({"owner": "w"}))
+            )
+            .await
+            .0,
+            200
+        );
+
+        // a caller-supplied project (query or body) can't override the stored one
+        let denied = [
+            (M::GET, format!("/v1/runs/{}?project=proj/a", run_b.id), None),
+            (
+                M::POST,
+                format!("/v1/runs/{}/steps/s/begin?project=proj/a", run_b.id),
+                Some(json!({"owner": "w", "project": "proj/a"})),
+            ),
+            (M::POST, format!("/v1/runs/{}/claim", run_b.id), Some(json!({"owner": "w", "project": "proj/a"}))),
+            (
+                M::POST,
+                format!("/v1/runs/{}/finish", run_b.id),
+                Some(json!({"outcome": "completed", "project": "proj/a"})),
+            ),
+        ];
+        for (method, path, body) in denied {
+            let (st, res) = call(method, &u(&path), Some(&alice), body).await;
+            assert_eq!(st, 403, "{path}: {res}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_only_return_readable_projects() {
+        use reqwest::Method as M;
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::None).await;
+        let (_, alice) = admin_and_user(&store, "alice", false).await;
+        store.grant_create("proj/a", "alice", Role::Read, "admin").await.unwrap();
+        for p in ["proj/a", "proj/b"] {
+            store
+                .memory_save(NewMemory {
+                    project: Some(p.into()),
+                    content: format!("fact in {p}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .run_start(NewRun { project: p.into(), name: format!("run in {p}"), ..Default::default() })
+                .await
+                .unwrap();
+        }
+        let u = |p: &str| format!("{url}{p}");
+
+        let (st, memories) = call(M::GET, &u("/v1/memories?limit=50"), Some(&alice), None).await;
+        assert_eq!(st, 200);
+        let contents: Vec<_> = memories.as_array().unwrap().iter().map(|m| m["content"].as_str().unwrap()).collect();
+        assert!(contents.contains(&"fact in proj/a") && !contents.contains(&"fact in proj/b"), "{memories}");
+
+        let (st, runs) = call(M::GET, &u("/v1/runs"), Some(&alice), None).await;
+        assert_eq!(st, 200);
+        let projects: Vec<_> = runs.as_array().unwrap().iter().map(|r| r["project"].as_str().unwrap()).collect();
+        assert_eq!(projects, vec!["proj/a"], "{runs}");
+
+        assert_eq!(call(M::GET, &u("/v1/memories?project=proj/b"), Some(&alice), None).await.0, 403);
+    }
+
+    #[tokio::test]
+    async fn grants_api_is_admin_only_and_default_write_is_compatible() {
+        use reqwest::Method as M;
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::Write).await;
+        let (admin, alice) = admin_and_user(&store, "alice", false).await;
+        let u = |p: &str| format!("{url}{p}");
+
+        assert_eq!(call(M::GET, &u("/v1/admin/grants"), Some(&alice), None).await.0, 403);
+        assert_eq!(
+            call(
+                M::POST,
+                &u("/v1/admin/grants"),
+                Some(&alice),
+                Some(json!({"pattern":"p","user":"alice","role":"read"}))
+            )
+            .await
+            .0,
+            403
+        );
+        assert_eq!(call(M::GET, &u("/v1/admin/audit"), Some(&alice), None).await.0, 403);
+
+        let (st, g) = call(
+            M::POST,
+            &u("/v1/admin/grants"),
+            Some(&admin),
+            Some(json!({"pattern": "p/*", "user": "alice", "role": "read"})),
+        )
+        .await;
+        assert_eq!(st, 200, "{g}");
+        let gid = g["id"].as_str().unwrap();
+        let (_, list) = call(M::GET, &u("/v1/admin/grants?user=alice"), Some(&admin), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(call(M::DELETE, &u(&format!("/v1/admin/grants/{gid}")), Some(&admin), None).await.0, 200);
+        assert_eq!(call(M::GET, &u("/v1/admin/grants?user=alice"), Some(&admin), None).await.0, 200);
+
+        // default write: no grant still means today's behaviour
+        let (st, _) = call(
+            M::POST,
+            &u("/v1/memories"),
+            Some(&alice),
+            Some(json!({"project": "no/grant", "content": "still writable"})),
+        )
+        .await;
+        assert_eq!(st, 200);
+        let (_, me) = call(M::GET, &u("/v1/whoami"), Some(&alice), None).await;
+        assert_eq!(me["default_access"], "write");
     }
 }
