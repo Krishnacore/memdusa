@@ -588,7 +588,8 @@ mod tests {
     #[test]
     fn cursor_session_end_reads_prompt_and_last_words_from_the_transcript() {
         let payload = include_str!("../tests/fixtures/harness/cursor-session-end.json")
-            .replace("__TRANSCRIPT__", &format!("{FIXTURES}/cursor-transcript.jsonl"));
+            // as a JSON string: a Windows path's backslashes would otherwise be invalid escapes
+            .replace("\"__TRANSCRIPT__\"", &json!(format!("{FIXTURES}/cursor-transcript.jsonl")).to_string());
         let input: Value = serde_json::from_str(&payload).unwrap();
         let v = Harness::Cursor.normalize(HookEvent::SessionEnd, input.clone()).unwrap();
         assert_eq!(v["last_assistant_message"], "ok", "text of the final assistant message only");
