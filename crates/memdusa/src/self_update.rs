@@ -226,6 +226,9 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
 /// Entry point for the CLI subcommand.
 pub(crate) async fn run(version: Option<String>, check: bool) -> Result<()> {
     let exe = std::env::current_exe().context("finding the running executable")?;
+    // resolve symlinks: package managers link bin/memdusa into their own tree (e.g. Linuxbrew's Cellar),
+    // and the real file is what must be replaced
+    let exe = exe.canonicalize().unwrap_or(exe);
     cleanup_old_backup(&exe);
     // `--check` is safe for any install; actually replacing a package-managed
     // binary would be wrong, so refuse before doing any network work.
