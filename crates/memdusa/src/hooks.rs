@@ -397,7 +397,10 @@ async fn log(ctx: &Ctx<'_>, kind: &str, content: String, data: Option<Value>) ->
 /// brief arrives after the agent has already started (or never arrives if the hook is cut short).
 /// Spend at most this long on the full brief, then answer with a minimal one. The session event
 /// is recorded before this budget starts, so a slow or failing brief can never lose the session.
-const SESSION_BRIEF_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// It must exceed the brief's own 3 s cap on the semantic query embedding (after which the brief
+/// falls back to lexical ranking), so a slow embedding API yields a lexical brief, not a degraded
+/// one; and stay under the 5 s hook timeout `memdusa install cursor` writes.
+const SESSION_BRIEF_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 
 async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
     session_start_with_budget(ctx, source, SESSION_BRIEF_BUDGET).await
