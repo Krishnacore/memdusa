@@ -41,6 +41,10 @@ machine and in every harness. Without a remote it falls back to the git root pat
   to change the destination. Then connect a harness, e.g. `memdusa install claude-code`.
 - **Prebuilt binaries** (Linux x86_64/arm64, macOS Intel/Apple Silicon, Windows): download from the GitHub release
   for each `v*` tag, unpack, and put `memdusa` on your `PATH`.
+- **Self-update**: `memdusa self-update` fetches the latest release for your platform, verifies its SHA-256 checksum
+  and replaces the running binary. `memdusa self-update --check` only reports the available version (no download);
+  `memdusa self-update --version v0.1.1` installs a specific one. Installs managed by Homebrew or cargo are not
+  replaced: use `brew upgrade memdusa` or `cargo install` / `cargo binstall memdusa` instead.
 - **Server image**: `docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa` (SQLite in the `/data`
   volume; set `MEMDUSA_DATABASE_URL=postgres://…` for Postgres, `MEMDUSA_ALLOWED_HOSTS` for your domain).
   Create the first user with `docker exec <container> memdusa user add <name> --admin`.
@@ -439,9 +443,9 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
   - ✓ one-line install script (`curl -fsSL …/install.sh | sh`) that picks the right archive, verifies its checksum and
     installs to `~/.local/bin`, plus a PowerShell equivalent for Windows
   - Windows: Scoop bucket and winget manifest, generated per release
-  - `cargo binstall memdusa` (metadata pointing at the release archives) and publishing to crates.io
+  - ✓ `cargo binstall memdusa` metadata pointing at the release archives (publishing to crates.io is still to do)
   - Linux packages (`.deb`/`.rpm`) and an AUR package; container images are already published to GHCR
-  - `memdusa self-update` that uses the same release archives and checksums
+  - ✓ `memdusa self-update` that uses the same release archives and checksums
 - [ ] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
       OpenCode or Codex workers via `hc`, or a harness's own subagents). Observed while building memdusa itself:
       when a worker hit its usage limit, its replacement in another harness started from scratch. Ideas:
