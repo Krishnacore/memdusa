@@ -294,6 +294,7 @@ async fn brief_warns_when_code_state_drifted() {
             dirty_count: 2,
             dirty_files: vec!["src/refund.ts".into(), "src/api.ts".into()],
             host: Some("laptop".into()),
+            worktree: None,
         };
         s.checkpoint_save(NewCheckpoint {
             project: p.clone(),
@@ -324,6 +325,72 @@ async fn brief_warns_when_code_state_drifted() {
         let warn_at = b.markdown.find("⚠ Code state differs").expect("warning section");
         assert!(warn_at < b.markdown.find("Where things stand").unwrap(), "{name}: warnings come first");
         assert!(b.markdown.contains("saved on `laptop`") && b.markdown.contains("you're on `main`"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn brief_uses_the_callers_worktree_and_summarizes_others() {
+    for (name, s) in stores().await {
+        let p = project();
+        let wt = |path: &str, branch: &str, head: &str| GitState {
+            branch: Some(branch.into()),
+            head: Some(head.into()),
+            host: Some("mbp".into()),
+            worktree: Some(path.into()),
+            ..Default::default()
+        };
+
+        // Worker A saved the newest project checkpoint, on its own branch/worktree.
+        let a = wt("/work/wta", "feat/a", "aaa1111");
+        s.checkpoint_save(NewCheckpoint {
+            project: p.clone(),
+            goal: "A's work".into(),
+            git: Some(a.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // A's edits are stored with cwd = its worktree.
+        for f in ["a.rs", "b.rs"] {
+            s.event_append(NewEvent {
+                project: p.clone(),
+                kind: "file_change".into(),
+                content: f.into(),
+                data: Some(json!({ "cwd": "/work/wta" })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+
+        // Caller in worktree B: no checkpoint of its own yet.
+        let b = wt("/work/wtb", "feat/b", "bbb2222");
+        let brief = brief::build(&s, &p, None, Some(&b), None).await.unwrap();
+        assert!(brief.git_warnings.is_empty(), "{name}: {:?}", brief.git_warnings);
+        assert_eq!(
+            brief.other_worktree_note.as_deref(),
+            Some("_Latest checkpoint was saved in another worktree (../wta, branch feat/a)._"),
+            "{name}"
+        );
+        assert!(!brief.markdown.contains("⚠ Code state differs"), "{name}");
+        assert!(brief.markdown.contains("Latest checkpoint was saved in another worktree"), "{name}");
+        assert!(brief.markdown.contains("Other worktrees: ../wta (2 files)"), "{name}: {}", brief.markdown);
+        assert!(!brief.markdown.contains("**Files changed recently:**"), "{name}: nothing changed in B");
+
+        // An older checkpoint in B wins: compare with that, and no "other worktree" note.
+        let older = wt("/work/wtb", "feat/b", "bbb2222");
+        s.checkpoint_save(NewCheckpoint {
+            project: p.clone(),
+            goal: "B's earlier stop".into(),
+            created_at: Some(now_ms() - 60_000),
+            git: Some(older),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let brief = brief::build(&s, &p, None, Some(&b), None).await.unwrap();
+        assert!(brief.git_warnings.is_empty(), "{name}: {:?}", brief.git_warnings);
+        assert!(brief.other_worktree_note.is_none(), "{name}");
     }
 }
 

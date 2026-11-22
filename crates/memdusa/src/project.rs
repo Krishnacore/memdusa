@@ -33,6 +33,9 @@ pub fn git_state(dir: &Path) -> Option<GitState> {
     }
     let mut state = parse_status(&String::from_utf8_lossy(&out.stdout));
     state.host = gethostname::gethostname().into_string().ok().filter(|h| !h.is_empty());
+    // Same repo, different worktrees: record which one this state belongs to.
+    state.worktree = git(dir, &["rev-parse", "--show-toplevel"])
+        .map(|p| std::fs::canonicalize(&p).map(|c| c.to_string_lossy().into_owned()).unwrap_or(p));
     Some(state)
 }
 
@@ -94,6 +97,8 @@ pub fn normalize_remote(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::{normalize_remote, parse_status};
 
     #[test]
@@ -110,6 +115,19 @@ mod tests {
 
         let fresh = parse_status("# branch.oid (initial)\n# branch.head (detached)\n");
         assert_eq!((fresh.head, fresh.branch, fresh.dirty_count), (None, None, 0));
+    }
+
+    #[test]
+    fn git_state_records_the_worktree_root() {
+        let dir = std::env::temp_dir().join(format!("memdusa-wt-{}", memdusa_core::model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Command::new("git").arg("init").arg("-q").arg(&dir).status().unwrap().success());
+        let state = super::git_state(&dir).unwrap();
+        assert!(state.worktree.is_some(), "worktree root should be recorded");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let recorded = std::fs::canonicalize(state.worktree.unwrap()).unwrap();
+        assert_eq!(recorded, root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

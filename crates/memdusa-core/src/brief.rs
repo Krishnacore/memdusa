@@ -50,8 +50,11 @@ pub struct Brief {
     pub recent_events: Vec<Event>,
     /// Recent tasks workers were delegated (coordinator view; empty in a worker's own brief).
     pub delegated: Vec<DelegatedWork>,
-    /// How the caller's code state differs from the latest checkpoint's.
+    /// How the caller's code state differs from the checkpoint we compared with.
     pub git_warnings: Vec<String>,
+    /// Calm note when the newest checkpoint came from a different worktree (no drift warning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_worktree_note: Option<String>,
     /// The same content rendered as Markdown, ready to paste into a prompt.
     pub markdown: String,
 }
@@ -96,6 +99,136 @@ fn truncate(s: &str, max: usize) -> String {
     let mut t: String = s.chars().take(max).collect();
     t.push('…');
     t
+}
+
+// ---------------------------------------------------------------- worktrees
+
+/// Lexically normalize a path for comparison: forward slashes everywhere, no `.`/`..`.
+/// No filesystem access (a path may live on another machine, or no longer exist).
+fn norm_path(path: &str) -> String {
+    let replaced = path.replace('\\', "/");
+    // Windows canonicalize() prefixes paths with `\\?\`.
+    let normalized = replaced.strip_prefix("//?/").unwrap_or(&replaced);
+    let mut parts: Vec<&str> = vec![];
+    for raw in normalized.split('/') {
+        match raw {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
+
+/// Path components are case-insensitive on Windows, case-sensitive elsewhere.
+fn same_worktree_path(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// Is `path` the worktree root `root`, or a directory underneath it?
+fn under_worktree(path: &str, root: &str) -> bool {
+    same_worktree_path(path, root) || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+}
+
+/// A worktree path as seen from `current`: `../memdusa-eval2` for a sibling checkout.
+fn display_worktree(other: &str, current: Option<&str>) -> String {
+    let other = norm_path(other);
+    match current {
+        None => other,
+        Some(c) => {
+            let cur = norm_path(c);
+            let a: Vec<&str> = cur.split('/').filter(|s| !s.is_empty()).collect();
+            let b: Vec<&str> = other.split('/').filter(|s| !s.is_empty()).collect();
+            let common = a.iter().zip(&b).take_while(|(x, y)| same_worktree_path(x, y)).count();
+            let mut parts = vec!["..".to_owned(); a.len() - common];
+            parts.extend(b[common..].iter().map(|s| (*s).to_owned()));
+            if parts.is_empty() { ".".to_owned() } else { parts.join("/") }
+        }
+    }
+}
+
+/// Pick the checkpoint the caller's code state should be compared with. Prefer the newest
+/// checkpoint saved in *this* worktree on this machine, then the newest on the same branch,
+/// then today's behaviour (newest overall) when checkpoints carry no worktree info. When the
+/// newest checkpoint is from another worktree, there is no drift to warn about: return a calm
+/// note describing it instead. `drift()` stays a pure comparison of two states.
+fn select_drift_checkpoint<'a>(pool: &'a [Checkpoint], current: &GitState) -> (Option<&'a Checkpoint>, Option<String>) {
+    let Some(wt) = current.worktree.as_deref().map(norm_path) else {
+        return (pool.first(), None);
+    };
+    let same_machine = |g: &GitState| match (&g.host, &current.host) {
+        (Some(a), Some(b)) => same_worktree_path(a, b),
+        _ => true, // no host recorded: assume the same machine
+    };
+    if let Some(cp) = pool.iter().find(|c| {
+        c.git.as_ref().is_some_and(|g| {
+            same_machine(g) && g.worktree.as_deref().is_some_and(|w| same_worktree_path(&norm_path(w), &wt))
+        })
+    }) {
+        return (Some(cp), None);
+    }
+    if let Some(cp) = pool.iter().find(|c| {
+        c.git
+            .as_ref()
+            .and_then(|g| g.branch.as_deref())
+            .zip(current.branch.as_deref())
+            .is_some_and(|(a, b)| same_worktree_path(a, b))
+    }) {
+        return (Some(cp), None);
+    }
+    if let Some(g) = pool.first().and_then(|c| c.git.as_ref())
+        && let Some(other) = g.worktree.as_deref().map(norm_path)
+        && !same_worktree_path(&other, &wt)
+    {
+        let label = display_worktree(&other, Some(&wt));
+        let branch = g.branch.as_deref().unwrap_or("(detached)");
+        return (None, Some(format!("_Latest checkpoint was saved in another worktree ({label}, branch {branch})._")));
+    }
+    (pool.first(), None)
+}
+
+/// Recent file edits split into this worktree (paths already relative to the hook's cwd) and
+/// other worktrees (a friendly label plus the number of distinct files). Edits with no recorded
+/// cwd count as this worktree's, so the output is unchanged when nothing records it.
+fn files_by_worktree<'a>(events: &'a [Event], worktree: &str) -> (Vec<&'a str>, Vec<(String, usize)>) {
+    let current = norm_path(worktree);
+    let mut mine: Vec<&str> = vec![];
+    let mut elsewhere: Vec<(&'a Event, String)> = vec![];
+    for e in events.iter().filter(|e| e.kind == FILE_CHANGE) {
+        let from_here = event_str(e, "cwd").map(norm_path).is_none_or(|cwd| under_worktree(&cwd, &current));
+        if from_here {
+            if !mine.contains(&e.content.as_str()) && mine.len() < 20 {
+                mine.push(&e.content);
+            }
+        } else {
+            elsewhere.push((e, norm_path(event_str(e, "cwd").unwrap_or_default())));
+        }
+    }
+    // A hook may fire in a subdirectory; group those edits under the shallowest cwd
+    // seen for that worktree so one checkout is never split into several entries.
+    let mut roots: Vec<String> = vec![];
+    for (_, cwd) in &elsewhere {
+        if roots.iter().any(|r| same_worktree_path(r, cwd) || under_worktree(cwd, r)) {
+            continue;
+        }
+        roots.retain(|r| !under_worktree(r, cwd));
+        roots.push(cwd.clone());
+    }
+    let others = roots
+        .into_iter()
+        .map(|root| {
+            let count = elsewhere
+                .iter()
+                .filter(|(_, cwd)| under_worktree(cwd, &root))
+                .map(|(e, _)| e.content.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            (display_worktree(&root, Some(&current)), count)
+        })
+        .collect();
+    (mine, others)
 }
 
 /// Every `delegated_session` event of the project, newest first.
@@ -280,7 +413,24 @@ pub async fn build_with_budget(
     let (memories, omitted) =
         select_memories(store, project, user, focus.as_deref(), memory_budget, &recent_events).await?;
 
-    let git_warnings = match (checkpoints.first().and_then(|c| c.git.as_ref()), current_git) {
+    // Drift is compared with the checkpoint from the caller's own worktree when there is one.
+    // Task-scoped worker briefs still select from their task alone; older checkpoints of that
+    // task are kept so a worker can match the worktree it is resuming in.
+    let drift_pool = match current_git {
+        Some(c) if c.worktree.is_some() => Some(match task {
+            Some(t) => store.checkpoints_for_task(project, t, 100).await?,
+            None => store.checkpoints_recent(project, 100).await?,
+        }),
+        _ => None,
+    };
+    let (drift_cp, other_worktree_note) = match &drift_pool {
+        Some(pool) => match current_git {
+            Some(c) => select_drift_checkpoint(pool, c),
+            None => (checkpoints.first(), None),
+        },
+        None => (checkpoints.first(), None),
+    };
+    let git_warnings = match (drift_cp.and_then(|c| c.git.as_ref()), current_git) {
         (Some(saved), Some(current)) => saved.drift(current),
         _ => vec![],
     };
@@ -303,6 +453,8 @@ pub async fn build_with_budget(
         omitted,
         events: &recent_events,
         git_warnings: &git_warnings,
+        other_worktree_note: other_worktree_note.as_deref(),
+        current_worktree: current_git.and_then(|g| g.worktree.as_deref()),
         delegated: &delegated,
         message: message.as_ref(),
         summary: summary.as_ref(),
@@ -315,6 +467,7 @@ pub async fn build_with_budget(
         recent_events,
         delegated,
         git_warnings,
+        other_worktree_note,
         markdown,
     })
 }
@@ -579,6 +732,9 @@ struct Parts<'a> {
     omitted: usize,
     events: &'a [Event],
     git_warnings: &'a [String],
+    other_worktree_note: Option<&'a str>,
+    /// The caller's worktree root, when known: files are grouped by it.
+    current_worktree: Option<&'a str>,
     delegated: &'a [DelegatedWork],
     message: Option<&'a Event>,
     summary: Option<&'a Event>,
@@ -594,6 +750,8 @@ fn render(parts: &Parts) -> String {
         omitted,
         events,
         git_warnings,
+        other_worktree_note,
+        current_worktree,
         delegated,
         message,
         summary,
@@ -613,6 +771,9 @@ fn render(parts: &Parts) -> String {
             let _ = writeln!(o, "- {w}");
         }
         let _ = writeln!(o, "\nVerify the actual state of the code before trusting the notes below.\n");
+    }
+    if let Some(note) = other_worktree_note {
+        let _ = writeln!(o, "{note}\n");
     }
 
     if checkpoints.is_empty() && runs.is_empty() && memories.is_empty() && events.is_empty() && delegated.is_empty() {
@@ -741,13 +902,20 @@ fn render(parts: &Parts) -> String {
 
     if !events.is_empty() {
         // Hooks journal every edit and shell command; collapse those so the
-        // brief stays readable.
-        let mut files: Vec<&str> = vec![];
-        for e in events.iter().filter(|e| e.kind == FILE_CHANGE) {
-            if !files.contains(&e.content.as_str()) && files.len() < 20 {
-                files.push(&e.content);
+        // brief stays readable. With a worktree, show this one's files first and
+        // summarize the other workers' checkouts instead of mixing them in.
+        let (files, other_worktrees) = match current_worktree {
+            Some(wt) => files_by_worktree(events, wt),
+            None => {
+                let mut files: Vec<&str> = vec![];
+                for e in events.iter().filter(|e| e.kind == FILE_CHANGE) {
+                    if !files.contains(&e.content.as_str()) && files.len() < 20 {
+                        files.push(&e.content);
+                    }
+                }
+                (files, vec![])
             }
-        }
+        };
         let commands: Vec<_> = events.iter().filter(|e| e.kind == COMMAND).take(5).collect();
         let others: Vec<_> = events
             .iter()
@@ -758,6 +926,11 @@ fn render(parts: &Parts) -> String {
         let _ = writeln!(o, "## Recent activity");
         if !files.is_empty() {
             let _ = writeln!(o, "**Files changed recently:** {}\n", files.join(", "));
+        }
+        if !other_worktrees.is_empty() {
+            let summary: Vec<String> =
+                other_worktrees.iter().map(|(label, n)| format!("{label} ({n} files)")).collect();
+            let _ = writeln!(o, "Other worktrees: {}\n", summary.join(", "));
         }
         if !commands.is_empty() {
             let _ = writeln!(o, "**Last commands:**");
@@ -775,4 +948,117 @@ fn render(parts: &Parts) -> String {
         }
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cp(worktree: Option<&str>, branch: &str, host: &str, at: Millis) -> Checkpoint {
+        Checkpoint {
+            id: new_id(),
+            project: "p".into(),
+            task: None,
+            goal: format!("goal {at}"),
+            done: vec![],
+            next: vec![],
+            blockers: vec![],
+            files: vec![],
+            notes: None,
+            source: None,
+            git: Some(GitState {
+                branch: Some(branch.into()),
+                head: Some("a1b2c3d4e5".into()),
+                host: Some(host.into()),
+                worktree: worktree.map(String::from),
+                ..Default::default()
+            }),
+            created_at: at,
+        }
+    }
+
+    fn caller() -> GitState {
+        GitState {
+            branch: Some("feat/b".into()),
+            head: Some("fffffff0000".into()),
+            host: Some("mbp".into()),
+            worktree: Some("/work/wtb".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drift_checkpoint_prefers_same_worktree_then_branch() {
+        let current = caller();
+        let other = cp(Some("/work/wta"), "feat/a", "mbp", 300);
+        let same_wt = cp(Some("/work/wtb"), "feat/old", "mbp", 200);
+        let same_branch = cp(Some("/work/wtc"), "feat/b", "mbp", 100);
+
+        let pool = [other.clone(), same_wt.clone(), same_branch.clone()];
+        let (chosen, note) = select_drift_checkpoint(&pool, &current);
+        assert_eq!(chosen.map(|c| &c.id), Some(&same_wt.id), "same worktree wins even if older");
+        assert!(note.is_none());
+
+        let pool = [other, same_branch.clone()];
+        let (chosen, note) = select_drift_checkpoint(&pool, &current);
+        assert_eq!(chosen.map(|c| &c.id), Some(&same_branch.id), "then the same branch");
+        assert!(note.is_none());
+
+        // A different machine's copy of the same path is not our worktree: fall through to branch.
+        let remote = cp(Some("/work/wtb"), "feat/old", "desktop", 300);
+        let pool = [remote, same_branch.clone()];
+        let (chosen, _) = select_drift_checkpoint(&pool, &current);
+        assert_eq!(chosen.map(|c| &c.id), Some(&same_branch.id), "different machine is not the same worktree");
+    }
+
+    #[test]
+    fn drift_checkpoint_notes_other_worktree_and_keeps_legacy_behaviour() {
+        let current = GitState { worktree: Some("C:\\work\\wtb".into()), ..caller() };
+        let other = cp(Some("C:/work/wta"), "feat/eval", "mbp", 300);
+        let pool = [other];
+        let (chosen, note) = select_drift_checkpoint(&pool, &current);
+        assert!(chosen.is_none(), "no warning against another worker's branch");
+        assert_eq!(
+            note.as_deref(),
+            Some("_Latest checkpoint was saved in another worktree (../wta, branch feat/eval)._"),
+            "{note:?}"
+        );
+
+        let legacy = cp(None, "feat/a", "mbp", 300);
+        let pool = [legacy.clone()];
+        let (chosen, note) = select_drift_checkpoint(&pool, &current);
+        assert_eq!(chosen.map(|c| &c.id), Some(&legacy.id), "no worktree info: today's behaviour");
+        assert!(note.is_none());
+
+        let no_wt_caller = GitState { worktree: None, ..current };
+        let pool = [legacy.clone()];
+        let (chosen, note) = select_drift_checkpoint(&pool, &no_wt_caller);
+        assert_eq!(chosen.map(|c| &c.id), Some(&legacy.id));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn files_are_grouped_by_worktree() {
+        let event = |content: &str, cwd: Option<&str>| Event {
+            id: new_id(),
+            project: "p".into(),
+            session: None,
+            source: None,
+            kind: FILE_CHANGE.into(),
+            content: content.into(),
+            data: cwd.map(|c| serde_json::json!({ "cwd": c })),
+            created_at: 1,
+        };
+        let events = vec![
+            event("b.rs", Some("C:\\work\\wtb")),
+            event("a.rs", Some("C:/work/wta")),
+            event("a2.rs", Some("C:\\work\\wta\\sub")),
+            event("legacy.rs", None),
+        ];
+        let (mine, others) = files_by_worktree(&events, "C:/work/wtb");
+        assert_eq!(mine, vec!["b.rs", "legacy.rs"], "no-cwd edits stay in this worktree");
+        assert_eq!(others, vec![("../wta".to_owned(), 2)], "paths shown relative to the caller");
+        assert_eq!(display_worktree("/work/wta", Some("/work/wtb")), "../wta");
+        assert_eq!(display_worktree("/work/wtb", Some("/work/wtb")), ".");
+    }
 }
