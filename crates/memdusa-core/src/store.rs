@@ -787,6 +787,48 @@ impl Store {
         self.events_query(project, session, Some(kind), limit).await
     }
 
+    /// Events of one `kind` belonging to any of `sessions`, oldest first. Unlike
+    /// [`Self::events_recent`] this does not go through the "N most recent events"
+    /// window, so an old event (e.g. a worker's original assignment) survives a
+    /// long, busy task. Portable `Q` SQL: SQLite + Postgres.
+    pub async fn events_for_sessions_kind(
+        &self,
+        project: &str,
+        sessions: &[&str],
+        kind: &str,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        if sessions.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut q = Q::new("SELECT * FROM events WHERE project = ");
+        let p = q.text(project);
+        q.push(&p);
+        let k = q.text(kind);
+        q.push(&format!(" AND kind = {k} AND session IN ("));
+        let vals: Vec<String> = sessions.iter().map(|s| q.text(*s)).collect();
+        q.push(&vals.join(", ")).push(")");
+        let l = q.int(limit.clamp(1, 500));
+        q.push(&format!(" ORDER BY created_at ASC, id ASC LIMIT {l}"));
+        q.build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(Event {
+                    id: r.try_get("id")?,
+                    project: r.try_get("project")?,
+                    session: r.try_get("session")?,
+                    source: r.try_get("source")?,
+                    kind: r.try_get("kind")?,
+                    content: r.try_get("content")?,
+                    data: from_json(r.try_get("data")?),
+                    created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
     async fn events_query(
         &self,
         project: &str,
