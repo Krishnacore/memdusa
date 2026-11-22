@@ -83,7 +83,9 @@ impl OAuthConfig {
     }
 
     pub fn www_authenticate(&self) -> String {
-        format!("Bearer resource_metadata=\"{}\"", self.resource_metadata_url())
+        // `scope` tells MCP clients what to request (spec: scope from the challenge first, else every
+        // `scopes_supported`); without it they asked for `memdusa memdusa:read` together.
+        format!("Bearer resource_metadata=\"{}\", scope=\"memdusa\"", self.resource_metadata_url())
     }
 
     pub fn is_secure(&self) -> bool {
@@ -249,6 +251,10 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
     {
         return invalid("unsupported scope");
     }
+    // Echo what the client asked for (default: full access). Advertising every supported scope made
+    // clients (e.g. the MCP Python SDK) request `memdusa memdusa:read` when they only wanted `memdusa`.
+    // The scope a token actually gets is decided (and shown on the consent page) at /oauth/authorize.
+    let registered_scope = b.scope.clone().unwrap_or_else(|| "memdusa".into());
     let client = OAuthClient {
         id: new_id(),
         client_id: generate_secret(CLIENT_PREFIX).unwrap_or_else(|_| format!("{CLIENT_PREFIX}{}", new_id())),
@@ -277,7 +283,7 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
         "token_endpoint_auth_method": "none",
         "grant_types": client.grant_types,
         "response_types": ["code"],
-        "scope": SUPPORTED_SCOPES.join(" "),
+        "scope": registered_scope,
     }))
     .into_response()
 }
@@ -1403,7 +1409,7 @@ mod tests {
             assert_eq!(r.status(), 401);
             assert_eq!(
                 r.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap(),
-                "Bearer resource_metadata=\"http://127.0.0.1:1/.well-known/oauth-protected-resource\""
+                "Bearer resource_metadata=\"http://127.0.0.1:1/.well-known/oauth-protected-resource\", scope=\"memdusa\""
             );
         }
     }
