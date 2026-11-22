@@ -44,6 +44,8 @@ async fn clients_transactions_codes_and_grants() {
             state: "s".into(),
             user_name: None,
             created_at: now_ms(),
+            upstream: None,
+            signin_method: "api_key".into(),
         };
         s.oauth_txn_create(&txn).await.unwrap();
         assert_eq!(s.oauth_txn_get(&txn.csrf).await.unwrap().unwrap().state, "s");
@@ -155,5 +157,48 @@ async fn read_only_scope_and_sessions() {
             0,
             "{name}: idempotent"
         );
+    }
+}
+
+#[tokio::test]
+async fn identities_link_bind_and_unlink() {
+    for (name, s) in stores().await {
+        let user = format!("u{}", new_id()).replace('-', "");
+        s.user_create(&user, false).await.unwrap();
+
+        // Admin link is stored pending until the first successful sign-in.
+        let pending = s.identity_insert(&user, "github", "pending:octocat", None, Some("octocat")).await.unwrap();
+        assert!(pending.pending());
+        assert_eq!(pending.handle(), "octocat");
+        assert_eq!(s.identity_by_subject("github", "424242").await.unwrap().map(|i| i.user_name), None);
+        assert_eq!(s.identity_pending("github", "octocat").await.unwrap().unwrap().user_name, user);
+
+        s.identity_bind_pending(&pending, "424242").await.unwrap();
+        let bound = s.identity_by_subject("github", "424242").await.unwrap().unwrap();
+        assert_eq!(bound.user_name, user);
+        assert!(!bound.pending());
+        assert_eq!(bound.subject, "424242");
+
+        // Duplicate real subjects are refused, and unlink removes by subject
+        // or by pending handle.
+        assert!(s.identity_insert(&user, "github", "424242", None, None).await.is_err());
+        s.identity_insert(&user, "google", "pending:alice@acme.com", Some("alice@acme.com"), None).await.unwrap();
+        assert_eq!(s.identity_list(&user).await.unwrap().len(), 2);
+        assert_eq!(s.identity_unlink(&user, "google", "alice@acme.com").await.unwrap(), 1);
+        assert_eq!(s.identity_unlink(&user, "github", "424242").await.unwrap(), 1);
+        assert!(s.identity_list(&user).await.unwrap().is_empty(), "{name}: all links removed");
+    }
+}
+
+#[tokio::test]
+async fn auto_provision_user_names_are_sanitized_and_unique() {
+    for (_name, s) in stores().await {
+        let first = s.user_create_unique("Alice.O@example").await.unwrap();
+        assert_eq!(first.name, "alice.o-example");
+        assert!(!first.admin);
+        let second = s.user_create_unique("Alice.O@example").await.unwrap();
+        assert_eq!(second.name, "alice.o-example-2");
+        let third = s.user_create_unique("Alice.O@example").await.unwrap();
+        assert_eq!(third.name, "alice.o-example-3");
     }
 }

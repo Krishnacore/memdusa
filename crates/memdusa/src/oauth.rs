@@ -28,6 +28,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::http::{ApiError, AppState};
+use crate::oauth_upstream::{self, GITHUB, GOOGLE, Upstream, UpstreamConfig};
 
 pub const ACCESS_SECS: i64 = 3600;
 pub const REFRESH_SECS: i64 = 30 * 24 * 3600;
@@ -51,6 +52,8 @@ pub struct OAuthConfig {
     pub absolute_secs: i64,
     pub code_secs: i64,
     pub txn_secs: i64,
+    /// Upstream GitHub/Google providers (enabled by their credentials).
+    pub upstream: UpstreamConfig,
 }
 
 impl OAuthConfig {
@@ -64,6 +67,16 @@ impl OAuthConfig {
         let secs = |name: &str, default: i64| -> i64 {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).filter(|v| *v > 0).unwrap_or(default)
         };
+        let env_list = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let env = |name: &str| std::env::var(name).unwrap_or_default().trim().to_owned();
+        use crate::oauth_upstream::{GitHubConfig, GoogleConfig};
         Ok(Some(Self {
             issuer: url.into(),
             access_secs: secs("MEMDUSA_OAUTH_ACCESS_SECS", ACCESS_SECS),
@@ -71,7 +84,39 @@ impl OAuthConfig {
             absolute_secs: secs("MEMDUSA_OAUTH_ABSOLUTE_SECS", ABSOLUTE_SECS),
             code_secs: secs("MEMDUSA_OAUTH_CODE_SECS", CODE_SECS),
             txn_secs: secs("MEMDUSA_OAUTH_SIGNIN_SECS", TXN_SECS),
+            upstream: UpstreamConfig {
+                github: GitHubConfig {
+                    client_id: env("MEMDUSA_OAUTH_GITHUB_CLIENT_ID"),
+                    client_secret: env("MEMDUSA_OAUTH_GITHUB_CLIENT_SECRET"),
+                    // Test-only base-URL overrides (documented in the README).
+                    auth_url: env("MEMDUSA_TEST_GITHUB_AUTH_URL"),
+                    token_url: env("MEMDUSA_TEST_GITHUB_TOKEN_URL"),
+                    api_url: env("MEMDUSA_TEST_GITHUB_API_URL"),
+                    allowed_orgs: env_list("MEMDUSA_OAUTH_ALLOW_GITHUB_ORGS"),
+                },
+                google: GoogleConfig {
+                    client_id: env("MEMDUSA_OAUTH_GOOGLE_CLIENT_ID"),
+                    client_secret: env("MEMDUSA_OAUTH_GOOGLE_CLIENT_SECRET"),
+                    // Test-only endpoint overrides (documented in the README).
+                    discovery_url: env("MEMDUSA_TEST_GOOGLE_DISCOVERY_URL"),
+                    jwks_url: env("MEMDUSA_TEST_GOOGLE_JWKS_URL"),
+                    userinfo_url: env("MEMDUSA_TEST_GOOGLE_USERINFO_URL"),
+                    allowed_domains: env_list("MEMDUSA_OAUTH_ALLOW_GOOGLE_DOMAINS"),
+                },
+            },
         }))
+    }
+
+    /// Callback URLs to register with GitHub/Google for the enabled providers.
+    pub fn callback_urls(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if self.upstream.github.enabled() {
+            out.push((GITHUB.into(), format!("{}/oauth/callback/github", self.issuer)));
+        }
+        if self.upstream.google.enabled() {
+            out.push((GOOGLE.into(), format!("{}/oauth/callback/google", self.issuer)));
+        }
+        out
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -111,12 +156,15 @@ pub fn validate_issuer(url: &str) -> anyhow::Result<()> {
 #[derive(Clone)]
 pub struct OAuthRuntime {
     pub config: OAuthConfig,
+    /// Upstream provider client and JWKS/discovery caches.
+    pub upstream: Upstream,
     failures: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
 }
 
 impl OAuthRuntime {
     pub fn new(config: OAuthConfig) -> Self {
-        Self { config, failures: Arc::new(Mutex::new(HashMap::new())) }
+        let upstream = Upstream::new(config.upstream.clone());
+        Self { config, upstream, failures: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     /// Record a failed sign-in; returns true when this IP is now blocked.
@@ -151,6 +199,8 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/signin", post(signin))
+        .route("/oauth/signin/{provider}", get(upstream_start))
+        .route("/oauth/callback/{provider}", get(upstream_callback))
         .route("/oauth/consent", post(consent))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
@@ -164,6 +214,13 @@ pub fn session_routes() -> Router<AppState> {
         .route("/v1/me/sessions/{id}", delete(my_session_revoke))
         .route("/v1/admin/sessions", get(admin_sessions))
         .route("/v1/admin/sessions/{id}", delete(admin_session_revoke))
+}
+
+/// Identity linking endpoints (admin-only; all handlers check `Identity.admin`).
+pub fn identity_routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/admin/users/{name}/identities", get(identity_list).post(identity_link))
+        .route("/v1/admin/users/{name}/identities/{provider}/{handle}", delete(identity_unlink))
 }
 
 // ---------------------------------------------------------------- metadata
@@ -349,13 +406,15 @@ async fn authorize(State(s): State<AppState>, Query(q): Query<AuthorizeQuery>) -
         state,
         user_name: None,
         created_at: now_ms(),
+        upstream: None,
+        signin_method: "api_key".into(),
     };
     if let Err(e) = s.store.oauth_txn_create(&txn).await {
         return internal(&e);
     }
     let secs = cfg(&s).config.txn_secs;
     let cookie = cookie_header(&s, &txn.csrf, false, secs);
-    let html = signin_html(&txn, &client.name, None);
+    let html = signin_html(&txn, &client.name, None, &cfg(&s).config.upstream);
     ([(header::SET_COOKIE, cookie), (header::CACHE_CONTROL, "no-store".to_owned())], Html(html)).into_response()
 }
 
@@ -395,7 +454,8 @@ async fn signin(
             if blocked {
                 return err(StatusCode::TOO_MANY_REQUESTS, "slow_down", "too many failed sign-ins; try again later");
             }
-            let html = signin_html(&txn, &client_name, Some("That API key didn't work. Try again."));
+            let html =
+                signin_html(&txn, &client_name, Some("That API key didn't work. Try again."), &cfg(&s).config.upstream);
             return (StatusCode::UNAUTHORIZED, Html(html)).into_response();
         }
         Err(e) => return internal(&e),
@@ -412,7 +472,8 @@ async fn signin(
     {
         tracing::warn!("could not audit sign-in: {e}");
     }
-    Html(consent_html(&user, &client_name, &txn.redirect_uri, &txn.scope, &txn.csrf)).into_response()
+    Html(consent_html(&user, &client_name, &txn.redirect_uri, &txn.scope, &txn.csrf, &cfg(&s).config.upstream))
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +536,252 @@ async fn consent(State(s): State<AppState>, headers: HeaderMap, Form(f): Form<Co
         [(header::LOCATION, location), (header::SET_COOKIE, clear), (header::CACHE_CONTROL, "no-store".to_owned())],
     )
         .into_response()
+}
+
+// ------------------------------------------------------------ upstream (H2b)
+
+#[derive(Debug, Deserialize)]
+struct UpstreamStartQuery {
+    csrf: String,
+}
+
+/// Start a GitHub/Google sign-in from the sign-in page (or a link from the
+/// consent page). The pending memdusa transaction is carried through in the
+/// `state` parameter so the callback can bind back to it.
+async fn upstream_start(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    Query(q): Query<UpstreamStartQuery>,
+) -> Response {
+    let Some(txn) = check_csrf(&s, &headers, &q.csrf).await else {
+        return invalid("missing or expired sign-in cookie");
+    };
+    let provider = provider.to_lowercase();
+    let upstream = &cfg(&s).upstream;
+    if !upstream.enabled(&provider) {
+        return info_page("Not configured", &format!("Sign-in with {provider} is not configured on this server."));
+    }
+    let state = format!("{}.{}", txn.csrf, generate_secret("st_").unwrap_or_else(|_| format!("st_{}", new_id())));
+    let verifier = generate_secret("pkce_").unwrap_or_else(|_| format!("pkce_{}", new_id()));
+    let nonce = if provider == GOOGLE {
+        Some(generate_secret("nonce_").unwrap_or_else(|_| format!("nonce_{}", new_id())))
+    } else {
+        None
+    };
+    let callback = upstream.callback_url(&cfg(&s).config.issuer, &provider);
+    let url = match upstream.authorize_url(&provider, &callback, &state, &verifier, nonce.as_deref()).await {
+        Ok(url) => url,
+        Err(e) => {
+            tracing::warn!("could not build {provider} authorize URL: {e}");
+            return info_page("Sign-in failed", "Could not start the upstream sign-in. Please try again.");
+        }
+    };
+    let bound = UpstreamTxn { provider: provider.clone(), state, verifier, nonce };
+    if let Err(e) = s.store.oauth_txn_set_upstream(&txn.csrf, &bound, &provider).await {
+        return internal(&e);
+    }
+    (StatusCode::FOUND, [(header::LOCATION, url), (header::CACHE_CONTROL, "no-store".to_owned())]).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamCallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+async fn upstream_callback(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    Query(q): Query<UpstreamCallbackQuery>,
+) -> Response {
+    let provider = provider.to_lowercase();
+    let state = q.state.as_deref().unwrap_or_default();
+    let (csrf, _) = match state.split_once('.') {
+        Some(pair) => pair,
+        None => return invalid("invalid upstream state"),
+    };
+    let Some(txn) = check_csrf(&s, &headers, csrf).await else {
+        return invalid("missing or expired sign-in cookie");
+    };
+    let Some(bound) = txn.upstream.as_ref().filter(|u| u.provider == provider && u.state == state) else {
+        // State mismatch (wrong provider, replay, or CSRF) is refused.
+        tracing::warn!("upstream state mismatch for {provider}");
+        let _ = s
+            .store
+            .audit(NewAuditEvent::denied("anonymous", "oauth.upstream_state_mismatch").target(&provider).detail(
+                json!({
+                    "provider": provider
+                }),
+            ))
+            .await;
+        return info_page("Sign-in failed", "The upstream response did not match this sign-in. Please try again.");
+    };
+    let bound = bound.clone();
+
+    if let Some(e) = q.error {
+        tracing::warn!("{provider} authorize error: {} / {}", e, q.error_description.as_deref().unwrap_or(""));
+        let _ = s
+            .store
+            .audit(NewAuditEvent::denied("anonymous", "oauth.upstream_error").target(&provider).detail(json!({
+                "provider": provider, "error": e
+            })))
+            .await;
+        return info_page("Sign-in failed", "The identity provider could not complete the sign-in. Please try again.");
+    }
+    let Some(code) = q.code else { return invalid("missing upstream code") };
+
+    let upstream = &cfg(&s).upstream;
+    let callback = upstream.callback_url(&cfg(&s).config.issuer, &provider);
+    let identity = match upstream.exchange(&provider, &code, &bound.verifier, &callback, bound.nonce.as_deref()).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("{provider} identity exchange failed: {e}");
+            let _ = s
+                .store
+                .audit(NewAuditEvent::denied("anonymous", "oauth.upstream_exchange_failed").target(&provider).detail(
+                    json!({
+                        "provider": provider, "error": e.to_string()
+                    }),
+                ))
+                .await;
+            return info_page("Sign-in failed", "Could not verify your identity with the provider. Please try again.");
+        }
+    };
+
+    let signed_in = txn.user_name.as_deref();
+    let user = match oauth_upstream::resolve_identity(&s.store, &identity, upstream, signed_in).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("identity resolution failed: {e}");
+            let _ = s
+                .store
+                .audit(NewAuditEvent::denied("anonymous", "oauth.identity_link_conflict").target(&provider).detail(
+                    json!({
+                        "provider": provider, "subject": identity.subject, "error": e.to_string()
+                    }),
+                ))
+                .await;
+            return info_page("Sign-in failed", &format!("{e}"));
+        }
+    };
+
+    let Some(user) = user else {
+        let _ = s
+            .store
+            .audit(NewAuditEvent::denied("anonymous", "oauth.identity_unknown").target(&provider).detail(json!({
+                "provider": provider, "subject": identity.subject, "display": identity.display
+            })))
+            .await;
+        return not_linked_html(&provider, &identity.display);
+    };
+
+    if let Err(e) = s.store.oauth_txn_set_user(&txn.csrf, &user).await {
+        return internal(&e);
+    }
+    if let Err(e) = s
+        .store
+        .audit(NewAuditEvent::ok(&user, "oauth.signin").target(&txn.client_id).detail(json!({
+            "method": provider, "provider": provider, "subject": identity.subject
+        })))
+        .await
+    {
+        tracing::warn!("could not audit upstream sign-in: {e}");
+    }
+    let client_name = s.store.oauth_client_get(&txn.client_id).await.ok().flatten().map(|c| c.name).unwrap_or_default();
+    Html(consent_html(&user, &client_name, &txn.redirect_uri, &txn.scope, &txn.csrf, &cfg(&s).config.upstream))
+        .into_response()
+}
+
+// -------------------------------------------------------------- identities
+
+async fn identity_list(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if !id.admin {
+        return ApiError(Error::Forbidden("admin only".into())).into_response();
+    }
+    match s.store.identity_list(&name).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkBody {
+    provider: String,
+    identity: String,
+}
+
+async fn identity_link(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(b): Json<LinkBody>,
+) -> Response {
+    if !id.admin {
+        return ApiError(Error::Forbidden("admin only".into())).into_response();
+    }
+    let (provider, handle) = match oauth_upstream::parse_link(&format!("{}:{}", b.provider, b.identity)) {
+        Ok(v) => v,
+        Err(e) => return invalid(&e.to_string()),
+    };
+    let (subject, login, email) = if oauth_upstream::is_stable_subject(&handle) {
+        (handle.clone(), None, None)
+    } else if provider == GITHUB {
+        (format!("{}{}", oauth_upstream::PENDING_PREFIX, handle), Some(handle.clone()), None)
+    } else {
+        (format!("{}{}", oauth_upstream::PENDING_PREFIX, handle), None, Some(handle.clone()))
+    };
+    match s.store.identity_insert(&name, &provider, &subject, email.as_deref(), login.as_deref()).await {
+        Ok(inserted) => {
+            if let Err(e) = s
+                .store
+                .audit(NewAuditEvent::ok(id.actor(), "oauth.identity_link").target(&name).detail(json!({
+                    "provider": provider, "handle": handle
+                })))
+                .await
+            {
+                tracing::warn!("could not audit identity link: {e}");
+            }
+            Json(inserted).into_response()
+        }
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+async fn identity_unlink(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    axum::extract::Path((name, provider, handle)): axum::extract::Path<(String, String, String)>,
+) -> Response {
+    if !id.admin {
+        return ApiError(Error::Forbidden("admin only".into())).into_response();
+    }
+    match s.store.identity_unlink(&name, &provider, &handle).await {
+        Ok(n) => {
+            if let Err(e) = s
+                .store
+                .audit(NewAuditEvent::ok(id.actor(), "oauth.identity_unlink").target(&name).detail(json!({
+                    "provider": provider, "handle": handle, "removed": n
+                })))
+                .await
+            {
+                tracing::warn!("could not audit identity unlink: {e}");
+            }
+            Json(json!({ "unlinked": n })).into_response()
+        }
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 
 // -------------------------------------------------------------------- token
@@ -853,12 +1160,27 @@ fn html_page(title: &str, body: String) -> String {
          body{{font:16px system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#222}}\
          input{{width:100%;box-sizing:border-box;padding:.6rem;margin:.3rem 0 1rem}}\
          button{{padding:.6rem 1rem;margin-right:.5rem;cursor:pointer}}\
+         a.provider{{display:inline-block;padding:.6rem 1rem;margin:.2rem .5rem .2rem 0;border:1px solid #888;border-radius:.3rem;text-decoration:none;color:#222}}\
          .alt{{opacity:.55}}.err{{color:#b00020}}</style></head><body>{body}</body></html>"
     )
 }
 
-fn signin_html(txn: &OAuthTransaction, client_name: &str, error: Option<&str>) -> String {
+fn signin_html(txn: &OAuthTransaction, client_name: &str, error: Option<&str>, providers: &UpstreamConfig) -> String {
     let error = error.map(|e| format!("<p class=\"err\">{}</p>", esc(e))).unwrap_or_default();
+    let mut buttons = String::new();
+    if providers.github.enabled() {
+        buttons.push_str(&format!(
+            "<a class=\"provider\" href=\"/oauth/signin/github?csrf={}\">Continue with GitHub</a>",
+            pct(&txn.csrf)
+        ));
+    }
+    if providers.google.enabled() {
+        buttons.push_str(&format!(
+            "<a class=\"provider\" href=\"/oauth/signin/google?csrf={}\">Continue with Google</a>",
+            pct(&txn.csrf)
+        ));
+    }
+    let alt = if buttons.is_empty() { String::new() } else { format!("<hr><p class=\"alt\">Or:</p><p>{buttons}</p>") };
     html_page(
         "Sign in · memdusa",
         format!(
@@ -867,21 +1189,43 @@ fn signin_html(txn: &OAuthTransaction, client_name: &str, error: Option<&str>) -
              <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
              <label for=\"api_key\">API key</label>\
              <input id=\"api_key\" type=\"password\" name=\"api_key\" autocomplete=\"off\" required>\
-             <button type=\"submit\">Sign in</button></form>\
-             <hr><p class=\"alt\">Continue with GitHub / Google — coming in H2b</p>\
-             <p class=\"alt\"><button disabled>Continue with GitHub</button><button disabled>Continue with Google</button></p>",
+             <button type=\"submit\">Sign in</button></form>{}",
             esc(client_name),
             error,
-            esc(&txn.csrf)
+            esc(&txn.csrf),
+            alt
         ),
     )
 }
 
-fn consent_html(user: &str, client_name: &str, redirect_uri: &str, scope: &str, csrf: &str) -> String {
+fn consent_html(
+    user: &str,
+    client_name: &str,
+    redirect_uri: &str,
+    scope: &str,
+    csrf: &str,
+    providers: &UpstreamConfig,
+) -> String {
     let host = Url::parse(redirect_uri)
         .ok()
         .and_then(|u| u.host_str().map(String::from))
         .unwrap_or_else(|| redirect_uri.into());
+    let mut links = String::new();
+    if providers.github.enabled() {
+        links.push_str(&format!(
+            "<a class=\"alt\" href=\"/oauth/signin/github?csrf={}\">Link GitHub to {}</a> ",
+            pct(csrf),
+            esc(user)
+        ));
+    }
+    if providers.google.enabled() {
+        links.push_str(&format!(
+            "<a class=\"alt\" href=\"/oauth/signin/google?csrf={}\">Link Google to {}</a>",
+            pct(csrf),
+            esc(user)
+        ));
+    }
+    let links = if links.is_empty() { String::new() } else { format!("<hr><p>{links}</p>") };
     html_page(
         "Authorize · memdusa",
         format!(
@@ -890,15 +1234,36 @@ fn consent_html(user: &str, client_name: &str, redirect_uri: &str, scope: &str, 
              <form method=\"post\" action=\"/oauth/consent\">\
              <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
              <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\
-             <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form>",
+             <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form>{}",
             esc(client_name),
             esc(user),
             esc(client_name),
             esc(&host),
             esc(scope),
-            esc(csrf)
+            esc(csrf),
+            links
         ),
     )
+}
+
+fn not_linked_html(provider: &str, display: &str) -> Response {
+    Html(html_page(
+        "Not linked · memdusa",
+        format!(
+            "<h1>Not linked to a memdusa user</h1>\
+             <p>Your <strong>{}</strong> identity (<code>{}</code>) is not linked to a memdusa user.</p>\
+             <p>Ask your administrator to run <code>memdusa user link &lt;user&gt; {}:&lt;handle&gt;</code>, \
+             or sign in with your API key and link it from the consent page.</p>",
+            esc(provider),
+            esc(display),
+            esc(provider)
+        ),
+    ))
+    .into_response()
+}
+
+fn info_page(title: &str, message: &str) -> Response {
+    Html(html_page(title, format!("<h1>{title}</h1><p>{}</p>", esc(message)))).into_response()
 }
 
 fn err(status: StatusCode, code: &str, desc: &str) -> Response {
@@ -935,6 +1300,7 @@ mod tests {
             absolute_secs: 365 * 24 * 3600,
             code_secs: 600,
             txn_secs: 600,
+            upstream: UpstreamConfig::default(),
         }
     }
 

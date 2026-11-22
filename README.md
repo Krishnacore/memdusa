@@ -535,7 +535,7 @@ What an MCP client (or any OAuth client) sees:
 - `GET /oauth/authorize` checks `response_type=code`, the registered `redirect_uri`, `code_challenge` with
   `code_challenge_method=S256` (plain PKCE is rejected), `state`, `scope` and the optional `resource` (RFC 8707). It
   renders a minimal server-rendered sign-in page: paste an existing memdusa API key, then approve the client and
-  scopes on the consent screen. GitHub/Google buttons are placeholders for H2b.
+  scopes on the consent screen. See "Sign in with GitHub / Google" below for the upstream providers.
 - `POST /oauth/token` exchanges the one-time code (10-minute expiry) with the PKCE verifier, and rotates refresh
   tokens on every use. Reusing a rotated refresh token revokes the whole grant chain (and is audited as theft).
   `POST /oauth/revoke` is RFC 7009.
@@ -560,6 +560,72 @@ memdusa sessions revoke <id>       # revokes that session's whole grant chain
 The same data is available at `GET/DELETE /v1/me/sessions[/{id}]` and `GET/DELETE /v1/admin/sessions[/{id}]`.
 
 CLI browser login (`memdusa login … --browser` / `--device`) is H2c and not implemented yet.
+
+### Sign in with GitHub / Google
+
+Each upstream is enabled by setting its client id **and** secret on the server. With `MEMDUSA_PUBLIC_URL` set,
+`memdusa serve` prints the exact callback URLs to register at startup:
+
+```sh
+export MEMDUSA_PUBLIC_URL=https://memdusa.example.com
+export MEMDUSA_OAUTH_GITHUB_CLIENT_ID=Iv1.…          # GitHub OAuth App
+export MEMDUSA_OAUTH_GITHUB_CLIENT_SECRET=…
+export MEMDUSA_OAUTH_GOOGLE_CLIENT_ID=…apps.googleusercontent.com
+export MEMDUSA_OAUTH_GOOGLE_CLIENT_SECRET=…
+memdusa serve --addr 0.0.0.0:7077 --allowed-host memdusa.example.com
+# register https://memdusa.example.com/oauth/callback/github
+# register https://memdusa.example.com/oauth/callback/google
+```
+
+- **GitHub**: create an OAuth App (Settings → Developer settings → OAuth Apps). Set the *Authorization callback
+  URL* to the printed `/oauth/callback/github` URL. memdusa requests `read:user` (plus `read:org` when org
+  allowlisting is configured), sends `state` and PKCE `S256`, exchanges the code at
+  `github.com/login/oauth/access_token`, and reads `GET /user`. The subject is the stable numeric user id, the
+  display/login is the GitHub login.
+- **Google**: create an OAuth client (Google Cloud Console → APIs & Services → Credentials) of type *Web
+  application*, with the printed `/oauth/callback/google` URL as an authorized redirect URI. memdusa uses OpenID
+  Connect (scopes `openid email`, `state`, PKCE `S256` and `nonce`), verifies the ID token's issuer, audience,
+  expiry, nonce and RS256 signature against Google's cached JWKS, and requires `email_verified = true`. The subject
+  is the `sub` claim.
+
+The sign-in page shows a **Continue with GitHub / Google** button for each configured provider. The pending memdusa
+authorization transaction is carried through the upstream round trip (short-lived transaction cookie + `state`);
+the user lands on the same consent screen as API-key sign-in. Upstream access tokens are used once to read the
+identity and are **never stored**.
+
+#### Who may sign in
+
+By default only identities linked to a memdusa user may sign in. Unknown identities get a friendly "not linked"
+page and are audited.
+
+Link an identity as an admin (the handle is resolved lazily on first sign-in by login/email, or immediately if it
+is a numeric id):
+
+```sh
+memdusa user link alice github:octocat          # binds on first GitHub sign-in by login
+memdusa user link alice github:424242           # binds directly to the numeric user id
+memdusa user link alice google:alice@acme.com   # binds on first Google sign-in by verified email
+memdusa user identities alice
+memdusa user unlink alice github:octocat
+```
+
+A user who is already signed in with an API key can also click **Link GitHub / Link Google** on the consent page
+to link their own identity. All link/unlink changes are audited.
+
+Optional auto-provisioning (off by default) creates a **non-admin** user on first successful sign-in, named after
+the GitHub login or the email local part (de-duplicated, e.g. `alice-2`):
+
+```sh
+export MEMDUSA_OAUTH_ALLOW_GITHUB_ORGS=acme,other-org   # active org membership required
+export MEMDUSA_OAUTH_ALLOW_GOOGLE_DOMAINS=acme.com      # verified email domain or `hd` claim
+```
+
+For hosted-domain accounts, Google's `hd` claim is matched as well as the verified email domain.
+
+Test-only overrides for the upstream endpoints (`MEMDUSA_TEST_GITHUB_AUTH_URL`, `MEMDUSA_TEST_GITHUB_TOKEN_URL`,
+`MEMDUSA_TEST_GITHUB_API_URL`, `MEMDUSA_TEST_GOOGLE_DISCOVERY_URL`, `MEMDUSA_TEST_GOOGLE_JWKS_URL`,
+`MEMDUSA_TEST_GOOGLE_USERINFO_URL`) point the server at an in-process mock and are used by the test suite; do not
+set them in production.
 
 ## MCP tools
 

@@ -474,6 +474,13 @@ const MIGRATIONS: &[Migration] = &[
             user_name TEXT,
             created_at BIGINT NOT NULL)",
     ]),
+    // 9: H2b upstream sign-in. A sign-in transaction remembers the short-lived
+    // upstream round trip (state / PKCE verifier / nonce) and how the user
+    // signed in, so the consent screen can create the right kind of grant.
+    Migration::Portable(&[
+        "ALTER TABLE oauth_transactions ADD COLUMN upstream TEXT",
+        "ALTER TABLE oauth_transactions ADD COLUMN signin_method TEXT NOT NULL DEFAULT 'api_key'",
+    ]),
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
