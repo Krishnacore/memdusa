@@ -337,17 +337,18 @@ memdusa status         # "semantic search: on (model ..., 12/12 memories embedde
 ### Built-in local model (no server, no API key)
 
 The `local-embed` cargo feature compiles in a retrieval-trained sentence transformer (`all-MiniLM-L6-v2`, 384 dims)
-running on ONNX Runtime. Default and release binaries do **not** include it; build it yourself when you want it:
+running on ONNX Runtime. Release binaries, the Homebrew formula and the Docker image include it (it stays off until
+you select it); building from source needs `--features local-embed`. Nothing leaves your machine:
 
 ```sh
-cargo build --release --features local-embed      # or: cargo install memdusa --features local-embed
-
 export MEMDUSA_EMBED_URL=local                    # or MEMDUSA_EMBED_PROVIDER=local
 export MEMDUSA_EMBED_MODEL=all-MiniLM-L6-v2       # default; bge-small-en-v1.5 is also supported
 memdusa embed --download-model                    # once: ~91 MB into $MEMDUSA_HOME/models/ (default ~/.memdusa/models/)
 memdusa embed                                     # backfill existing memories
 memdusa status                                    # shows the model and coverage, or how to fetch it
 ```
+
+From source: `cargo install memdusa --features local-embed` (or `cargo build --release --features local-embed`).
 
 Nothing leaves the machine: model text, memories and queries are processed in-process, and the only network request is
 that first Hugging Face download. After that memdusa works offline. Hooks and searches **never download**: if the model

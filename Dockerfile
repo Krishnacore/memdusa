@@ -7,11 +7,11 @@ COPY crates/memdusa-core/Cargo.toml crates/memdusa-core/
 COPY crates/memdusa/Cargo.toml crates/memdusa/
 RUN mkdir -p crates/memdusa-core/src crates/memdusa/src \
  && echo "" > crates/memdusa-core/src/lib.rs && echo "fn main() {}" > crates/memdusa/src/main.rs \
- && cargo build --release --locked -p memdusa \
+ && cargo build --release --locked -p memdusa --features local-embed \
  && rm -rf crates/*/src
 COPY crates crates
 RUN touch crates/memdusa-core/src/lib.rs crates/memdusa/src/main.rs \
- && cargo build --release --locked -p memdusa
+ && cargo build --release --locked -p memdusa --features local-embed
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
