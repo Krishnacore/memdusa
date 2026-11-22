@@ -610,7 +610,13 @@ async fn search_survives_special_characters() {
         let found = s.memory_search(query(&p, "\"unwrap\": (try) -safer*")).await.unwrap();
         assert_eq!(found.len(), 1, "{name}: words inside the noise still match");
         assert!(s.memory_search(query(&p, "!!!")).await.unwrap().is_empty(), "{name}: nothing searchable");
-        assert_eq!(s.memory_search(query(&p, "   ")).await.unwrap().len(), 1, "{name}: blank query lists recent");
+        // a shared Postgres test DB also holds other tests' (visible) global memories: count only this project's
+        let recent = s.memory_search(query(&p, "   ")).await.unwrap();
+        assert_eq!(
+            recent.iter().filter(|m| m.project.as_deref() == Some(p.as_str())).count(),
+            1,
+            "{name}: blank query lists recent"
+        );
     }
 }
 
