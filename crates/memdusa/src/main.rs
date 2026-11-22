@@ -122,6 +122,9 @@ enum Cmd {
         /// Re-embed every memory, not just the missing or outdated ones.
         #[arg(long)]
         all: bool,
+        /// Only this project (default: all).
+        #[arg(long = "only-project")]
+        only_project: Option<String>,
     },
     /// Print the detected project key.
     Project,
@@ -520,7 +523,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", semantic_line(s.model.as_deref(), s.embedded, s.total));
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
-        Cmd::Embed { all } => print_backfill(&store.embeddings_backfill(all).await?),
+        Cmd::Embed { all, only_project } => {
+            print_backfill(&store.embeddings_backfill(all, only_project.as_deref()).await?)
+        }
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
         Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
             let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
@@ -722,7 +727,9 @@ async fn run_remote(
             }
             print_import(&total);
         }
-        Cmd::Embed { all } => print_backfill(&client()?.embeddings_backfill(all).await?),
+        Cmd::Embed { all, only_project } => {
+            print_backfill(&client()?.embeddings_backfill(all, only_project.as_deref()).await?)
+        }
         Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
         Cmd::Sync => {
             let spool = spool::Spool::open()?;
