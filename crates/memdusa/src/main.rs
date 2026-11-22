@@ -1,6 +1,8 @@
 mod adapters;
 mod config;
 mod embedder;
+mod hermes;
+mod hermes_yaml;
 mod hooks;
 mod http;
 mod install;
@@ -415,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
                 scope,
                 settings,
                 bin,
+                database_url: cli.database_url.clone(),
                 mcp: !no_mcp,
                 dry_run,
                 uninstall: false,
@@ -426,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
                 scope,
                 settings,
                 bin: Some("memdusa".into()),
+                database_url: None,
                 mcp: !no_mcp,
                 dry_run: false,
                 uninstall: true,
@@ -946,6 +950,21 @@ async fn run_hook_input(
 ) -> anyhow::Result<Option<String>> {
     // Translate the harness's payload into memdusa's canonical one (or ignore this event).
     let Some(mut input) = harness.normalize(event, native) else { return Ok(None) };
+
+    // Hermes runs hooks from its install dir: take the session's real workspace from its state.db.
+    if harness == adapters::Harness::Hermes
+        && let Some(home) = hermes::home()
+    {
+        let sid = input.get("session_id").and_then(|v| v.as_str()).map(String::from);
+        let payload_cwd = input.get("cwd").and_then(|v| v.as_str()).map(String::from);
+        let resolved = hermes::resolve_cwd(&home, sid.as_deref(), payload_cwd.as_deref()).await;
+        if let Some(obj) = input.as_object_mut() {
+            match resolved {
+                Some(c) => obj.insert("cwd".into(), c.into()),
+                None => obj.remove("cwd"),
+            };
+        }
+    }
 
     // The project is always detected here, on the machine that has the repo.
     let project_dir = ["CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR", "GEMINI_PROJECT_DIR"]

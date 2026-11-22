@@ -28,6 +28,9 @@ pub struct InstallOptions {
     pub settings: Option<PathBuf>,
     /// Command used to invoke memdusa. Default: absolute path of this binary.
     pub bin: Option<String>,
+    /// Database URL given explicitly at install time (flag or `MEMDUSA_DATABASE_URL`);
+    /// baked into every generated hook and MCP command.
+    pub database_url: Option<String>,
     pub mcp: bool,
     pub dry_run: bool,
     pub uninstall: bool,
@@ -124,10 +127,21 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-fn hook_command(bin: &str, h: Harness, event: crate::hooks::HookEvent) -> String {
+/// ` --database-url <url>` (shell-quoted) when the URL was given explicitly at install time.
+fn db_flag(db: Option<&str>) -> String {
+    db.map(|u| format!(" --database-url {}", shell_quote(u))).unwrap_or_default()
+}
+
+/// `["--database-url", url]` for argument-list configs (MCP entries), else nothing.
+fn db_args(db: Option<&str>) -> Vec<String> {
+    db.map(|u| vec!["--database-url".to_owned(), u.to_owned()]).unwrap_or_default()
+}
+
+pub(crate) fn hook_command(bin: &str, h: Harness, event: crate::hooks::HookEvent, db: Option<&str>) -> String {
+    let flag = db_flag(db);
     match h {
-        Harness::ClaudeCode => format!("{} hook {}", shell_quote(bin), event.arg()),
-        _ => format!("{} hook {} --harness {}", shell_quote(bin), event.arg(), h.agent()),
+        Harness::ClaudeCode => format!("{} hook {}{flag}", shell_quote(bin), event.arg()),
+        _ => format!("{} hook {} --harness {}{flag}", shell_quote(bin), event.arg(), h.agent()),
     }
 }
 
@@ -137,7 +151,13 @@ fn is_ours(v: &Value) -> bool {
 
 /// Remove our previous hook entries from `settings`, then (unless
 /// uninstalling) add the current set. Everything else is preserved.
-pub fn merge_hooks(mut settings: Value, h: Harness, bin: &str, uninstall: bool) -> anyhow::Result<Value> {
+pub fn merge_hooks(
+    mut settings: Value,
+    h: Harness,
+    bin: &str,
+    db: Option<&str>,
+    uninstall: bool,
+) -> anyhow::Result<Value> {
     let root = settings.as_object_mut().context("config file is not a JSON object")?;
 
     // Antigravity: one named group per tool, which we own entirely.
@@ -147,8 +167,7 @@ pub fn merge_hooks(mut settings: Value, h: Harness, bin: &str, uninstall: bool) 
             let mut group = Map::new();
             group.insert("enabled".into(), json!(true));
             for nh in h.events() {
-                let handler =
-                    json!({ "type": "command", "command": hook_command(bin, h, nh.event), "timeout": nh.timeout_secs });
+                let handler = json!({ "type": "command", "command": hook_command(bin, h, nh.event, db), "timeout": nh.timeout_secs });
                 let entry = match nh.matcher {
                     Some(m) => json!([{ "matcher": m, "hooks": [handler] }]),
                     None => json!([handler]),
@@ -186,9 +205,10 @@ pub fn merge_hooks(mut settings: Value, h: Harness, bin: &str, uninstall: bool) 
         for nh in h.events() {
             // Gemini CLI timeouts are in milliseconds, everyone else's in seconds
             let timeout = if h == Harness::Gemini { nh.timeout_secs * 1000 } else { nh.timeout_secs };
-            let handler = json!({ "type": "command", "command": hook_command(bin, h, nh.event), "timeout": timeout });
+            let command = hook_command(bin, h, nh.event, db);
+            let handler = json!({ "type": "command", "command": command, "timeout": timeout });
             let entry = if h == Harness::Cursor {
-                json!({ "command": hook_command(bin, h, nh.event), "timeout": nh.timeout_secs })
+                json!({ "command": command, "timeout": nh.timeout_secs })
             } else {
                 let mut group = Map::new();
                 if let Some(m) = nh.matcher {
@@ -215,13 +235,21 @@ pub fn merge_hooks(mut settings: Value, h: Harness, bin: &str, uninstall: bool) 
 }
 
 /// Add (or remove) `mcpServers.memdusa` in a JSON config.
-pub fn merge_mcp_json(mut config: Value, h: Harness, bin: &str, uninstall: bool) -> anyhow::Result<Value> {
+pub fn merge_mcp_json(
+    mut config: Value,
+    h: Harness,
+    bin: &str,
+    db: Option<&str>,
+    uninstall: bool,
+) -> anyhow::Result<Value> {
     let root = config.as_object_mut().context("config file is not a JSON object")?;
     let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
     let servers = servers.as_object_mut().context("`mcpServers` is not a JSON object")?;
     servers.remove("memdusa");
     if !uninstall {
-        let mut entry = json!({ "command": bin, "args": ["mcp", "--agent", h.agent()] });
+        let mut args = vec!["mcp".to_owned(), "--agent".to_owned(), h.agent().to_owned()];
+        args.extend(db_args(db));
+        let mut entry = json!({ "command": bin, "args": args });
         if h == Harness::Cursor {
             entry["type"] = json!("stdio");
         }
@@ -237,7 +265,7 @@ pub fn merge_mcp_json(mut config: Value, h: Harness, bin: &str, uninstall: bool)
 }
 
 /// Add (or remove) the `[mcp_servers.memdusa]` table in Codex's config.toml.
-pub fn merge_codex_toml(text: &str, bin: &str, uninstall: bool) -> String {
+pub fn merge_codex_toml(text: &str, bin: &str, db: Option<&str>, uninstall: bool) -> String {
     const HEADER: &str = "[mcp_servers.memdusa]";
     // drop an existing table: from its header to the next table header
     let mut out: Vec<&str> = vec![];
@@ -264,7 +292,8 @@ pub fn merge_codex_toml(text: &str, bin: &str, uninstall: bool) -> String {
         if !s.is_empty() {
             s.push_str("\n\n");
         }
-        s.push_str(&format!("{HEADER}\ncommand = {}\nargs = [\"mcp\", \"--agent\", \"codex\"]", quote(bin)));
+        let extra: String = db_args(db).iter().map(|a| format!(", {}", quote(a))).collect();
+        s.push_str(&format!("{HEADER}\ncommand = {}\nargs = [\"mcp\", \"--agent\", \"codex\"{extra}]", quote(bin)));
     }
     if !s.is_empty() {
         s.push('\n');
@@ -420,6 +449,7 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
         Some(b) => b.clone(),
         None => std::env::current_exe()?.canonicalize()?.display().to_string(),
     };
+    let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
     match h {
         Harness::OpenCode | Harness::Pi => return install_plugin(&opts, &bin),
         Harness::Hermes => return install_hermes(&opts, &bin),
@@ -434,17 +464,17 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     };
     let current = read_json(&path)?;
     let old = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
-    let mut updated = merge_hooks(current, h, &bin, opts.uninstall)?;
+    let mut updated = merge_hooks(current, h, &bin, db, opts.uninstall)?;
     let mcp_same_file = opts.mcp && h == Harness::Gemini && opts.settings.is_none();
     if mcp_same_file {
-        updated = merge_mcp_json(updated, h, &bin, opts.uninstall)?;
+        updated = merge_mcp_json(updated, h, &bin, db, opts.uninstall)?;
     }
     apply(&path, &old, &json_text(&updated)?, if mcp_same_file { "hooks and MCP server" } else { "hooks" }, &opts)?;
 
     // MCP server
     if opts.mcp && !mcp_same_file {
         match h {
-            Harness::ClaudeCode => mcp_register_claude(&bin, opts.scope, opts.dry_run, opts.uninstall)?,
+            Harness::ClaudeCode => mcp_register_claude(&bin, db, opts.scope, opts.dry_run, opts.uninstall)?,
             Harness::Codex => {
                 let p = if opts.scope == Scope::User {
                     home_dir()?.join(".codex/config.toml")
@@ -452,12 +482,12 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
                     ".codex/config.toml".into()
                 };
                 let old = std::fs::read_to_string(&p).unwrap_or_default();
-                apply(&p, &old, &merge_codex_toml(&old, &bin, opts.uninstall), "MCP server", &opts)?;
+                apply(&p, &old, &merge_codex_toml(&old, &bin, db, opts.uninstall), "MCP server", &opts)?;
             }
             _ => {
                 if let Some(p) = mcp_json_path(h, opts.scope)? {
                     let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
-                    let merged = merge_mcp_json(read_json(&p)?, h, &bin, opts.uninstall)?;
+                    let merged = merge_mcp_json(read_json(&p)?, h, &bin, db, opts.uninstall)?;
                     apply(&p, &old, &json_text(&merged)?, "MCP server", &opts)?;
                 }
             }
@@ -512,8 +542,8 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
         ),
         Harness::OpenCode => n.push("Restart OpenCode to load the plugin.".into()),
         Harness::Hermes => n.push(
-            "Hermes asks once to approve each new hook. Headless runs never ask: approve them first in an \
-             interactive session, or run with --accept-hooks."
+            "Hermes only runs shell hooks that are allowlisted: run Hermes once with `--accept-hooks` (or approve \
+             them at its prompt). `hermes hooks doctor` shows their status. Headless runs never ask."
                 .into(),
         ),
         Harness::Git | Harness::ClaudeCode => {}
@@ -525,14 +555,20 @@ const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../assets/pi-extension.ts");
 
 /// The plugin source with the memdusa binary baked in.
-pub fn plugin_source(h: Harness, bin: &str) -> String {
+pub fn plugin_source(h: Harness, bin: &str, db: Option<&str>) -> String {
     let template = if h == Harness::OpenCode { OPENCODE_PLUGIN } else { PI_EXTENSION };
-    template.replace("__MEMDUSA_BIN__", &serde_json::to_string(bin).expect("string serializes"))
+    // extra `spawn` args (after the fixed ones): empty unless a database URL was given
+    let extra: String =
+        db_args(db).iter().map(|a| format!(", {}", serde_json::to_string(a).expect("string serializes"))).collect();
+    template
+        .replace("__MEMDUSA_BIN__", &serde_json::to_string(bin).expect("string serializes"))
+        .replace("__MEMDUSA_EXTRA_ARGS__", &extra)
 }
 
 /// OpenCode and pi: write the plugin/extension file and register the MCP server.
 fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     let h = opts.harness;
+    let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
     let user = opts.scope == Scope::User;
     let path: PathBuf = match &opts.settings {
         Some(p) => p.clone(),
@@ -557,16 +593,17 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
             println!("removed {}", path.display());
         }
     } else {
-        apply(&path, &old, &plugin_source(h, bin), if h == Harness::OpenCode { "plugin" } else { "extension" }, opts)?;
+        let what = if h == Harness::OpenCode { "plugin" } else { "extension" };
+        apply(&path, &old, &plugin_source(h, bin, db), what, opts)?;
     }
 
     if opts.mcp {
         match h {
-            Harness::OpenCode => opencode_mcp(bin, user, opts.dry_run, opts.uninstall)?,
+            Harness::OpenCode => opencode_mcp(bin, db, user, opts.dry_run, opts.uninstall)?,
             _ => {
                 if let Some(p) = mcp_json_path(h, opts.scope)? {
                     let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
-                    let merged = merge_mcp_json(read_json(&p)?, h, bin, opts.uninstall)?;
+                    let merged = merge_mcp_json(read_json(&p)?, h, bin, db, opts.uninstall)?;
                     apply(&p, &old, &json_text(&merged)?, "MCP server", opts)?;
                 }
             }
@@ -581,7 +618,7 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn opencode_mcp(bin: &str, user: bool, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+fn opencode_mcp(bin: &str, db: Option<&str>, user: bool, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
     if uninstall {
         println!("OpenCode has no `mcp remove`: delete `memdusa` from `mcp.servers` in your opencode.json(c).");
         return Ok(());
@@ -591,6 +628,7 @@ fn opencode_mcp(bin: &str, user: bool, dry_run: bool, uninstall: bool) -> anyhow
         args.push("--global".into());
     }
     args.extend(["memdusa", "--", bin, "mcp", "--agent", "opencode"].map(String::from));
+    args.extend(db_args(db));
     let shown = format!("opencode {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
     if dry_run {
         println!("# would run: {shown}");
@@ -611,69 +649,6 @@ fn opencode_mcp(bin: &str, user: bool, dry_run: bool, uninstall: bool) -> anyhow
     Ok(())
 }
 
-const HERMES_BEGIN: &str =
-    "# >>> memdusa (managed by `memdusa install hermes`; remove with `memdusa uninstall hermes`)";
-const HERMES_END: &str = "# <<< memdusa";
-
-/// Add or remove memdusa's marked block in Hermes' config.yaml. Returns
-/// `Err(block)` when the file already has its own top-level `hooks:` or
-/// `mcp_servers:` (merging YAML by hand would lose the user's formatting).
-pub fn merge_hermes_yaml(text: &str, bin: &str, mcp: bool, uninstall: bool) -> Result<String, String> {
-    // drop our previous block
-    let mut kept: Vec<&str> = vec![];
-    let mut inside = false;
-    for line in text.lines() {
-        if line.trim_end() == HERMES_BEGIN {
-            inside = true;
-        } else if inside && line.trim_end() == HERMES_END {
-            inside = false;
-        } else if !inside {
-            kept.push(line);
-        }
-    }
-    while kept.last().is_some_and(|l| l.trim().is_empty()) {
-        kept.pop();
-    }
-    let mut out = kept.join("\n");
-    if !uninstall {
-        let q = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
-        let mut block = vec![HERMES_BEGIN.to_owned(), "hooks:".to_owned()];
-        let mut current = "";
-        for nh in Harness::Hermes.events() {
-            if nh.native != current {
-                block.push(format!("  {}:", nh.native));
-                current = nh.native;
-            }
-            block.push(format!("    - command: {}", q(&hook_command(bin, Harness::Hermes, nh.event))));
-            if let Some(m) = nh.matcher {
-                block.push(format!("      matcher: {}", q(m)));
-            }
-            block.push(format!("      timeout: {}", nh.timeout_secs));
-        }
-        if mcp {
-            block.extend([
-                "mcp_servers:".to_owned(),
-                "  memdusa:".to_owned(),
-                format!("    command: {}", q(bin)),
-                "    args: [\"mcp\", \"--agent\", \"hermes\"]".to_owned(),
-            ]);
-        }
-        block.push(HERMES_END.to_owned());
-        let clash = |key: &str| kept.iter().any(|l| l.starts_with(&format!("{key}:")));
-        if clash("hooks") || (mcp && clash("mcp_servers")) {
-            return Err(block.join("\n"));
-        }
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&block.join("\n"));
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    Ok(out)
-}
-
 fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     if opts.scope != Scope::User {
         bail!("Hermes only has a user config (~/.hermes/config.yaml); use --scope user");
@@ -686,16 +661,14 @@ fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
             .join("config.yaml"),
     };
     let old = std::fs::read_to_string(&path).unwrap_or_default();
-    match merge_hermes_yaml(&old, bin, opts.mcp, opts.uninstall) {
-        Ok(text) => apply(&path, &old, &text, "hooks", opts)?,
-        Err(block) => {
-            println!(
-                "{} already has its own `hooks:` or `mcp_servers:` section; merge this into it by hand:\n\n{block}\n",
-                path.display()
-            );
-            return Ok(());
-        }
-    }
+    let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
+    let text = crate::hermes_yaml::merge(&old, bin, db, opts.mcp, opts.uninstall).map_err(|why| {
+        anyhow::anyhow!(
+            "{}: {why}; memdusa won't edit it. Rewrite it as a block mapping (or remove it) and re-run",
+            path.display()
+        )
+    })?;
+    apply(&path, &old, &text, "hooks", opts)?;
     if !opts.uninstall && !opts.dry_run {
         for note in notes(Harness::Hermes)? {
             println!("\nnote: {note}");
@@ -762,7 +735,13 @@ fn write_with_backup(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn mcp_register_claude(bin: &str, scope: Scope, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+fn mcp_register_claude(
+    bin: &str,
+    db: Option<&str>,
+    scope: Scope,
+    dry_run: bool,
+    uninstall: bool,
+) -> anyhow::Result<()> {
     let scope = match scope {
         Scope::User => "user",
         Scope::Project => "project",
@@ -771,9 +750,11 @@ fn mcp_register_claude(bin: &str, scope: Scope, dry_run: bool, uninstall: bool) 
     let args: Vec<String> = if uninstall {
         ["mcp", "remove", "memdusa", "--scope", scope].map(String::from).to_vec()
     } else {
-        ["mcp", "add", "memdusa", "--scope", scope, "--", bin, "mcp", "--agent", "claude-code"]
+        let mut a = ["mcp", "add", "memdusa", "--scope", scope, "--", bin, "mcp", "--agent", "claude-code"]
             .map(String::from)
-            .to_vec()
+            .to_vec();
+        a.extend(db_args(db));
+        a
     };
     let shown = format!("claude {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
     if dry_run {
@@ -820,8 +801,8 @@ mod tests {
                 "SessionStart": [{"hooks": [{"type": "command", "command": "/old/path/memdusa hook session-start"}]}]
             }
         });
-        let once = merge_hooks(existing, Harness::ClaudeCode, BIN, false).unwrap();
-        let twice = merge_hooks(once.clone(), Harness::ClaudeCode, BIN, false).unwrap();
+        let once = merge_hooks(existing, Harness::ClaudeCode, BIN, None, false).unwrap();
+        let twice = merge_hooks(once.clone(), Harness::ClaudeCode, BIN, None, false).unwrap();
         assert_eq!(once, twice, "re-installing must not duplicate hooks");
 
         assert_eq!(once["model"], "opus");
@@ -834,7 +815,7 @@ mod tests {
         assert_eq!(once["hooks"]["PostToolUse"][0]["matcher"], crate::hooks::JOURNALED_TOOLS);
         assert_eq!(once["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10);
 
-        let removed = merge_hooks(once, Harness::ClaudeCode, BIN, true).unwrap();
+        let removed = merge_hooks(once, Harness::ClaudeCode, BIN, None, true).unwrap();
         assert_eq!(
             removed,
             json!({"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}})
@@ -843,22 +824,22 @@ mod tests {
 
     #[test]
     fn quotes_paths_with_spaces() {
-        let s = merge_hooks(json!({}), Harness::ClaudeCode, "/Users/me/my tools/memdusa", false).unwrap();
+        let s = merge_hooks(json!({}), Harness::ClaudeCode, "/Users/me/my tools/memdusa", None, false).unwrap();
         let cmd = s["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, "'/Users/me/my tools/memdusa' hook stop");
-        assert!(merge_hooks(s, Harness::ClaudeCode, "/x/memdusa", true).unwrap().get("hooks").is_none());
+        assert!(merge_hooks(s, Harness::ClaudeCode, "/x/memdusa", None, true).unwrap().get("hooks").is_none());
     }
 
     #[test]
     fn harness_specific_shapes() {
         // Codex: Claude-like groups, its own matcher and the 3s SessionEnd cap
-        let codex = merge_hooks(json!({}), Harness::Codex, BIN, false).unwrap();
+        let codex = merge_hooks(json!({}), Harness::Codex, BIN, None, false).unwrap();
         assert_eq!(codex["hooks"]["PostToolUse"][0]["matcher"], "Bash|apply_patch");
         assert_eq!(codex["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         assert_eq!(codex["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{BIN} hook stop --harness codex"));
 
         // Gemini: native event names, millisecond timeouts
-        let gem = merge_hooks(json!({"theme": "dark"}), Harness::Gemini, BIN, false).unwrap();
+        let gem = merge_hooks(json!({"theme": "dark"}), Harness::Gemini, BIN, None, false).unwrap();
         assert_eq!(
             gem["hooks"]["BeforeAgent"][0]["hooks"][0]["command"],
             format!("{BIN} hook user-prompt-submit --harness gemini")
@@ -868,46 +849,49 @@ mod tests {
 
         // Cursor: version 1, handlers directly in the event list, two native events for tool use
         let mine = json!({"command": "./audit.sh"});
-        let cur =
-            merge_hooks(json!({"hooks": {"afterFileEdit": [mine.clone()]}}), Harness::Cursor, BIN, false).unwrap();
+        let cur = merge_hooks(json!({"hooks": {"afterFileEdit": [mine.clone()]}}), Harness::Cursor, BIN, None, false)
+            .unwrap();
         assert_eq!(cur["version"], 1);
         assert_eq!(cur["hooks"]["afterFileEdit"].as_array().unwrap().len(), 2);
         assert_eq!(
             cur["hooks"]["afterShellExecution"][0]["command"],
             format!("{BIN} hook post-tool-use --harness cursor")
         );
-        let back = merge_hooks(cur, Harness::Cursor, BIN, true).unwrap();
+        let back = merge_hooks(cur, Harness::Cursor, BIN, None, true).unwrap();
         assert_eq!(back, json!({"version": 1, "hooks": {"afterFileEdit": [mine]}}));
 
         // Antigravity: one named group we own
-        let agy = merge_hooks(json!({"other": {"enabled": true}}), Harness::Antigravity, BIN, false).unwrap();
+        let agy = merge_hooks(json!({"other": {"enabled": true}}), Harness::Antigravity, BIN, None, false).unwrap();
         assert_eq!(agy["memdusa"]["enabled"], true);
         assert_eq!(
             agy["memdusa"]["SessionStart"][0]["command"],
             format!("{BIN} hook session-start --harness antigravity")
         );
         assert!(agy["memdusa"]["PostToolUse"][0]["matcher"].as_str().unwrap().contains("run_command"));
-        assert_eq!(merge_hooks(agy, Harness::Antigravity, BIN, true).unwrap(), json!({"other": {"enabled": true}}));
+        assert_eq!(
+            merge_hooks(agy, Harness::Antigravity, BIN, None, true).unwrap(),
+            json!({"other": {"enabled": true}})
+        );
     }
 
     #[test]
     fn mcp_configs() {
-        let cur = merge_mcp_json(json!({"mcpServers": {"x": {}}}), Harness::Cursor, BIN, false).unwrap();
+        let cur = merge_mcp_json(json!({"mcpServers": {"x": {}}}), Harness::Cursor, BIN, None, false).unwrap();
         assert_eq!(
             cur["mcpServers"]["memdusa"],
             json!({"type": "stdio", "command": BIN, "args": ["mcp", "--agent", "cursor"]})
         );
-        assert_eq!(merge_mcp_json(cur, Harness::Cursor, BIN, true).unwrap(), json!({"mcpServers": {"x": {}}}));
+        assert_eq!(merge_mcp_json(cur, Harness::Cursor, BIN, None, true).unwrap(), json!({"mcpServers": {"x": {}}}));
 
         let toml = "model = \"o5\"\n\n[mcp_servers.other]\ncommand = \"x\"\n";
-        let added = merge_codex_toml(toml, "/opt/my \"bin\"/memdusa", false);
+        let added = merge_codex_toml(toml, "/opt/my \"bin\"/memdusa", None, false);
         assert!(added.ends_with("[mcp_servers.memdusa]\ncommand = \"/opt/my \\\"bin\\\"/memdusa\"\nargs = [\"mcp\", \"--agent\", \"codex\"]\n"), "{added}");
-        assert_eq!(merge_codex_toml(&added, "/opt/my \"bin\"/memdusa", false), added, "idempotent");
-        assert_eq!(merge_codex_toml(&added, BIN, true), toml, "uninstall restores the original");
+        assert_eq!(merge_codex_toml(&added, "/opt/my \"bin\"/memdusa", None, false), added, "idempotent");
+        assert_eq!(merge_codex_toml(&added, BIN, None, true), toml, "uninstall restores the original");
         let between =
             "[mcp_servers.memdusa]\ncommand = \"old\"\n[mcp_servers.memdusa.env]\nA = \"1\"\n[profile]\nx = 1\n";
         assert_eq!(
-            merge_codex_toml(between, BIN, true),
+            merge_codex_toml(between, BIN, None, true),
             "[profile]\nx = 1\n",
             "removes nested tables, keeps later ones"
         );
@@ -915,28 +899,81 @@ mod tests {
 
     #[test]
     fn plugins_and_hermes() {
-        let src = plugin_source(Harness::OpenCode, "/opt/my \"tools\"/memdusa");
+        let src = plugin_source(Harness::OpenCode, "/opt/my \"tools\"/memdusa", None);
         assert!(src.contains(r#"const BIN: string = "/opt/my \"tools\"/memdusa""#), "bin is a JSON string literal");
         assert!(!src.contains("__MEMDUSA_BIN__"));
-        assert!(plugin_source(Harness::Pi, BIN).contains("agent_before_settle"));
-        let pi = merge_mcp_json(json!({}), Harness::Pi, BIN, false).unwrap();
+        assert!(!src.contains("__MEMDUSA_EXTRA_ARGS__"));
+        assert!(src.contains(r#"["hook", event, "--agent", AGENT]"#), "no URL: spawn args unchanged");
+        assert!(plugin_source(Harness::Pi, BIN, None).contains("agent_before_settle"));
+        let pi = merge_mcp_json(json!({}), Harness::Pi, BIN, None, false).unwrap();
         assert_eq!(pi["mcpServers"]["memdusa"]["exposure"], "direct");
 
         let base = "model: hermes-4\nterminal:\n  backend: local\n";
-        let added = merge_hermes_yaml(base, BIN, true, false).unwrap();
-        assert!(added.starts_with(base), "user's config kept as-is");
-        assert!(added.contains(
-            "  pre_llm_call:\n    - command: \"/usr/local/bin/memdusa hook session-start --harness hermes\""
-        ));
-        assert!(added.contains("      matcher: \"write_file|patch|terminal\""));
-        assert!(added.contains("mcp_servers:\n  memdusa:\n    command: \"/usr/local/bin/memdusa\""));
-        assert_eq!(added.matches("pre_llm_call:").count(), 1, "both pre_llm_call hooks under one key");
-        assert_eq!(merge_hermes_yaml(&added, BIN, true, false).unwrap(), added, "idempotent");
-        assert_eq!(merge_hermes_yaml(&added, BIN, true, true).unwrap(), base, "uninstall restores the original");
+        let added = crate::hermes_yaml::merge(base, BIN, None, true, false).unwrap();
         assert!(
-            merge_hermes_yaml("hooks:\n  on_session_start: []\n", BIN, true, false).is_err(),
-            "won't clobber existing hooks"
+            added.contains(
+                "pre_llm_call:\n    - command: \"/usr/local/bin/memdusa hook session-start --harness hermes\""
+            )
         );
+        assert_eq!(crate::hermes_yaml::merge(&added, BIN, None, true, true).unwrap(), base);
+    }
+
+    #[test]
+    fn database_url_is_written_into_every_harness_format() {
+        const URL: &str = "sqlite:///x/memdusa.db";
+        let flag = " --database-url sqlite:///x/memdusa.db";
+
+        // JSON hook configs: Claude Code, Codex, Gemini (shared settings), Cursor, Antigravity
+        for h in [Harness::ClaudeCode, Harness::Codex, Harness::Gemini] {
+            let v = merge_hooks(json!({}), h, BIN, Some(URL), false).unwrap();
+            for (_, groups) in v["hooks"].as_object().unwrap() {
+                let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
+                assert!(cmd.ends_with(flag), "{h:?}: {cmd}");
+                assert!(is_memdusa_hook(cmd), "still recognised for uninstall: {cmd}");
+            }
+            assert_eq!(merge_hooks(v, h, BIN, None, true).unwrap(), json!({}), "{h:?} uninstall");
+        }
+        let cur = merge_hooks(json!({}), Harness::Cursor, BIN, Some(URL), false).unwrap();
+        assert!(cur["hooks"]["stop"][0]["command"].as_str().unwrap().ends_with(&format!("--harness cursor{flag}")));
+        let agy = merge_hooks(json!({}), Harness::Antigravity, BIN, Some(URL), false).unwrap();
+        assert!(agy["memdusa"]["Stop"][0]["command"].as_str().unwrap().ends_with(flag));
+
+        // URLs needing shell quoting are quoted in the command string
+        let pg = merge_hooks(json!({}), Harness::ClaudeCode, BIN, Some("postgres://u:p w@h/db?x=1"), false).unwrap();
+        assert!(
+            pg["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" --database-url 'postgres://u:p w@h/db?x=1'")
+        );
+
+        // JSON MCP entries get the args; without a URL they are unchanged
+        let mcp = merge_mcp_json(json!({}), Harness::Cursor, BIN, Some(URL), false).unwrap();
+        assert_eq!(mcp["mcpServers"]["memdusa"]["args"], json!(["mcp", "--agent", "cursor", "--database-url", URL]));
+        let plain = merge_mcp_json(json!({}), Harness::Cursor, BIN, None, false).unwrap();
+        assert_eq!(plain["mcpServers"]["memdusa"]["args"], json!(["mcp", "--agent", "cursor"]));
+
+        // Codex TOML
+        let toml = merge_codex_toml("", "/opt/my \"bin\"/memdusa", Some("postgres://u:p\"q@h/db"), false);
+        assert!(
+            toml.ends_with(
+                "args = [\"mcp\", \"--agent\", \"codex\", \"--database-url\", \"postgres://u:p\\\"q@h/db\"]\n"
+            ),
+            "{toml}"
+        );
+        assert!(merge_codex_toml(&toml, BIN, None, true).is_empty());
+
+        // OpenCode / pi TS templates: extra spawn args as JSON string literals
+        for h in [Harness::OpenCode, Harness::Pi] {
+            let src = plugin_source(h, BIN, Some("postgres://u:p\"q@h/db"));
+            assert!(src.contains(r#"["hook", event, "--agent", AGENT, "--database-url", "postgres://u:p\"q@h/db"]"#));
+            assert!(!src.contains("__MEMDUSA_"));
+        }
+
+        // Hermes YAML is covered in hermes_yaml's tests; check the hook shape here too
+        let yaml = crate::hermes_yaml::merge("", BIN, Some(URL), true, false).unwrap();
+        assert!(yaml.contains(&format!("hook stop --harness hermes{flag}\"")));
+        assert!(yaml.contains(&format!("args: [\"mcp\", \"--agent\", \"hermes\", \"--database-url\", \"{URL}\"]")));
     }
 
     #[test]

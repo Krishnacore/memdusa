@@ -22,7 +22,7 @@ function memdusa(event: string, payload: Record<string, unknown>): Promise<any> 
       }
     }
     try {
-      const child = spawn(BIN, ["hook", event, "--agent", AGENT], { stdio: ["pipe", "pipe", "ignore"] })
+      const child = spawn(BIN, ["hook", event, "--agent", AGENT__MEMDUSA_EXTRA_ARGS__], { stdio: ["pipe", "pipe", "ignore"] })
       const timer = setTimeout(() => {
         child.kill()
         finish(null)
