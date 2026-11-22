@@ -130,7 +130,7 @@ Most harnesses refuse to run a project's hooks or MCP servers until you approve 
 | Cursor CLI (`cursor-agent`) | Untrusted folders won't start in print mode: trust the folder interactively or pass `--trust`; `--approve-mcps` auto-approves the MCP server. Cursor runs memdusa through its Claude Code hooks import. |
 | pi | Project extensions (`.pi/`) load only for trusted projects: answer the trust prompt, or pass `--approve` / `-a` for one run. |
 | Hermes | Shell hooks must be allowlisted: run Hermes once with `--accept-hooks` (or approve at its prompt). `hermes hooks doctor` shows their status. |
-| OpenCode v2 | Plugins run in OpenCode's background service, which does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is saved in `~/.memdusa` and read by every hook), not with shell env vars. `opencode run --standalone` uses a private server that does inherit env. |
+| OpenCode v2 | Plugins and MCP servers run in a shared background service that does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is saved in `~/.memdusa` and read by every hook), not with shell env vars. A delegated worker must launch with `opencode run --standalone` (a private server that does inherit env), or its MCP tools won't see `MEMDUSA_RUN` / `MEMDUSA_TASK`. |
 | Gemini CLI | Google stopped serving individual accounts in Gemini CLI (June 2026): use Antigravity (`agy`, `memdusa install antigravity`). |
 
 Things to know per tool:
@@ -170,6 +170,22 @@ project. Launch each worker with environment variables:
 ```sh
 MEMDUSA_TASK=install-scripts MEMDUSA_PARENT=lead-session claude   # or opencode, codex, ...
 ```
+
+For a headless worker, pass the run and task on the launch line — one example per harness verified live:
+
+```sh
+MEMDUSA_RUN=… MEMDUSA_TASK=refunds   claude -p "Continue your delegated task."
+MEMDUSA_RUN=… MEMDUSA_TASK=invoices  codex exec "Continue your delegated task." < /dev/null
+MEMDUSA_RUN=… MEMDUSA_TASK=docs      opencode run --standalone "Continue your delegated task."
+```
+
+`codex exec` reads stdin when it is not a terminal, so close it (`< /dev/null`) or it waits. Claude Code passes the
+launch env to its stdio MCP servers, and `memdusa install codex` writes `env_vars` (plus
+`default_tools_approval_mode = "approve"`, so headless tool calls don't need an interactive approver) into
+`~/.codex/config.toml`. OpenCode v2 runs plugins and MCP servers in a shared background service that does not inherit
+the launcher's env, so a delegated worker must use `opencode run --standalone`. For pi, Cursor, Antigravity and Hermes
+we have not verified env forwarding to MCP servers; configure memdusa at install time (`--database-url` / `memdusa
+login`) instead of relying on shell env vars.
 
 `MEMDUSA_TASK` marks the worker (required); `MEMDUSA_PARENT` is free text naming the coordinator (optional). Then:
 
