@@ -367,8 +367,10 @@ async fn post_tool_use(ctx: &Ctx<'_>, tool: &str, input: Option<&Value>) -> Resu
 async fn record_agent_message(ctx: &Ctx<'_>, message: &str) -> Result<()> {
     let content = truncate(message, MAX_MESSAGE_CHARS);
     if let Some(session) = &ctx.session {
+        // Stored content is redacted (after truncation), so compare it in that form.
+        let redacted = ctx.store.redactor().text(&content).into_owned();
         let recent = ctx.store.events_recent(&ctx.project, Some(session), 300).await?;
-        if recent.iter().find(|e| e.kind == AGENT_MESSAGE).is_some_and(|e| e.content == content) {
+        if recent.iter().find(|e| e.kind == AGENT_MESSAGE).is_some_and(|e| e.content == redacted) {
             return Ok(());
         }
     }
@@ -602,6 +604,20 @@ mod tests {
             store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content.chars().count(), MAX_MESSAGE_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_with_a_secret_doesnt_duplicate() {
+        let store = ctx_store().await;
+        let cfg = cfg();
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4).get(..36).unwrap());
+        let stop = json!({"last_assistant_message": format!("Deployed using {token}, tests next.")});
+        handle(HookEvent::Stop, input(stop.clone()), ctx(&store, &cfg)).await.unwrap();
+        handle(HookEvent::Stop, input(stop), ctx(&store, &cfg)).await.unwrap();
+        let msgs: Vec<_> =
+            store.events_recent("p", None, 50).await.unwrap().into_iter().filter(|e| e.kind == AGENT_MESSAGE).collect();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(!msgs[0].content.contains(&token), "secret was redacted: {}", msgs[0].content);
     }
 
     #[tokio::test]
