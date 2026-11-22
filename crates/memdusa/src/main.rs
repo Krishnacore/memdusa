@@ -6,6 +6,8 @@ mod hermes_yaml;
 mod hooks;
 mod http;
 mod install;
+#[cfg(feature = "local-embed")]
+mod local_embed;
 mod mcp;
 mod ops;
 mod project;
@@ -122,6 +124,10 @@ enum Cmd {
         /// Re-embed every memory, not just the missing or outdated ones.
         #[arg(long)]
         all: bool,
+        /// Download the local embedding model first (once, into <MEMDUSA_HOME>/models/).
+        /// Only needed with MEMDUSA_EMBED_URL=local; hooks never download automatically.
+        #[arg(long)]
+        download_model: bool,
     },
     /// Print the detected project key.
     Project,
@@ -507,9 +513,16 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { .. } => Mode::Local(cli.database_url.clone().map_or_else(default_db_url, Ok)?),
         _ => Mode::detect(cli.database_url.clone())?,
     };
+    // An explicit model download is the only path allowed to touch the network for model files.
+    let allow_download = matches!(&cli.cmd, Cmd::Embed { download_model: true, .. });
     let store = match &mode {
-        Mode::Remote(r) => return run_remote(cli.cmd, r, project, cli.project).await,
-        Mode::Local(url) => open_store(url).await.with_context(|| format!("connecting to {url}"))?,
+        Mode::Remote(r) => {
+            if allow_download {
+                println!("local embedding models are installed where memdusa serve runs, not on this client");
+            }
+            return run_remote(cli.cmd, r, project, cli.project).await;
+        }
+        Mode::Local(url) => open_store(url, allow_download).await.with_context(|| format!("connecting to {url}"))?,
     };
 
     match cli.cmd {
@@ -518,9 +531,12 @@ async fn main() -> anyhow::Result<()> {
             println!("mode: local database {url} (schema ok, {} users)", store.user_count().await?);
             let s = store.embedding_stats().await?;
             println!("{}", semantic_line(s.model.as_deref(), s.embedded, s.total));
+            if let Some(hint) = embedder::local_status_hint() {
+                println!("{hint}");
+            }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
-        Cmd::Embed { all } => print_backfill(&store.embeddings_backfill(all).await?),
+        Cmd::Embed { all, .. } => print_backfill(&store.embeddings_backfill(all).await?),
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
         Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
             let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
@@ -722,7 +738,7 @@ async fn run_remote(
             }
             print_import(&total);
         }
-        Cmd::Embed { all } => print_backfill(&client()?.embeddings_backfill(all).await?),
+        Cmd::Embed { all, .. } => print_backfill(&client()?.embeddings_backfill(all).await?),
         Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
         Cmd::Sync => {
             let spool = spool::Spool::open()?;
@@ -1004,7 +1020,7 @@ async fn run_hook_input(
             remote_hook(event, req, &r, deadline).await?
         }
         Mode::Local(url) => {
-            let store = open_store(&url).await?;
+            let store = open_store(&url, false).await?;
             let resp = hooks::handle_request(&store, event, req, &model::Identity::root()).await?;
             // Local mode has no server to prune on a schedule: do it at session end, at most daily.
             if let hooks::HookEvent::SessionEnd = event
@@ -1084,10 +1100,11 @@ fn redactor_from_env() -> anyhow::Result<Redactor> {
     Redactor::new(&patterns).with_context(|| format!("loading redaction patterns (env or {})", file.display()))
 }
 
-async fn open_store(url: &str) -> anyhow::Result<Store> {
+async fn open_store(url: &str, allow_download: bool) -> anyhow::Result<Store> {
     let mut store = Store::connect(url).await?.with_redactor(redactor_from_env()?);
-    // Semantic search is opt-in (MEMDUSA_EMBED_URL); a broken setup must not stop memdusa from working.
-    match embedder::HttpEmbedder::from_env() {
+    // Semantic search is opt-in (MEMDUSA_EMBED_URL / MEMDUSA_EMBED_PROVIDER); a broken setup must
+    // not stop memdusa from working. Only `embed --download-model` may fetch model files.
+    match embedder::from_env(allow_download).await {
         Ok(Some(e)) => store = store.with_embedder(e),
         Ok(None) => {}
         Err(e) => eprintln!("memdusa: semantic search disabled, bad embedding config: {e:#}"),

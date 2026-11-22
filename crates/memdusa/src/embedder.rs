@@ -1,12 +1,18 @@
-//! Embedding provider over HTTP: the OpenAI-compatible `POST {base}/embeddings` API, which OpenAI,
-//! Ollama (`http://localhost:11434/v1`) and many other servers speak. Configured from the environment
-//! of the process that owns the store (on a server: the server's env); off unless `MEMDUSA_EMBED_URL` is set.
+//! Embedding providers, configured from the environment of the process that owns the store (on a
+//! server: the server's env); off unless `MEMDUSA_EMBED_URL` / `MEMDUSA_EMBED_PROVIDER` is set.
+//!
+//! * HTTP: the OpenAI-compatible `POST {base}/embeddings` API (OpenAI, Ollama, ...).
+//! * Local: `MEMDUSA_EMBED_URL=local` or `MEMDUSA_EMBED_PROVIDER=local`, when built with the
+//!   `local-embed` cargo feature. Runs a small ONNX sentence-transformer inside memdusa.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use memdusa_core::embed::{BATCH, EmbedFuture, Embedder};
 use serde::Deserialize;
+
+#[cfg(feature = "local-embed")]
+use crate::{config, local_embed};
 
 pub const DEFAULT_MODEL: &str = "text-embedding-3-small";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,12 +61,8 @@ impl HttpEmbedder {
         })
     }
 
-    /// The provider configured by `MEMDUSA_EMBED_URL` / `MEMDUSA_EMBED_MODEL` / `MEMDUSA_EMBED_API_KEY`
+    /// HTTP provider from `MEMDUSA_EMBED_URL` / `MEMDUSA_EMBED_MODEL` / `MEMDUSA_EMBED_API_KEY`
     /// (`OPENAI_API_KEY` is used only for api.openai.com); `None` when semantic search is off.
-    pub fn from_env() -> anyhow::Result<Option<Arc<dyn Embedder>>> {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<Arc<dyn Embedder>>> {
         let val = |k: &str| get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let Some(url) = val("MEMDUSA_EMBED_URL") else { return Ok(None) };
@@ -68,7 +70,87 @@ impl HttpEmbedder {
         let api_key = api_key(&url, val("MEMDUSA_EMBED_API_KEY"), val("OPENAI_API_KEY"));
         Ok(Some(Arc::new(Self::new(&url, &model, api_key, REQUEST_TIMEOUT)?)))
     }
+}
 
+/// Which provider the environment asks for. `Ok(Some(model))` = local, with that model name;
+/// `Ok(None)` = HTTP (or off). Kept pure for tests.
+fn local_selection(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<String>> {
+    let val = |k: &str| get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let provider = val("MEMDUSA_EMBED_PROVIDER");
+    let url = val("MEMDUSA_EMBED_URL");
+    match provider.as_deref() {
+        Some(p) if p.eq_ignore_ascii_case("http") => return Ok(None),
+        Some(p) if !p.eq_ignore_ascii_case("local") => {
+            anyhow::bail!("MEMDUSA_EMBED_PROVIDER must be http or local (got {p:?})")
+        }
+        _ => {}
+    }
+    let from_url = url.as_deref().and_then(|u| {
+        let lower = u.to_ascii_lowercase();
+        if lower == "local" { Some(String::new()) } else { lower.strip_prefix("local:").map(str::to_owned) }
+    });
+    if from_url.is_none() && provider.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        from_url
+            .filter(|m| !m.is_empty())
+            .or_else(|| val("MEMDUSA_EMBED_MODEL"))
+            .unwrap_or_else(|| "all-MiniLM-L6-v2".into()),
+    ))
+}
+
+/// The provider configured by the environment. `allow_download` is true only for the explicit
+/// `memdusa embed --download-model` command: hooks and searches never fetch a model.
+pub async fn from_env(allow_download: bool) -> anyhow::Result<Option<Arc<dyn Embedder>>> {
+    let get = |k: &str| std::env::var(k).ok();
+    if let Some(model) = local_selection(get)? {
+        #[cfg(feature = "local-embed")]
+        {
+            let e = local_embed::LocalEmbedder::new(&model, config::dir()?.join("models"))?;
+            if allow_download {
+                e.prepare().await?;
+            }
+            return Ok(Some(Arc::new(e)));
+        }
+        #[cfg(not(feature = "local-embed"))]
+        {
+            let _ = (&allow_download, &model);
+            anyhow::bail!(
+                "local embeddings need a memdusa built with the `local-embed` cargo feature \
+                 (MEMDUSA_EMBED_URL=local)"
+            );
+        }
+    }
+    HttpEmbedder::from_lookup(get)
+}
+
+/// Model-specific default for prompt recall. The quality probe (see
+/// `local_embed/quality.rs`) puts MiniLM's currency hits at 0.50-0.60 (release-only hits ~0.23)
+/// and unrelated queries at ≤0.20, so 0.4 recalls the former without the latter; the generic
+/// default is 0.5.
+pub fn default_recall_min() -> f32 {
+    match local_selection(|k| std::env::var(k).ok()) {
+        Ok(Some(model)) if model.trim_start_matches("local:").eq_ignore_ascii_case("all-minilm-l6-v2") => 0.4,
+        _ => crate::hooks::RECALL_COSINE,
+    }
+}
+
+/// A one-line hint when local embeddings are selected but the model is not on disk yet.
+pub fn local_status_hint() -> Option<String> {
+    #[cfg(feature = "local-embed")]
+    {
+        let model = local_selection(|k| std::env::var(k).ok()).ok().flatten()?;
+        let e = local_embed::LocalEmbedder::new(&model, config::dir().ok()?.join("models")).ok()?;
+        if e.is_ready() { None } else { Some(local_embed::missing_model_hint(e.spec())) }
+    }
+    #[cfg(not(feature = "local-embed"))]
+    {
+        None
+    }
+}
+
+impl HttpEmbedder {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         let mut req =
             self.client.post(&self.endpoint).json(&serde_json::json!({ "model": self.model, "input": texts }));
@@ -235,6 +317,32 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(e.model(), "nomic-embed-text");
+    }
+
+    #[test]
+    fn local_provider_selection() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert!(local_selection(env(&[])).unwrap().is_none());
+        assert!(local_selection(env(&[("MEMDUSA_EMBED_URL", "http://localhost:11434/v1")])).unwrap().is_none());
+        assert_eq!(local_selection(env(&[("MEMDUSA_EMBED_URL", "local")])).unwrap().unwrap(), "all-MiniLM-L6-v2");
+        assert_eq!(
+            local_selection(env(&[("MEMDUSA_EMBED_PROVIDER", "local"), ("MEMDUSA_EMBED_MODEL", "bge-small")]))
+                .unwrap()
+                .unwrap(),
+            "bge-small"
+        );
+        assert_eq!(
+            local_selection(env(&[("MEMDUSA_EMBED_URL", "LOCAL:bge-small-en-v1.5")])).unwrap().unwrap(),
+            "bge-small-en-v1.5"
+        );
+        assert!(
+            local_selection(env(&[("MEMDUSA_EMBED_PROVIDER", "http"), ("MEMDUSA_EMBED_URL", "local")]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(local_selection(env(&[("MEMDUSA_EMBED_PROVIDER", "wat")])).is_err());
     }
 
     #[test]

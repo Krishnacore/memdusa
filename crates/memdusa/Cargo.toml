@@ -13,6 +13,10 @@ pkg-fmt = "tgz"
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-fmt = "zip"
 
+[features]
+# Built-in embeddings (ONNX Runtime + a small sentence-transformer). Off in default/release builds.
+local-embed = ["dep:fastembed"]
+
 [dependencies]
 memdusa-core.workspace = true
 anyhow.workspace = true
@@ -33,6 +37,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 gethostname = "1"
 rmcp.workspace = true
 sqlx.workspace = true
+fastembed = { workspace = true, optional = true }
 
 [dev-dependencies]
 yaml-rust2 = "0.10"
