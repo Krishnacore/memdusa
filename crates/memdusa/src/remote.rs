@@ -350,6 +350,37 @@ impl Client {
         Ok(self.send(self.request(Method::POST, &format!("/v1/admin/users/{name}/{action}"))).await?)
     }
 
+    pub async fn identity_list(&self, user: &str) -> anyhow::Result<Vec<memdusa_core::oauth::UserIdentity>> {
+        Ok(self.send(self.request(Method::GET, &format!("/v1/admin/users/{}/identities", path_segment(user)))).await?)
+    }
+
+    pub async fn identity_link(
+        &self,
+        user: &str,
+        provider: &str,
+        identity: &str,
+    ) -> anyhow::Result<memdusa_core::oauth::UserIdentity> {
+        let body = json!({ "provider": provider, "identity": identity });
+        Ok(self
+            .send(self.request(Method::POST, &format!("/v1/admin/users/{}/identities", path_segment(user))).json(&body))
+            .await?)
+    }
+
+    pub async fn identity_unlink(
+        &self,
+        user: &str,
+        provider: &str,
+        identity: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let path = format!(
+            "/v1/admin/users/{}/identities/{}/{}",
+            path_segment(user),
+            path_segment(provider),
+            path_segment(identity)
+        );
+        Ok(self.send(self.request(Method::DELETE, &path)).await?)
+    }
+
     /// `user: None` = the caller's own keys.
     pub async fn key_list(&self, user: Option<&str>) -> anyhow::Result<Vec<ApiKey>> {
         match user {

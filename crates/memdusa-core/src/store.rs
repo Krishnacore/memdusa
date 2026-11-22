@@ -474,7 +474,14 @@ const MIGRATIONS: &[Migration] = &[
             user_name TEXT,
             created_at BIGINT NOT NULL)",
     ]),
-    // 9: device authorization state (H2c). The v8 table was created but never
+    // 9: H2b upstream sign-in. A sign-in transaction remembers the short-lived
+    // upstream round trip (state / PKCE verifier / nonce) and how the user
+    // signed in, so the consent screen can create the right kind of grant.
+    Migration::Portable(&[
+        "ALTER TABLE oauth_transactions ADD COLUMN upstream TEXT",
+        "ALTER TABLE oauth_transactions ADD COLUMN signin_method TEXT NOT NULL DEFAULT 'api_key'",
+    ]),
+    // 10: device authorization state (H2c). The v8 table was created but never
     // used. Rebuild it instead of ADD COLUMN: a database rewound to v3 or
     // already carrying the new columns must migrate cleanly either way.
     Migration::Portable(&[

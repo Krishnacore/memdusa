@@ -603,6 +603,7 @@ pub(crate) mod tests {
             txn_secs: 600,
             device_secs: 600,
             device_interval_secs: 1,
+            upstream: crate::oauth_upstream::UpstreamConfig::default(),
         }
     }
 
