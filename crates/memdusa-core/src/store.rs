@@ -148,6 +148,37 @@ pub fn search_terms(text: &str) -> Vec<String> {
     w
 }
 
+/// Jaccard similarity from which a saved memory counts as a near-duplicate of an existing one.
+const NEAR_DUPLICATE: f64 = 0.75;
+/// How many full-text candidates are compared when looking for a near-duplicate.
+const NEAR_DUPLICATE_CANDIDATES: i64 = 10;
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "has", "have", "had", "its", "not",
+    "but", "you", "all", "can", "will", "our", "their", "they", "them", "into", "also", "any", "than", "then", "when",
+    "which",
+];
+
+/// The words that carry a memory's meaning: [`words`] without short words and stopwords.
+fn significant_words(text: &str) -> Vec<String> {
+    words(text).into_iter().filter(|w| w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str())).collect()
+}
+
+/// Two words count as the same when equal, or when one is a prefix (4+ chars) of the
+/// other, so "auth" ~ "authentication" and "test" ~ "testing".
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || (a.chars().count().min(b.chars().count()) >= 4 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// Jaccard similarity (0..=1) of the significant word sets of two texts.
+fn similarity(a: &str, b: &str) -> f64 {
+    let (wa, wb) = (significant_words(a), significant_words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return 0.0;
+    }
+    let common = wa.iter().filter(|x| wb.iter().any(|y| same_word(x, y))).count();
+    common as f64 / (wa.len() + wb.len() - common) as f64
+}
+
 /// Ordered, append-only list of migrations. Never edit a released entry:
 /// add a new one (e.g. `ALTER TABLE ... ADD COLUMN ...`). Portable statements
 /// must be valid on both SQLite and Postgres.
@@ -375,6 +406,7 @@ impl Store {
             user: r.try_get("user_name")?,
             created_at: r.try_get("created_at")?,
             updated_at: r.try_get("updated_at")?,
+            merged: false,
         })
     }
 
@@ -429,6 +461,35 @@ impl Store {
             return Ok(existing);
         }
 
+        // a near-duplicate (same kind and scope) is updated in place: newer wording wins, tags merge
+        let candidates = self
+            .memory_search(MemoryQuery {
+                query: Some(content.clone()),
+                project: m.project.clone(),
+                kind: Some(m.kind),
+                limit: Some(NEAR_DUPLICATE_CANDIDATES),
+                user: m.user.clone(),
+            })
+            .await?;
+        if let Some(mut near) = candidates
+            .into_iter()
+            .find(|c| c.project == m.project && similarity(&c.content, &content) >= NEAR_DUPLICATE)
+        {
+            for t in m.tags {
+                if !near.tags.contains(&t) {
+                    near.tags.push(t);
+                }
+            }
+            self.memory_write(&near.id, &content, near.kind, &near.tags, m.source.as_deref(), now).await?;
+            near.content = content;
+            near.updated_at = now;
+            if m.source.is_some() {
+                near.source = m.source;
+            }
+            near.merged = true;
+            return Ok(near);
+        }
+
         let mem = Memory {
             id: new_id(),
             project: m.project,
@@ -439,6 +500,7 @@ impl Store {
             user: m.user,
             created_at: now,
             updated_at: now,
+            merged: false,
         };
         let mut q = Q::new(
             "INSERT INTO memories (id, project, kind, content, tags, source, user_name, created_at, updated_at) VALUES (",
@@ -456,6 +518,62 @@ impl Store {
         ];
         q.push(&vals.join(", ")).push(")");
         q.build().execute(&self.pool).await?;
+        Ok(mem)
+    }
+
+    /// Overwrite a memory's editable columns (`source` only when given) and bump `updated_at`.
+    /// The full-text index follows: SQLite triggers on content/tags, a generated column on Postgres.
+    async fn memory_write(
+        &self,
+        id: &str,
+        content: &str,
+        kind: MemoryKind,
+        tags: &[String],
+        source: Option<&str>,
+        now: Millis,
+    ) -> Result<()> {
+        let mut q = Q::new("UPDATE memories SET ");
+        let (c, k, t, u) = (q.text(content), q.text(kind.as_str()), q.text(list_to_json(tags)), q.int(now));
+        q.push(&format!("content = {c}, kind = {k}, tags = {t}, updated_at = {u}"));
+        if let Some(s) = source {
+            let s = q.text(s);
+            q.push(&format!(", source = {s}"));
+        }
+        let id_p = q.text(id);
+        q.push(&format!(" WHERE id = {id_p}"));
+        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("memory {id}")));
+        }
+        Ok(())
+    }
+
+    /// Correct or refine a memory in place. Only the fields set in `patch` change;
+    /// content and tags are redacted like on save.
+    pub async fn memory_update(&self, id: &str, patch: MemoryPatch) -> Result<Memory> {
+        let mut q = Q::new(&format!("SELECT {MEMORY_COLS} FROM memories WHERE id = "));
+        let id_p = q.text(id);
+        q.push(&id_p);
+        let row = q.build().fetch_optional(&self.pool).await?.ok_or_else(|| Error::NotFound(format!("memory {id}")))?;
+        let mut mem = Self::row_to_memory(&row)?;
+
+        if let Some(c) = patch.content {
+            let c = self.redactor.string(c.trim().to_owned());
+            if c.is_empty() {
+                return Err(Error::Invalid("memory content is empty".into()));
+            }
+            mem.content = c;
+        }
+        if let Some(k) = patch.kind {
+            mem.kind = k;
+        }
+        if let Some(t) = patch.tags {
+            mem.tags = self.redactor.list(t);
+        }
+        if patch.source.is_some() {
+            mem.source = patch.source;
+        }
+        mem.updated_at = now_ms();
+        self.memory_write(id, &mem.content, mem.kind, &mem.tags, mem.source.as_deref(), mem.updated_at).await?;
         Ok(mem)
     }
 

@@ -165,7 +165,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/hooks/{event}", post(hook))
         .route("/v1/resume", get(resume))
         .route("/v1/memories", post(memory_save).get(memory_search))
-        .route("/v1/memories/{id}", delete(memory_forget))
+        .route("/v1/memories/{id}", delete(memory_forget).patch(memory_update))
         .route("/v1/events", post(event_append).get(events_recent))
         .route("/v1/checkpoints", post(checkpoint_save).get(checkpoints_latest))
         .route("/v1/runs", post(run_start).get(run_list))
@@ -556,6 +556,16 @@ async fn memory_save(
     Ok(Json(s.store.memory_save(m).await?))
 }
 
+async fn memory_update(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Path(mid): Path<String>,
+    Json(mut p): Json<MemoryPatch>,
+) -> ApiResult<Memory> {
+    p.source = attribute(&id, None);
+    Ok(Json(s.store.memory_update(&mid, p).await?))
+}
+
 async fn memory_search(
     State(s): State<AppState>,
     Extension(id): Extension<Identity>,
@@ -804,6 +814,36 @@ mod tests {
         let resp = r.send().await.unwrap();
         let status = resp.status().as_u16();
         (status, resp.json().await.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn patch_updates_a_memory_and_post_reports_merges() {
+        use reqwest::Method as M;
+        let (url, _) = spawn(None).await;
+        let u = |p: &str| format!("{url}{p}");
+
+        let first = json!({"project": "p", "content": "The API uses JWT tokens for auth"});
+        let (st, saved) = call(M::POST, &u("/v1/memories"), None, Some(first)).await;
+        assert_eq!(st, 200);
+        assert!(saved.get("merged").is_none(), "plain saves stay backward compatible: {saved}");
+        let id = saved["id"].as_str().unwrap().to_owned();
+
+        let near = json!({"project": "p", "content": "API uses JWT tokens for authentication"});
+        let (_, merged) = call(M::POST, &u("/v1/memories"), None, Some(near)).await;
+        assert_eq!((merged["id"].clone(), merged["merged"].clone()), (json!(id), json!(true)));
+
+        let patch = json!({"content": "Sessions use opaque cookies", "kind": "decision", "tags": ["auth"]});
+        let (st, m) = call(M::PATCH, &u(&format!("/v1/memories/{id}")), None, Some(patch)).await;
+        assert_eq!(st, 200, "{m}");
+        assert_eq!(
+            (m["content"].clone(), m["kind"].clone(), m["tags"].clone()),
+            (json!("Sessions use opaque cookies"), json!("decision"), json!(["auth"]))
+        );
+
+        let (st, _) = call(M::PATCH, &u("/v1/memories/missing"), None, Some(json!({"content": "x"}))).await;
+        assert_eq!(st, 404);
+        let (st, _) = call(M::PATCH, &u(&format!("/v1/memories/{id}")), None, Some(json!({"content": "  "}))).await;
+        assert_eq!(st, 400);
     }
 
     #[tokio::test]

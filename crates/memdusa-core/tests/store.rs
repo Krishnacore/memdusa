@@ -686,3 +686,112 @@ async fn v3_database_migrates_to_v4_and_backfills() {
     s.memory_save(mem(&proj, "freshly written note about sharding", &[])).await.unwrap();
     assert_eq!(s.memory_search(query(&p, "sharding")).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn memory_update_changes_fields_and_reindexes() {
+    for (name, s) in stores().await {
+        let p = project();
+        let u = new_id().replace('-', "");
+        let (old, new) = (format!("{u}old"), format!("{u}new"));
+        let m = s.memory_save(mem(&Some(p.clone()), &format!("uses {old} store"), &["a"])).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let patch = MemoryPatch {
+            content: Some(format!("uses {new} store")),
+            kind: Some(MemoryKind::Decision),
+            tags: Some(vec!["b".into()]),
+            source: Some("agent".into()),
+        };
+        let up = s.memory_update(&m.id, patch).await.unwrap();
+        assert_eq!(
+            (up.kind, up.tags.clone(), up.source.as_deref()),
+            (MemoryKind::Decision, vec!["b".to_string()], Some("agent")),
+            "{name}"
+        );
+        assert!(up.updated_at > m.updated_at && up.created_at == m.created_at, "{name}");
+
+        assert!(s.memory_search(query(&p, &old)).await.unwrap().is_empty(), "{name}: old words gone");
+        let found = s.memory_search(query(&p, &new)).await.unwrap();
+        assert_eq!(ids(found.clone()), vec![m.id.clone()], "{name}");
+        assert_eq!((found[0].kind, found[0].content.as_str()), (MemoryKind::Decision, up.content.as_str()), "{name}");
+
+        // a partial patch leaves the rest alone
+        let up = s.memory_update(&m.id, MemoryPatch { tags: Some(vec![]), ..Default::default() }).await.unwrap();
+        assert_eq!((up.content.contains(&new), up.kind, up.tags.len()), (true, MemoryKind::Decision, 0), "{name}");
+
+        // redaction applies to content and tags
+        let gh = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let up = s
+            .memory_update(
+                &m.id,
+                MemoryPatch { content: Some(format!("token {gh}")), tags: Some(vec![gh.into()]), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(up.content, "token [REDACTED:github_token]", "{name}");
+        assert!(!up.tags[0].contains("ghp_"), "{name}: {:?}", up.tags);
+
+        assert!(matches!(s.memory_update("missing", MemoryPatch::default()).await, Err(Error::NotFound(_))), "{name}");
+        let empty = MemoryPatch { content: Some("  ".into()), ..Default::default() };
+        assert!(matches!(s.memory_update(&m.id, empty).await, Err(Error::Invalid(_))), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn near_duplicate_saves_merge_into_the_existing_memory() {
+    for (name, s) in stores().await {
+        let (p, other) = (project(), project());
+        let first = s.memory_save(mem(&Some(p.clone()), "The API uses JWT tokens for auth", &["auth"])).await.unwrap();
+        assert!(!first.merged, "{name}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let second =
+            s.memory_save(mem(&Some(p.clone()), "API uses JWT tokens for authentication", &["jwt"])).await.unwrap();
+        assert!(second.merged && second.id == first.id, "{name}");
+        assert_eq!(second.content, "API uses JWT tokens for authentication", "{name}");
+        assert_eq!(second.tags, vec!["auth".to_string(), "jwt".to_string()], "{name}");
+        assert!(second.updated_at > first.updated_at, "{name}");
+        let all = s.memory_search(query(&p, "jwt")).await.unwrap();
+        let mine: Vec<_> = all.iter().filter(|m| m.project.as_deref() == Some(p.as_str())).collect();
+        assert_eq!((mine.len(), mine[0].content.as_str()), (1, "API uses JWT tokens for authentication"), "{name}");
+
+        // another kind, another project, or clearly different content stay separate
+        let kind =
+            NewMemory { kind: MemoryKind::Decision, ..mem(&Some(p.clone()), "The API uses JWT tokens for auth", &[]) };
+        let k = s.memory_save(kind).await.unwrap();
+        assert!(!k.merged && k.id != first.id, "{name}: different kind");
+        let o = s.memory_save(mem(&Some(other.clone()), "The API uses JWT tokens for auth", &[])).await.unwrap();
+        assert!(!o.merged && o.id != first.id, "{name}: different project");
+        let d =
+            s.memory_save(mem(&Some(p.clone()), "Deploys go through the staging cluster first", &[])).await.unwrap();
+        assert!(!d.merged, "{name}: different content");
+    }
+}
+
+#[tokio::test]
+async fn brief_flags_memories_about_files_changed_since() {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    for (name, s) in stores().await {
+        let p = project();
+        let before = s.memory_save(mem(&Some(p.clone()), "Auth lives in src/auth/jwt.rs", &[])).await.unwrap();
+        s.memory_save(mem(&Some(p.clone()), "Prefer small functions everywhere", &[])).await.unwrap();
+        pause().await;
+        let change = |path: &str| NewEvent {
+            project: p.clone(),
+            kind: "file_change".into(),
+            content: path.into(),
+            ..Default::default()
+        };
+        s.event_append(change("/home/dev/repo/src/auth/jwt.rs")).await.unwrap();
+        pause().await;
+        s.memory_save(mem(&Some(p.clone()), "Sessions are stored in src/auth/jwt.rs too", &["x"])).await.unwrap();
+
+        let b = brief::build(&s, &p, None, None).await.unwrap();
+        let line = |needle: &str| b.markdown.lines().find(|l| l.contains(needle)).unwrap_or_default().to_owned();
+        let flagged = line("Auth lives in");
+        assert!(flagged.contains("may be outdated: src/auth/jwt.rs changed"), "{name}: {flagged}");
+        assert!(!line("Sessions are stored").contains("outdated"), "{name}: saved after the change");
+        assert!(!line("Prefer small functions").contains("outdated"), "{name}: no paths");
+        let _ = before;
+    }
+}

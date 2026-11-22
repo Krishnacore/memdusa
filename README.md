@@ -272,8 +272,18 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 
 ## MCP tools
 
-`resume`, `memory_save`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`, `run_step`,
-`run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
+`resume`, `memory_save`, `memory_update`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`,
+`run_step`, `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
+
+### Memory hygiene
+
+- `memory_update` (REST: `PATCH /v1/memories/{id}`) corrects a memory in place: any of `content`, `kind`, `tags`.
+  Redaction applies and the search index follows.
+- Saving a near-duplicate merges instead of adding: a memory of the same kind and scope (project, or your globals)
+  whose significant words overlap by at least 75% (Jaccard; short words and stopwords ignored, "auth" ~
+  "authentication") is updated with the newer text and merged tags. The result says so (`merged: true` in REST/JSON).
+- The brief flags a memory with ` _(may be outdated: src/auth/jwt.rs changed 2h ago)_` when it mentions a file that
+  a recent `file_change` event touched after the memory was last updated.
 
 ### Search and recall
 
@@ -377,7 +387,8 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Ranked full-text memory search
 - [x] Relevant memories injected on each prompt
 - [ ] Semantic memory search (embeddings behind a trait; local model or API)
-- [ ] Memory consolidation: summarize old events, merge near-duplicate memories
+- [x] Memory hygiene: update, near-duplicate merge, stale flags
+- [ ] Memory consolidation: summarize old events
 - [x] Per-user API keys, server-side attribution, private global memories
 - [ ] Per-project access control (who can read/write which projects), audit log
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)

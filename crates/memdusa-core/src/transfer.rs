@@ -86,6 +86,7 @@ impl Store {
                 user: r.try_get("user_name")?,
                 created_at: r.try_get("created_at")?,
                 updated_at: r.try_get("updated_at")?,
+                merged: false,
             }));
         }
 
