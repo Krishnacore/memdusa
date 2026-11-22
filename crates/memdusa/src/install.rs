@@ -191,6 +191,16 @@ pub fn merge_hooks(
                 };
                 group.insert(nh.native.into(), entry);
             }
+            // `agy -p` soft-denies MCP calls it cannot ask approval for. A PreToolUse hook can
+            // auto-approve just memdusa's server; the handler checks ServerName before doing so.
+            let approve = hook_command(bin, h, crate::hooks::HookEvent::McpApproval, db);
+            group.insert(
+                "PreToolUse".into(),
+                json!([{
+                    "matcher": "call_mcp_tool|mcp_memdusa_.*",
+                    "hooks": [{ "type": "command", "command": approve, "timeout": 5 }]
+                }]),
+            );
             root.insert("memdusa".into(), group.into());
         }
         return Ok(settings);
@@ -689,11 +699,20 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
                 );
             }
         }
-        Harness::Antigravity => n.push(
-            "Antigravity has no session-end or compaction hooks, so memdusa can't write fallback checkpoints there; \
-             the stop hook asks the agent to checkpoint instead."
-                .into(),
-        ),
+        Harness::Antigravity => {
+            n.push(
+                "Antigravity has no session-end or compaction hooks. memdusa journals the agent's last words from the \
+                 session transcript at Stop and writes one fallback checkpoint when the agent goes fully idle after \
+                 editing files (at most one per session)."
+                    .into(),
+            );
+            n.push(
+                "Headless `agy -p` soft-denies MCP calls it can't ask approval for; memdusa installs a PreToolUse hook \
+                 that auto-approves only its own MCP server, so `checkpoint` works without \
+                 --dangerously-skip-permissions. MEMDUSA_RUN / MEMDUSA_TASK reach the MCP server from agy's environment."
+                    .into(),
+            );
+        }
         Harness::Gemini => n.push(
             "Gemini CLI was replaced by Antigravity CLI for consumer accounts in June 2026; if you're on Antigravity, \
              run `memdusa install antigravity`."
@@ -1034,7 +1053,13 @@ mod tests {
             agy["memdusa"]["SessionStart"][0]["command"],
             format!("{BIN} hook session-start --harness antigravity")
         );
-        assert!(agy["memdusa"]["PostToolUse"][0]["matcher"].as_str().unwrap().contains("run_command"));
+        assert!(agy["memdusa"]["PostToolUse"][0]["matcher"].as_str().unwrap().contains("write_file"));
+        assert!(
+            agy["memdusa"]["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("hook mcp-approval --harness antigravity")
+        );
         assert_eq!(
             merge_hooks(agy, Harness::Antigravity, BIN, None, true).unwrap(),
             json!({"other": {"enabled": true}})
