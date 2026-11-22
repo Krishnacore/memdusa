@@ -74,57 +74,75 @@ your other hooks, and backs the file up to `settings.json.memdusa-backup` first:
 Hooks never break a session. Any error is logged to stderr, the hook exits 0, and it gives up well inside Claude
 Code's timeout. A hook takes about 15 ms. In remote mode they call the server instead (see below).
 
-## Connect other harnesses (local, stdio)
+## Other harnesses
 
-Each harness launches `memdusa mcp`. Pass `--agent` so records and leases show who did what.
+One command per harness. It installs that tool's own hooks (or plugin) and registers the MCP server:
 
-**Claude Code (MCP only, no hooks)**
 ```sh
-claude mcp add memdusa --scope user -- memdusa mcp --agent claude-code
+memdusa install codex          # or: cursor | antigravity | gemini | opencode | pi | hermes
+memdusa install codex --scope project
+memdusa uninstall codex
 ```
 
-**Codex** (`~/.codex/config.toml`)
-```toml
-[mcp_servers.memdusa]
-command = "memdusa"
-args = ["mcp", "--agent", "codex"]
+Each tool's hook payload is translated to memdusa's canonical format on your machine, and the output is rendered back
+in that tool's dialect. Remote mode, the offline queue, redaction and code state therefore work the same everywhere.
+
+| Harness | How memdusa plugs in | Brief at start | Prompts | Edits / commands | Checkpoint reminder | Fallback checkpoint |
+|---|---|---|---|---|---|---|
+| Claude Code | hooks in `settings.json` | ✓ (also after compaction) | ✓ | ✓ | Stop | PreCompact, SessionEnd |
+| Codex CLI | `~/.codex/hooks.json` + `config.toml` | ✓ (also after compaction) | ✓ | ✓ (patch → files) | Stop | PreCompact, SessionEnd |
+| Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
+| Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | (no such hooks) |
+| Gemini CLI | `~/.gemini/settings.json` | ✓ | ✓ (`BeforeAgent`) | ✓ | AfterAgent (`deny`) | PreCompress, SessionEnd |
+| OpenCode | TypeScript plugin in `.opencode/plugins/` | ✓ (first prompt) | ✓ | ✓ | `experimental.idle` | compaction hook |
+| pi | TypeScript extension in `~/.pi/agent/extensions/` | ✓ (first run) | ✓ | ✓ | `agent_before_settle` | session_before_compact, session_shutdown |
+| Hermes Agent | shell hooks in `~/.hermes/config.yaml` | ✓ (first turn) | ✓ | ✓ | `pre_verify` (after edits only) | on_session_finalize |
+
+Things to know per tool:
+- **Codex** runs new hooks only after you trust them in `/hooks`.
+- **Cursor** also runs Claude Code hooks by default ("Third-Party Imports"). If both are installed, turn that off so events
+  aren't recorded twice; `memdusa install cursor` warns you.
+- **Antigravity** has no session-end or compaction hooks, so there's no fallback checkpoint there; the stop reminder does
+  that job. Gemini CLI remains for enterprise and paid-API users (consumer accounts moved to Antigravity in June 2026).
+- **pi** hides MCP tools behind "code mode" by default; memdusa registers its server with `exposure: "direct"`.
+- **Hermes** asks once to approve each hook (headless: `--accept-hooks`). memdusa writes a marked block into
+  `config.yaml`, or prints it for you to merge if the file already has `hooks:` / `mcp_servers:`.
+- The checkpoint reminder fires **at most once per session per window** for every harness, so it can't trap an agent that
+  has no way to checkpoint.
+
+Any other MCP client can use memdusa as a plain MCP server (`memdusa mcp --agent <name>`), without hooks.
+
+### Git hooks
+
+```sh
+memdusa install git       # in the repo; per clone
+memdusa uninstall git
 ```
 
-**Cursor** (`.cursor/mcp.json`) / **Gemini CLI** (`~/.gemini/settings.json`)
-```json
-{ "mcpServers": { "memdusa": { "command": "memdusa", "args": ["mcp", "--agent", "cursor"] } } }
+Commits, branch switches and merges are recorded as events in the journal, whoever made them (any agent or a human),
+through the same hook pipeline as the harness hooks (redaction, offline queue, remote mode). The hooks run in the
+background and never block or fail a git command. They are installed in `git rev-parse --git-path hooks`, so
+`core.hooksPath` (for example Husky) is respected. Existing user hooks are kept; memdusa only adds its own line.
+
+## Importing past sessions
+
+Work done before memdusa was installed, or in a tool without hooks, can still reach memdusa:
+
+```sh
+memdusa import-transcript claude-code --latest          # newest session for this repo
+memdusa import-transcript codex ~/.codex/sessions/2026/03/02/rollout-….jsonl
+memdusa import-transcript pi session1.jsonl session2.jsonl --dry-run
 ```
 
-> If a harness doesn't start MCP servers in the project directory, add `"env": {"MEMDUSA_PROJECT": "github.com/org/repo"}`
-> or let the agent pass `project` explicitly.
+Supported: `claude-code` (`~/.claude/projects/…`), `codex` (`~/.codex/sessions/…`; `.zst`-compressed files are skipped,
+decompress them first) and `pi` (`~/.pi/agent/sessions/…`). A transcript becomes the events its hooks would have
+recorded (prompts, file changes, commands, with their original timestamps), followed by a session end, so the usual
+fallback checkpoint is written if files changed. It goes through the same pipeline as live hooks (redaction, remote
+mode, project detection from the transcript's recorded directory, or `--project`).
 
-The server ships instructions telling the agent to call `resume` first, `checkpoint` before stopping, and so on. For
-harnesses that ignore MCP server instructions, put one line in your `CLAUDE.md` / `AGENTS.md`:
-
-> At the start of every session call the memdusa `resume` tool; save a `checkpoint` before you stop.
-
-## Code state in checkpoints
-
-Notes are only useful if the code matches them. Every checkpoint records where the code was: branch, HEAD, uncommitted
-files, and the machine. Hooks, the CLI, stdio MCP and the remote proxy capture it on the client (one
-`git status --porcelain=v2` call). The model never has to pass it in, and the field is hidden from its tool schema.
-
-```
-### Goal: Add refunds
-**Code:** `feat/refunds` @ `a1b2c3d` · 2 uncommitted (src/refund.ts, src/api.ts) · on `laptop`
-```
-
-On resume, the brief compares that with the resuming agent's state, and puts any warnings above the notes:
-
-| Situation | Warning |
-|---|---|
-| Saved on another machine with uncommitted files | those changes may exist only on that machine |
-| Different branch | the checkpoint was on `feat/x`, you're on `main` |
-| Same branch, HEAD moved | new commits, a rebase, or a different checkout |
-| Uncommitted files are clean now | committed elsewhere, stashed or discarded? |
-
-State is only attached when the current directory's repo *is* the project being resumed, so
-`--project other/repo` never compares against an unrelated checkout.
+- `--latest` picks the most recent session for the current directory's repo; otherwise pass the files.
+- Idempotent: a session that already has events is skipped, unless you pass `--force`.
+- `--dry-run` prints what would be imported (counts and time range) and writes nothing.
 
 ## Retention
 
@@ -251,6 +269,19 @@ claude mcp add --transport http memdusa https://memdusa.example.com/mcp \
 `resume`, `memory_save`, `memory_search`, `memory_forget`, `checkpoint`, `log_event`, `run_start`, `run_step`,
 `run_step_complete`, `run_step_fail`, `run_finish`, `run_claim`, `run_get`, `run_list`
 
+### MCP resources and prompts
+
+For clients that surface resources and prompts better than tool calls, the brief is also exposed as:
+
+- Resources (Markdown): `memdusa://brief` (the same text `resume` returns, for the default project),
+  `memdusa://memories` (project and visible global memories, grouped by kind), and the template
+  `memdusa://brief/{project}` for an explicit, URL-encoded project key (`memdusa://brief/github.com%2Facme%2Fshop`).
+  Unknown URIs return an MCP "resource not found" error.
+- Prompts: `resume` (optional `project` argument; the brief plus "continue from this brief") and `checkpoint`
+  (asks the agent to save a checkpoint and `memory_save` its decisions). Many clients show these as slash commands.
+
+The stdio→HTTP proxy forwards resources and prompts to the remote server, like tools.
+
 ### Durable run protocol
 
 ```
@@ -320,7 +351,11 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Claude Code hooks: auto-resume, journaling, checkpoint guard, fallback checkpoints
 - [x] Remote mode: `memdusa login`, hooks over REST, stdio→HTTP MCP proxy
 - [ ] Capture `PostCompact` summaries and Stop's `last_assistant_message` into the journal
-- [ ] Hook adapters for other harnesses (Codex, Gemini CLI, Cursor) and git hooks
+- [x] Adapters: Codex, Cursor, Antigravity, Gemini CLI, OpenCode, pi, Hermes
+- [x] Handoff eval with real agents (`eval/`)
+- [x] Git hooks (commits, branch switches) as events
+- [x] MCP resources and prompts (brief, memories, /resume)
+- [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
 - [ ] Semantic memory search (embeddings behind a trait; local model or API), plus SQLite FTS5 / Postgres `tsvector`
 - [ ] Memory consolidation: summarize old events, merge near-duplicate memories
 - [x] Per-user API keys, server-side attribution, private global memories
@@ -328,4 +363,3 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [ ] OAuth for remote MCP (so harnesses can connect without pasting a key)
 - [x] Local → hosted migration (`export | import`)
 - [ ] Continuous local ⇄ hosted sync
-- [ ] Transcript import from Claude Code / Codex session files

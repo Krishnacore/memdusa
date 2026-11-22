@@ -1,6 +1,6 @@
-//! `memdusa install claude-code`: registers the MCP server and merges the
-//! memdusa hooks into a Claude Code settings file, idempotently and without
-//! touching anything else in it.
+//! `memdusa install <harness>`: registers the MCP server and merges memdusa's
+//! hooks into the harness's own config files, idempotently and without
+//! touching anything else in them. `memdusa uninstall <harness>` reverses it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,44 +8,99 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use serde_json::{Map, Value, json};
 
-use crate::hooks::HookEvent;
+use crate::adapters::Harness;
+use crate::config::home_dir;
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scope {
-    /// ~/.claude/settings.json: every project on this machine.
+    /// Your user config: every project on this machine.
     User,
-    /// .claude/settings.json: this project, committed and shared with the team.
+    /// This project's config, committed and shared with the team.
     Project,
-    /// .claude/settings.local.json: this project, just you (gitignored).
+    /// This project, just you (Claude Code only: .claude/settings.local.json).
     Local,
 }
 
-impl Scope {
-    fn settings_path(self) -> anyhow::Result<PathBuf> {
-        Ok(match self {
-            Self::User => crate::config::home_dir()?.join(".claude/settings.json"),
-            Self::Project => PathBuf::from(".claude/settings.json"),
-            Self::Local => PathBuf::from(".claude/settings.local.json"),
-        })
-    }
-    fn mcp_scope(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Project => "project",
-            Self::Local => "local",
-        }
-    }
-}
-
 pub struct InstallOptions {
+    pub harness: Harness,
     pub scope: Scope,
-    /// Override the settings file (mostly for testing).
+    /// Override the hooks/settings file (mostly for testing).
     pub settings: Option<PathBuf>,
     /// Command used to invoke memdusa. Default: absolute path of this binary.
     pub bin: Option<String>,
     pub mcp: bool,
     pub dry_run: bool,
     pub uninstall: bool,
+}
+
+/// Git's native hook names, installed by `memdusa install git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GitHookKind {
+    #[value(name = "post-commit")]
+    Commit,
+    #[value(name = "post-checkout")]
+    Checkout,
+    #[value(name = "post-merge")]
+    Merge,
+}
+
+impl GitHookKind {
+    pub const ALL: [Self; 3] = [Self::Commit, Self::Checkout, Self::Merge];
+
+    /// Native hook file name, also the `memdusa git-hook` argument.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Commit => "post-commit",
+            Self::Checkout => "post-checkout",
+            Self::Merge => "post-merge",
+        }
+    }
+
+    /// `git_event` value recorded in the journal.
+    pub fn event(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Checkout => "checkout",
+            Self::Merge => "merge",
+        }
+    }
+}
+
+/// Where a harness keeps its hooks (and, for some, MCP servers).
+fn hooks_path(h: Harness, scope: Scope) -> anyhow::Result<PathBuf> {
+    let home = || home_dir();
+    Ok(match (h, scope) {
+        (Harness::ClaudeCode, Scope::User) => home()?.join(".claude/settings.json"),
+        (Harness::ClaudeCode, Scope::Project) => ".claude/settings.json".into(),
+        (Harness::ClaudeCode, Scope::Local) => ".claude/settings.local.json".into(),
+        (Harness::Codex, Scope::User) => home()?.join(".codex/hooks.json"),
+        (Harness::Codex, _) => ".codex/hooks.json".into(),
+        (Harness::Cursor, Scope::User) => home()?.join(".cursor/hooks.json"),
+        (Harness::Cursor, _) => ".cursor/hooks.json".into(),
+        (Harness::Gemini, Scope::User) => home()?.join(".gemini/settings.json"),
+        (Harness::Gemini, _) => ".gemini/settings.json".into(),
+        (Harness::Antigravity, Scope::User) => home()?.join(".gemini/config/hooks.json"),
+        (Harness::Antigravity, _) => ".agents/hooks.json".into(),
+        (Harness::OpenCode | Harness::Pi | Harness::Hermes | Harness::Git, _) => {
+            bail!("{} has no JSON hooks file", h.agent())
+        }
+    })
+}
+
+/// JSON file holding `mcpServers` (Claude Code and Codex are handled by their CLIs / TOML).
+fn mcp_json_path(h: Harness, scope: Scope) -> anyhow::Result<Option<PathBuf>> {
+    let user = scope == Scope::User;
+    Ok(match h {
+        Harness::Cursor => Some(if user { home_dir()?.join(".cursor/mcp.json") } else { ".cursor/mcp.json".into() }),
+        Harness::Gemini => Some(hooks_path(h, scope)?), // same settings.json
+        Harness::Antigravity => Some(if user {
+            home_dir()?.join(".gemini/config/mcp_config.json")
+        } else {
+            ".agents/mcp_config.json".into()
+        }),
+        Harness::Pi => Some(if user { home_dir()?.join(".pi/agent/mcp.json") } else { ".pi/mcp.json".into() }),
+        Harness::ClaudeCode | Harness::Codex | Harness::OpenCode | Harness::Hermes | Harness::Git => None,
+    })
 }
 
 /// Is this hook command one of ours? Matches regardless of binary location.
@@ -69,87 +124,623 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+fn hook_command(bin: &str, h: Harness, event: crate::hooks::HookEvent) -> String {
+    match h {
+        Harness::ClaudeCode => format!("{} hook {}", shell_quote(bin), event.arg()),
+        _ => format!("{} hook {} --harness {}", shell_quote(bin), event.arg(), h.agent()),
+    }
+}
+
+fn is_ours(v: &Value) -> bool {
+    v.get("command").and_then(Value::as_str).is_some_and(is_memdusa_hook)
+}
+
 /// Remove our previous hook entries from `settings`, then (unless
 /// uninstalling) add the current set. Everything else is preserved.
-pub fn merge_hooks(mut settings: Value, bin: &str, uninstall: bool) -> anyhow::Result<Value> {
-    let root = settings.as_object_mut().context("settings file is not a JSON object")?;
+pub fn merge_hooks(mut settings: Value, h: Harness, bin: &str, uninstall: bool) -> anyhow::Result<Value> {
+    let root = settings.as_object_mut().context("config file is not a JSON object")?;
+
+    // Antigravity: one named group per tool, which we own entirely.
+    if h == Harness::Antigravity {
+        root.remove("memdusa");
+        if !uninstall {
+            let mut group = Map::new();
+            group.insert("enabled".into(), json!(true));
+            for nh in h.events() {
+                let handler =
+                    json!({ "type": "command", "command": hook_command(bin, h, nh.event), "timeout": nh.timeout_secs });
+                let entry = match nh.matcher {
+                    Some(m) => json!([{ "matcher": m, "hooks": [handler] }]),
+                    None => json!([handler]),
+                };
+                group.insert(nh.native.into(), entry);
+            }
+            root.insert("memdusa".into(), group.into());
+        }
+        return Ok(settings);
+    }
+
+    if h == Harness::Cursor {
+        root.entry("version").or_insert(json!(1));
+    }
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().context("`hooks` is not a JSON object")?;
 
     // strip existing memdusa hooks everywhere
-    for groups in hooks.values_mut() {
-        let Some(groups) = groups.as_array_mut() else { continue };
-        for g in groups.iter_mut() {
-            if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
-                hs.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(is_memdusa_hook));
+    for entries in hooks.values_mut() {
+        let Some(entries) = entries.as_array_mut() else { continue };
+        if h == Harness::Cursor {
+            entries.retain(|e| !is_ours(e)); // Cursor: handlers sit directly in the event list
+        } else {
+            for g in entries.iter_mut() {
+                if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+                    hs.retain(|h| !is_ours(h));
+                }
             }
+            entries.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
         }
-        groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
     }
-    hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
+    hooks.retain(|_, entries| entries.as_array().is_none_or(|e| !e.is_empty()));
 
     if !uninstall {
-        for ev in HookEvent::ALL {
-            let mut group = Map::new();
-            if let Some(m) = ev.matcher() {
-                group.insert("matcher".into(), json!(m));
-            }
-            group.insert(
-                "hooks".into(),
-                json!([{
-                    "type": "command",
-                    "command": format!("{} hook {}", shell_quote(bin), ev.arg()),
-                    "timeout": ev.timeout_secs(),
-                }]),
-            );
-            let list = hooks.entry(ev.claude_name()).or_insert_with(|| json!([]));
-            list.as_array_mut()
-                .with_context(|| format!("hooks.{} is not an array", ev.claude_name()))?
-                .push(group.into());
+        for nh in h.events() {
+            // Gemini CLI timeouts are in milliseconds, everyone else's in seconds
+            let timeout = if h == Harness::Gemini { nh.timeout_secs * 1000 } else { nh.timeout_secs };
+            let handler = json!({ "type": "command", "command": hook_command(bin, h, nh.event), "timeout": timeout });
+            let entry = if h == Harness::Cursor {
+                json!({ "command": hook_command(bin, h, nh.event), "timeout": nh.timeout_secs })
+            } else {
+                let mut group = Map::new();
+                if let Some(m) = nh.matcher {
+                    group.insert("matcher".into(), json!(m));
+                }
+                group.insert("hooks".into(), json!([handler]));
+                group.into()
+            };
+            hooks
+                .entry(nh.native)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .with_context(|| format!("hooks.{} is not an array", nh.native))?
+                .push(entry);
         }
     }
     if hooks.is_empty() {
         root.remove("hooks");
+        if h == Harness::Cursor {
+            root.remove("version");
+        }
     }
     Ok(settings)
 }
 
-pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
-    let bin = match opts.bin {
-        Some(b) => b,
-        None => std::env::current_exe()?.canonicalize()?.display().to_string(),
-    };
-    let path = match opts.settings {
-        Some(p) => p,
-        None => opts.scope.settings_path()?,
-    };
-
-    let current: Value = match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).with_context(|| format!("{} is not valid JSON; fix it first", path.display()))?
+/// Add (or remove) `mcpServers.memdusa` in a JSON config.
+pub fn merge_mcp_json(mut config: Value, h: Harness, bin: &str, uninstall: bool) -> anyhow::Result<Value> {
+    let root = config.as_object_mut().context("config file is not a JSON object")?;
+    let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = servers.as_object_mut().context("`mcpServers` is not a JSON object")?;
+    servers.remove("memdusa");
+    if !uninstall {
+        let mut entry = json!({ "command": bin, "args": ["mcp", "--agent", h.agent()] });
+        if h == Harness::Cursor {
+            entry["type"] = json!("stdio");
         }
-        Ok(_) => json!({}),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let updated = merge_hooks(current.clone(), &bin, opts.uninstall)?;
-    let text = serde_json::to_string_pretty(&updated)? + "\n";
+        if h == Harness::Pi {
+            entry["exposure"] = json!("direct"); // pi's default "codemode" hides tools from the model
+        }
+        servers.insert("memdusa".into(), entry);
+    }
+    if servers.is_empty() {
+        root.remove("mcpServers");
+    }
+    Ok(config)
+}
 
+/// Add (or remove) the `[mcp_servers.memdusa]` table in Codex's config.toml.
+pub fn merge_codex_toml(text: &str, bin: &str, uninstall: bool) -> String {
+    const HEADER: &str = "[mcp_servers.memdusa]";
+    // drop an existing table: from its header to the next table header
+    let mut out: Vec<&str> = vec![];
+    let mut skipping = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t == HEADER || t.starts_with("[mcp_servers.memdusa.") {
+            skipping = true;
+            continue;
+        }
+        if skipping && t.starts_with('[') {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    let mut s = out.join("\n");
+    if !uninstall {
+        let quote = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str(&format!("{HEADER}\ncommand = {}\nargs = [\"mcp\", \"--agent\", \"codex\"]", quote(bin)));
+    }
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
+/// Add or remove memdusa's line in one git hook script. Returns the new file
+/// content, or `None` when the file should be deleted (uninstall left only a
+/// shebang and blank lines). The user's other lines are never changed.
+pub fn merge_git_hook(existing: &str, line: &str, uninstall: bool) -> Option<String> {
+    let is_ours = |l: &str| l.trim_end().ends_with("# memdusa");
+    let lines: Vec<&str> = existing.lines().collect();
+
+    if uninstall {
+        if lines.iter().all(|l| l.trim().is_empty()) {
+            return None;
+        }
+        let kept: Vec<&str> = lines.into_iter().filter(|l| !is_ours(l)).collect();
+        // Nothing left but a shebang (and blank lines): our line was the whole hook.
+        if kept.iter().all(|l| l.trim().is_empty() || l.trim_start().starts_with("#!")) {
+            return None;
+        }
+        return Some(join_hook_lines(&kept, existing));
+    }
+
+    if lines.iter().all(|l| l.trim().is_empty()) {
+        return Some(format!("#!/bin/sh\n{line}\n"));
+    }
+
+    // Replace the first memdusa line (an older bin path) in place; drop any duplicates.
+    if lines.iter().any(|l| is_ours(l)) {
+        let mut replaced = false;
+        let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+        for l in lines {
+            if is_ours(l) {
+                if !replaced {
+                    out.push(line);
+                    replaced = true;
+                }
+            } else {
+                out.push(l);
+            }
+        }
+        return Some(join_hook_lines(&out, existing));
+    }
+
+    // A trailing `exit` would skip anything after it, so insert our line before
+    // the last meaningful line when that line is an exit statement. Otherwise
+    // append as usual.
+    let last_meaningful = lines.iter().rposition(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#')
+    });
+    let insert_at = match last_meaningful {
+        Some(i) if lines[i].trim_start().starts_with("exit") => i,
+        _ => lines.len(),
+    };
+    let mut out = lines;
+    out.insert(insert_at, line);
+    Some(join_hook_lines(&out, existing))
+}
+
+fn join_hook_lines(lines: &[&str], existing: &str) -> String {
+    let mut text = lines.join("\n");
+    if existing.ends_with('\n') || !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// The line `memdusa install git` adds to each hook. It can never fail the git
+/// operation (`|| true`) and never prints (`>/dev/null 2>&1`).
+fn git_hook_line(bin: &str, hook: &str) -> String {
+    format!("{} git-hook {hook} \"$@\" >/dev/null 2>&1 || true  # memdusa", shell_quote(bin))
+}
+
+/// `git rev-parse --git-path hooks`: respects `core.hooksPath` (e.g. Husky).
+fn git_hooks_dir() -> anyhow::Result<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("running git (is git installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("not in a git repository: {}", err.trim());
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if path.as_os_str().is_empty() {
+        bail!("git did not report a hooks directory");
+    }
+    Ok(if path.is_absolute() { path } else { std::env::current_dir()?.join(path) })
+}
+
+fn make_executable(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Write a hook atomically (write-then-rename), without leaving a backup in
+/// the hooks directory. Our merge only touches memdusa's own line.
+fn write_hook(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("memdusa-tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_json(path: &Path) -> anyhow::Result<Value> {
+    match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).with_context(|| format!("{} is not valid JSON; fix it first", path.display()))
+        }
+        Ok(_) => Ok(json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Write `text` to `path` (with a backup of the old file), or show it in a dry run.
+fn apply(path: &Path, old: &str, text: &str, what: &str, opts: &InstallOptions) -> anyhow::Result<()> {
     if opts.dry_run {
         println!("# {} (dry run)\n{text}", path.display());
-    } else if updated == current {
-        println!("hooks already up to date in {}", path.display());
+    } else if text == old {
+        println!("{what} already up to date in {}", path.display());
     } else {
-        write_with_backup(&path, &text)?;
-        let verb = if opts.uninstall { "removed memdusa hooks from" } else { "installed memdusa hooks into" };
-        println!("{verb} {}", path.display());
+        write_with_backup(path, text)?;
+        let verb = if opts.uninstall { "removed" } else { "installed" };
+        println!("{verb} memdusa {what} in {}", path.display());
+    }
+    Ok(())
+}
+
+fn json_text(v: &Value) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(v)? + "\n")
+}
+
+pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
+    let h = opts.harness;
+    if opts.scope == Scope::Local && !matches!(h, Harness::ClaudeCode | Harness::Git) {
+        bail!("--scope local is only for Claude Code; use --scope project");
+    }
+    let bin = match &opts.bin {
+        Some(b) => b.clone(),
+        None => std::env::current_exe()?.canonicalize()?.display().to_string(),
+    };
+    match h {
+        Harness::OpenCode | Harness::Pi => return install_plugin(&opts, &bin),
+        Harness::Hermes => return install_hermes(&opts, &bin),
+        Harness::Git => return install_git_hooks(&opts, &bin),
+        _ => {}
+    }
+
+    // hooks
+    let path = match &opts.settings {
+        Some(p) => p.clone(),
+        None => hooks_path(h, opts.scope)?,
+    };
+    let current = read_json(&path)?;
+    let old = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
+    let mut updated = merge_hooks(current, h, &bin, opts.uninstall)?;
+    let mcp_same_file = opts.mcp && h == Harness::Gemini && opts.settings.is_none();
+    if mcp_same_file {
+        updated = merge_mcp_json(updated, h, &bin, opts.uninstall)?;
+    }
+    apply(&path, &old, &json_text(&updated)?, if mcp_same_file { "hooks and MCP server" } else { "hooks" }, &opts)?;
+
+    // MCP server
+    if opts.mcp && !mcp_same_file {
+        match h {
+            Harness::ClaudeCode => mcp_register_claude(&bin, opts.scope, opts.dry_run, opts.uninstall)?,
+            Harness::Codex => {
+                let p = if opts.scope == Scope::User {
+                    home_dir()?.join(".codex/config.toml")
+                } else {
+                    ".codex/config.toml".into()
+                };
+                let old = std::fs::read_to_string(&p).unwrap_or_default();
+                apply(&p, &old, &merge_codex_toml(&old, &bin, opts.uninstall), "MCP server", &opts)?;
+            }
+            _ => {
+                if let Some(p) = mcp_json_path(h, opts.scope)? {
+                    let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
+                    let merged = merge_mcp_json(read_json(&p)?, h, &bin, opts.uninstall)?;
+                    apply(&p, &old, &json_text(&merged)?, "MCP server", &opts)?;
+                }
+            }
+        }
+    }
+
+    if !opts.uninstall && !opts.dry_run {
+        for note in notes(h)? {
+            println!("\nnote: {note}");
+        }
+        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
+}
+
+/// Things the user must know or do after installing.
+fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
+    let mut n = vec![];
+    match h {
+        Harness::Codex => n.push(
+            "Codex runs new or changed hooks only after you trust them: open Codex and approve them in /hooks \
+             (automation: --dangerously-bypass-hook-trust)."
+                .into(),
+        ),
+        Harness::Cursor => {
+            // Cursor also runs Claude Code hooks ("Third-Party Imports"), so they could fire twice.
+            let claude = [
+                home_dir()?.join(".claude/settings.json"),
+                ".claude/settings.json".into(),
+                ".claude/settings.local.json".into(),
+            ];
+            if claude.iter().any(|p| std::fs::read_to_string(p).is_ok_and(|s| s.contains(" hook session-start"))) {
+                n.push(
+                    "memdusa's Claude Code hooks are installed too, and Cursor runs Claude Code hooks by default \
+                     (Settings > Third-Party Imports). Turn that off, or uninstall one set, so events aren't recorded twice."
+                        .into(),
+                );
+            }
+        }
+        Harness::Antigravity => n.push(
+            "Antigravity has no session-end or compaction hooks, so memdusa can't write fallback checkpoints there; \
+             the stop hook asks the agent to checkpoint instead."
+                .into(),
+        ),
+        Harness::Gemini => n.push(
+            "Gemini CLI was replaced by Antigravity CLI for consumer accounts in June 2026; if you're on Antigravity, \
+             run `memdusa install antigravity`."
+                .into(),
+        ),
+        Harness::Pi => n.push(
+            "pi loads project extensions (.pi/) only after you trust the project; user scope works everywhere.".into(),
+        ),
+        Harness::OpenCode => n.push("Restart OpenCode to load the plugin.".into()),
+        Harness::Hermes => n.push(
+            "Hermes asks once to approve each new hook. Headless runs never ask: approve them first in an \
+             interactive session, or run with --accept-hooks."
+                .into(),
+        ),
+        Harness::Git | Harness::ClaudeCode => {}
+    }
+    Ok(n)
+}
+
+const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.ts");
+const PI_EXTENSION: &str = include_str!("../assets/pi-extension.ts");
+
+/// The plugin source with the memdusa binary baked in.
+pub fn plugin_source(h: Harness, bin: &str) -> String {
+    let template = if h == Harness::OpenCode { OPENCODE_PLUGIN } else { PI_EXTENSION };
+    template.replace("__MEMDUSA_BIN__", &serde_json::to_string(bin).expect("string serializes"))
+}
+
+/// OpenCode and pi: write the plugin/extension file and register the MCP server.
+fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    let h = opts.harness;
+    let user = opts.scope == Scope::User;
+    let path: PathBuf = match &opts.settings {
+        Some(p) => p.clone(),
+        None => match (h, user) {
+            (Harness::OpenCode, true) => home_dir()?.join(".config/opencode/plugins/memdusa/index.ts"),
+            (Harness::OpenCode, false) => ".opencode/plugins/memdusa/index.ts".into(),
+            (_, true) => home_dir()?.join(".pi/agent/extensions/memdusa.ts"),
+            (_, false) => ".pi/extensions/memdusa.ts".into(),
+        },
+    };
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    if opts.uninstall {
+        if opts.dry_run {
+            println!("# would remove {}", path.display());
+        } else if path.exists() {
+            std::fs::remove_file(&path)?;
+            if h == Harness::OpenCode
+                && let Some(dir) = path.parent()
+            {
+                let _ = std::fs::remove_dir(dir); // only if empty
+            }
+            println!("removed {}", path.display());
+        }
+    } else {
+        apply(&path, &old, &plugin_source(h, bin), if h == Harness::OpenCode { "plugin" } else { "extension" }, opts)?;
     }
 
     if opts.mcp {
-        mcp_register(&bin, opts.scope, opts.dry_run, opts.uninstall)?;
+        match h {
+            Harness::OpenCode => opencode_mcp(bin, user, opts.dry_run, opts.uninstall)?,
+            _ => {
+                if let Some(p) = mcp_json_path(h, opts.scope)? {
+                    let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
+                    let merged = merge_mcp_json(read_json(&p)?, h, bin, opts.uninstall)?;
+                    apply(&p, &old, &json_text(&merged)?, "MCP server", opts)?;
+                }
+            }
+        }
     }
     if !opts.uninstall && !opts.dry_run {
-        println!("\nDone. Start a new Claude Code session: it will load the resume brief automatically.");
+        for note in notes(h)? {
+            println!("\nnote: {note}");
+        }
+        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
+}
+
+fn opencode_mcp(bin: &str, user: bool, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+    if uninstall {
+        println!("OpenCode has no `mcp remove`: delete `memdusa` from `mcp.servers` in your opencode.json(c).");
+        return Ok(());
+    }
+    let mut args: Vec<String> = vec!["mcp".into(), "add".into()];
+    if user {
+        args.push("--global".into());
+    }
+    args.extend(["memdusa", "--", bin, "mcp", "--agent", "opencode"].map(String::from));
+    let shown = format!("opencode {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
+    if dry_run {
+        println!("# would run: {shown}");
+        return Ok(());
+    }
+    let listed = Command::new("opencode").args(["mcp", "list"]).output();
+    match listed {
+        Err(_) => println!("`opencode` CLI not found; register the MCP server with:\n  {shown}"),
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("memdusa") => {
+            println!("MCP server `memdusa` already registered with OpenCode")
+        }
+        Ok(_) => {
+            if !Command::new("opencode").args(&args).status()?.success() {
+                bail!("`{shown}` failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+const HERMES_BEGIN: &str =
+    "# >>> memdusa (managed by `memdusa install hermes`; remove with `memdusa uninstall hermes`)";
+const HERMES_END: &str = "# <<< memdusa";
+
+/// Add or remove memdusa's marked block in Hermes' config.yaml. Returns
+/// `Err(block)` when the file already has its own top-level `hooks:` or
+/// `mcp_servers:` (merging YAML by hand would lose the user's formatting).
+pub fn merge_hermes_yaml(text: &str, bin: &str, mcp: bool, uninstall: bool) -> Result<String, String> {
+    // drop our previous block
+    let mut kept: Vec<&str> = vec![];
+    let mut inside = false;
+    for line in text.lines() {
+        if line.trim_end() == HERMES_BEGIN {
+            inside = true;
+        } else if inside && line.trim_end() == HERMES_END {
+            inside = false;
+        } else if !inside {
+            kept.push(line);
+        }
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !uninstall {
+        let q = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
+        let mut block = vec![HERMES_BEGIN.to_owned(), "hooks:".to_owned()];
+        let mut current = "";
+        for nh in Harness::Hermes.events() {
+            if nh.native != current {
+                block.push(format!("  {}:", nh.native));
+                current = nh.native;
+            }
+            block.push(format!("    - command: {}", q(&hook_command(bin, Harness::Hermes, nh.event))));
+            if let Some(m) = nh.matcher {
+                block.push(format!("      matcher: {}", q(m)));
+            }
+            block.push(format!("      timeout: {}", nh.timeout_secs));
+        }
+        if mcp {
+            block.extend([
+                "mcp_servers:".to_owned(),
+                "  memdusa:".to_owned(),
+                format!("    command: {}", q(bin)),
+                "    args: [\"mcp\", \"--agent\", \"hermes\"]".to_owned(),
+            ]);
+        }
+        block.push(HERMES_END.to_owned());
+        let clash = |key: &str| kept.iter().any(|l| l.starts_with(&format!("{key}:")));
+        if clash("hooks") || (mcp && clash("mcp_servers")) {
+            return Err(block.join("\n"));
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block.join("\n"));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    if opts.scope != Scope::User {
+        bail!("Hermes only has a user config (~/.hermes/config.yaml); use --scope user");
+    }
+    let path = match &opts.settings {
+        Some(p) => p.clone(),
+        None => std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .map_or_else(|| Ok(home_dir()?.join(".hermes")), Ok::<_, anyhow::Error>)?
+            .join("config.yaml"),
+    };
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    match merge_hermes_yaml(&old, bin, opts.mcp, opts.uninstall) {
+        Ok(text) => apply(&path, &old, &text, "hooks", opts)?,
+        Err(block) => {
+            println!(
+                "{} already has its own `hooks:` or `mcp_servers:` section; merge this into it by hand:\n\n{block}\n",
+                path.display()
+            );
+            return Ok(());
+        }
+    }
+    if !opts.uninstall && !opts.dry_run {
+        for note in notes(Harness::Hermes)? {
+            println!("\nnote: {note}");
+        }
+        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+    }
+    Ok(())
+}
+
+/// `memdusa install git` / `uninstall git`: merge our line into the repo's
+/// `post-commit`, `post-checkout` and `post-merge` hooks.
+fn install_git_hooks(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
+    let dir = git_hooks_dir()?;
+    for hook in GitHookKind::ALL {
+        let path = dir.join(hook.name());
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = git_hook_line(bin, hook.name());
+        match merge_git_hook(&old, &line, opts.uninstall) {
+            None => {
+                if opts.dry_run {
+                    println!("# would remove {}", path.display());
+                } else if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    println!("removed memdusa git hook {}", path.display());
+                }
+            }
+            Some(text) if text == old => {
+                if !opts.dry_run {
+                    make_executable(&path)?;
+                }
+                println!("memdusa {} already up to date in {}", hook.name(), path.display());
+            }
+            Some(text) => {
+                if opts.dry_run {
+                    println!("# {} (dry run)\n{text}", path.display());
+                } else {
+                    write_hook(&path, &text)?;
+                    make_executable(&path)?;
+                    println!("installed memdusa {} hook in {}", hook.name(), path.display());
+                }
+            }
+        }
+    }
+    if !opts.uninstall && !opts.dry_run {
+        println!("\nDone. Commits, branch switches and merges in this repo will be recorded.");
     }
     Ok(())
 }
@@ -158,23 +749,29 @@ fn write_with_backup(path: &Path, text: &str) -> anyhow::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
     if path.exists() {
-        let backup = path.with_extension("json.memdusa-backup");
+        let backup = path.with_extension(format!("{ext}.memdusa-backup"));
         std::fs::copy(path, &backup)?;
         println!("backup: {}", backup.display());
     }
-    // write-then-rename so a crash never leaves a half-written settings file
-    let tmp = path.with_extension("json.memdusa-tmp");
+    // write-then-rename so a crash never leaves a half-written config file
+    let tmp = path.with_extension(format!("{ext}.memdusa-tmp"));
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn mcp_register(bin: &str, scope: Scope, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+fn mcp_register_claude(bin: &str, scope: Scope, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
+    let scope = match scope {
+        Scope::User => "user",
+        Scope::Project => "project",
+        Scope::Local => "local",
+    };
     let args: Vec<String> = if uninstall {
-        ["mcp", "remove", "memdusa", "--scope", scope.mcp_scope()].map(String::from).to_vec()
+        ["mcp", "remove", "memdusa", "--scope", scope].map(String::from).to_vec()
     } else {
-        ["mcp", "add", "memdusa", "--scope", scope.mcp_scope(), "--", bin, "mcp", "--agent", "claude-code"]
+        ["mcp", "add", "memdusa", "--scope", scope, "--", bin, "mcp", "--agent", "claude-code"]
             .map(String::from)
             .to_vec()
     };
@@ -212,8 +809,10 @@ fn mcp_register(bin: &str, scope: Scope, dry_run: bool, uninstall: bool) -> anyh
 mod tests {
     use super::*;
 
+    const BIN: &str = "/usr/local/bin/memdusa";
+
     #[test]
-    fn merge_is_idempotent_and_preserves_other_settings() {
+    fn claude_merge_is_idempotent_and_preserves_other_settings() {
         let existing = json!({
             "model": "opus",
             "hooks": {
@@ -221,8 +820,8 @@ mod tests {
                 "SessionStart": [{"hooks": [{"type": "command", "command": "/old/path/memdusa hook session-start"}]}]
             }
         });
-        let once = merge_hooks(existing, "/usr/local/bin/memdusa", false).unwrap();
-        let twice = merge_hooks(once.clone(), "/usr/local/bin/memdusa", false).unwrap();
+        let once = merge_hooks(existing, Harness::ClaudeCode, BIN, false).unwrap();
+        let twice = merge_hooks(once.clone(), Harness::ClaudeCode, BIN, false).unwrap();
         assert_eq!(once, twice, "re-installing must not duplicate hooks");
 
         assert_eq!(once["model"], "opus");
@@ -235,7 +834,7 @@ mod tests {
         assert_eq!(once["hooks"]["PostToolUse"][0]["matcher"], crate::hooks::JOURNALED_TOOLS);
         assert_eq!(once["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10);
 
-        let removed = merge_hooks(once, "/usr/local/bin/memdusa", true).unwrap();
+        let removed = merge_hooks(once, Harness::ClaudeCode, BIN, true).unwrap();
         assert_eq!(
             removed,
             json!({"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}})
@@ -244,10 +843,184 @@ mod tests {
 
     #[test]
     fn quotes_paths_with_spaces() {
-        let s = merge_hooks(json!({}), "/Users/me/my tools/memdusa", false).unwrap();
+        let s = merge_hooks(json!({}), Harness::ClaudeCode, "/Users/me/my tools/memdusa", false).unwrap();
         let cmd = s["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, "'/Users/me/my tools/memdusa' hook stop");
-        // ...and quoted commands are still recognized as ours
-        assert!(merge_hooks(s, "/x/memdusa", true).unwrap().get("hooks").is_none());
+        assert!(merge_hooks(s, Harness::ClaudeCode, "/x/memdusa", true).unwrap().get("hooks").is_none());
+    }
+
+    #[test]
+    fn harness_specific_shapes() {
+        // Codex: Claude-like groups, its own matcher and the 3s SessionEnd cap
+        let codex = merge_hooks(json!({}), Harness::Codex, BIN, false).unwrap();
+        assert_eq!(codex["hooks"]["PostToolUse"][0]["matcher"], "Bash|apply_patch");
+        assert_eq!(codex["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        assert_eq!(codex["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{BIN} hook stop --harness codex"));
+
+        // Gemini: native event names, millisecond timeouts
+        let gem = merge_hooks(json!({"theme": "dark"}), Harness::Gemini, BIN, false).unwrap();
+        assert_eq!(
+            gem["hooks"]["BeforeAgent"][0]["hooks"][0]["command"],
+            format!("{BIN} hook user-prompt-submit --harness gemini")
+        );
+        assert_eq!(gem["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 10_000);
+        assert_eq!(gem["theme"], "dark");
+
+        // Cursor: version 1, handlers directly in the event list, two native events for tool use
+        let mine = json!({"command": "./audit.sh"});
+        let cur =
+            merge_hooks(json!({"hooks": {"afterFileEdit": [mine.clone()]}}), Harness::Cursor, BIN, false).unwrap();
+        assert_eq!(cur["version"], 1);
+        assert_eq!(cur["hooks"]["afterFileEdit"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            cur["hooks"]["afterShellExecution"][0]["command"],
+            format!("{BIN} hook post-tool-use --harness cursor")
+        );
+        let back = merge_hooks(cur, Harness::Cursor, BIN, true).unwrap();
+        assert_eq!(back, json!({"version": 1, "hooks": {"afterFileEdit": [mine]}}));
+
+        // Antigravity: one named group we own
+        let agy = merge_hooks(json!({"other": {"enabled": true}}), Harness::Antigravity, BIN, false).unwrap();
+        assert_eq!(agy["memdusa"]["enabled"], true);
+        assert_eq!(
+            agy["memdusa"]["SessionStart"][0]["command"],
+            format!("{BIN} hook session-start --harness antigravity")
+        );
+        assert!(agy["memdusa"]["PostToolUse"][0]["matcher"].as_str().unwrap().contains("run_command"));
+        assert_eq!(merge_hooks(agy, Harness::Antigravity, BIN, true).unwrap(), json!({"other": {"enabled": true}}));
+    }
+
+    #[test]
+    fn mcp_configs() {
+        let cur = merge_mcp_json(json!({"mcpServers": {"x": {}}}), Harness::Cursor, BIN, false).unwrap();
+        assert_eq!(
+            cur["mcpServers"]["memdusa"],
+            json!({"type": "stdio", "command": BIN, "args": ["mcp", "--agent", "cursor"]})
+        );
+        assert_eq!(merge_mcp_json(cur, Harness::Cursor, BIN, true).unwrap(), json!({"mcpServers": {"x": {}}}));
+
+        let toml = "model = \"o5\"\n\n[mcp_servers.other]\ncommand = \"x\"\n";
+        let added = merge_codex_toml(toml, "/opt/my \"bin\"/memdusa", false);
+        assert!(added.ends_with("[mcp_servers.memdusa]\ncommand = \"/opt/my \\\"bin\\\"/memdusa\"\nargs = [\"mcp\", \"--agent\", \"codex\"]\n"), "{added}");
+        assert_eq!(merge_codex_toml(&added, "/opt/my \"bin\"/memdusa", false), added, "idempotent");
+        assert_eq!(merge_codex_toml(&added, BIN, true), toml, "uninstall restores the original");
+        let between =
+            "[mcp_servers.memdusa]\ncommand = \"old\"\n[mcp_servers.memdusa.env]\nA = \"1\"\n[profile]\nx = 1\n";
+        assert_eq!(
+            merge_codex_toml(between, BIN, true),
+            "[profile]\nx = 1\n",
+            "removes nested tables, keeps later ones"
+        );
+    }
+
+    #[test]
+    fn plugins_and_hermes() {
+        let src = plugin_source(Harness::OpenCode, "/opt/my \"tools\"/memdusa");
+        assert!(src.contains(r#"const BIN: string = "/opt/my \"tools\"/memdusa""#), "bin is a JSON string literal");
+        assert!(!src.contains("__MEMDUSA_BIN__"));
+        assert!(plugin_source(Harness::Pi, BIN).contains("agent_before_settle"));
+        let pi = merge_mcp_json(json!({}), Harness::Pi, BIN, false).unwrap();
+        assert_eq!(pi["mcpServers"]["memdusa"]["exposure"], "direct");
+
+        let base = "model: hermes-4\nterminal:\n  backend: local\n";
+        let added = merge_hermes_yaml(base, BIN, true, false).unwrap();
+        assert!(added.starts_with(base), "user's config kept as-is");
+        assert!(added.contains(
+            "  pre_llm_call:\n    - command: \"/usr/local/bin/memdusa hook session-start --harness hermes\""
+        ));
+        assert!(added.contains("      matcher: \"write_file|patch|terminal\""));
+        assert!(added.contains("mcp_servers:\n  memdusa:\n    command: \"/usr/local/bin/memdusa\""));
+        assert_eq!(added.matches("pre_llm_call:").count(), 1, "both pre_llm_call hooks under one key");
+        assert_eq!(merge_hermes_yaml(&added, BIN, true, false).unwrap(), added, "idempotent");
+        assert_eq!(merge_hermes_yaml(&added, BIN, true, true).unwrap(), base, "uninstall restores the original");
+        assert!(
+            merge_hermes_yaml("hooks:\n  on_session_start: []\n", BIN, true, false).is_err(),
+            "won't clobber existing hooks"
+        );
+    }
+
+    #[test]
+    fn git_hook_creates_appends_and_is_idempotent() {
+        let line = git_hook_line(BIN, "post-commit");
+
+        // new file: shebang plus our line
+        let fresh = merge_git_hook("", &line, false).unwrap();
+        assert_eq!(fresh, format!("#!/bin/sh\n{line}\n"));
+
+        // existing user hook: their lines are untouched, ours is appended
+        let user = "#!/bin/sh\nnpm test\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(added, format!("{user}{line}\n"));
+        assert!(added.starts_with(user), "user lines unchanged");
+
+        // re-installing does not duplicate
+        assert_eq!(merge_git_hook(&added, &line, false).unwrap(), added);
+    }
+
+    #[test]
+    fn git_hook_replaces_an_old_bin_path() {
+        let old = "/old/bin/memdusa git-hook post-commit \"$@\" >/dev/null 2>&1 || true  # memdusa";
+        let existing = format!("#!/bin/sh\necho user hook\n{old}\n");
+        let line = git_hook_line(BIN, "post-commit");
+        let merged = merge_git_hook(&existing, &line, false).unwrap();
+        assert_eq!(merged, format!("#!/bin/sh\necho user hook\n{line}\n"));
+        assert!(!merged.contains("/old/bin/memdusa"));
+        assert_eq!(merged.matches("# memdusa").count(), 1);
+    }
+
+    #[test]
+    fn git_hook_goes_before_a_trailing_exit() {
+        let line = git_hook_line(BIN, "post-commit");
+
+        let user = "#!/bin/sh\nnpm test\nexit 0\n";
+        let merged = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merged, format!("#!/bin/sh\nnpm test\n{line}\nexit 0\n"));
+        assert!(merged.find(&line).unwrap() < merged.find("exit 0").unwrap());
+
+        // trailing blank lines stay after the exit statement
+        let user_blank = "#!/bin/sh\nexit $?\n\n";
+        let merged_blank = merge_git_hook(user_blank, &line, false).unwrap();
+        assert_eq!(merged_blank, format!("#!/bin/sh\n{line}\nexit $?\n\n"));
+    }
+
+    #[test]
+    fn git_hook_appends_when_exit_is_not_the_last_statement() {
+        let line = git_hook_line(BIN, "post-commit");
+        let user = "#!/bin/sh\nif [ -n \"$CI\" ]; then\n  exit 0\nfi\necho done\n";
+        let merged = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merged, format!("{user}{line}\n"), "the if-block's exit is not trailing");
+        assert!(merged.ends_with(&format!("echo done\n{line}\n")));
+    }
+
+    #[test]
+    fn git_hook_uninstall_restores_an_exit_hook_exactly() {
+        let line = git_hook_line(BIN, "post-merge");
+        let user = "#!/bin/sh\nmake check\nexit $?\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merge_git_hook(&added, &line, true).unwrap(), user);
+    }
+
+    #[test]
+    fn git_hook_uninstall_restores_or_deletes() {
+        let line = git_hook_line(BIN, "post-merge");
+        let user = "#!/bin/sh\nmake check\n";
+        let added = merge_git_hook(user, &line, false).unwrap();
+        assert_eq!(merge_git_hook(&added, &line, true).unwrap(), user, "user's file restored");
+
+        // a file that only existed for us is deleted
+        let ours = merge_git_hook("", &line, false).unwrap();
+        assert_eq!(merge_git_hook(&ours, &line, true), None);
+        assert_eq!(merge_git_hook("#!/bin/sh\n", &line, true), None);
+    }
+
+    #[test]
+    fn git_hook_quotes_bin_paths_and_names_the_event() {
+        let line = git_hook_line("/Users/me/my tools/memdusa", "post-checkout");
+        assert_eq!(
+            line,
+            "'/Users/me/my tools/memdusa' git-hook post-checkout \"$@\" >/dev/null 2>&1 || true  # memdusa"
+        );
+        assert_eq!(GitHookKind::Checkout.event(), "checkout");
+        assert_eq!(GitHookKind::Merge.name(), "post-merge");
     }
 }

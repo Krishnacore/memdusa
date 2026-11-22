@@ -5,9 +5,14 @@
 use memdusa_core::model::*;
 use memdusa_core::{Store, brief};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    Role, ServerCapabilities, ServerConfig,
+};
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -417,11 +422,304 @@ impl MemdusaMcp {
     }
 }
 
+const BRIEF_URI: &str = "memdusa://brief";
+const BRIEF_TEMPLATE: &str = "memdusa://brief/{project}";
+const BRIEF_PREFIX: &str = "memdusa://brief/";
+const MEMORIES_URI: &str = "memdusa://memories";
+const MARKDOWN: &str = "text/markdown";
+
+const RESUME_INSTRUCTION: &str =
+    "Continue from this brief: verify the code state first, then carry on with the next steps.";
+const CHECKPOINT_PROMPT: &str = "\
+Save a memdusa checkpoint now with the `checkpoint` tool: the overall goal, what is done, the concrete next steps, \
+any blockers, and the key files a successor should look at first. \
+Then call `memory_save` for every decision worth keeping (with the why), and for durable user preferences or project facts.";
+
+/// Decode `%XX` escapes in a URI path segment.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+impl MemdusaMcp {
+    /// The same brief the `resume` tool returns.
+    async fn brief_markdown(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        project: Option<String>,
+    ) -> Result<String, McpError> {
+        let project = self.project(ctx, project).map_err(|e| McpError::invalid_params(e, None))?;
+        let git = self.local_git(&project);
+        Ok(brief::build(&self.store, &project, identity(ctx).user.as_deref(), git.as_ref())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .markdown)
+    }
+
+    async fn memories_markdown(&self, ctx: &RequestContext<RoleServer>) -> Result<String, McpError> {
+        let project = self.project(ctx, None).map_err(|e| McpError::invalid_params(e, None))?;
+        let memories = self
+            .store
+            .memory_search(MemoryQuery {
+                project: Some(project.clone()),
+                limit: Some(200),
+                user: identity(ctx).user,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(brief::memories_markdown(&project, &memories))
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemdusaMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().enable_prompts().build())
             .with_server_info(Implementation::new("memdusa", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(BRIEF_URI, "brief")
+                .with_title("Resume brief")
+                .with_description(
+                    "Hand-off brief for the current project: checkpoints, runs, memories, recent activity",
+                )
+                .with_mime_type(MARKDOWN),
+            Resource::new(MEMORIES_URI, "memories")
+                .with_title("Project memories")
+                .with_description("Saved memories for the current project plus global ones, grouped by kind")
+                .with_mime_type(MARKDOWN),
+        ]))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new(BRIEF_TEMPLATE, "project-brief")
+                .with_title("Resume brief for a project")
+                .with_description(
+                    "Hand-off brief for an explicit project key (URL-encoded, e.g. github.com%2Facme%2Fshop)",
+                )
+                .with_mime_type(MARKDOWN),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let uri = request.uri;
+        let text = if uri == BRIEF_URI {
+            self.brief_markdown(&ctx, None).await?
+        } else if uri == MEMORIES_URI {
+            self.memories_markdown(&ctx).await?
+        } else if let Some(project) = uri.strip_prefix(BRIEF_PREFIX).and_then(percent_decode).filter(|p| !p.is_empty())
+        {
+            self.brief_markdown(&ctx, Some(project)).await?
+        } else {
+            return Err(McpError::resource_not_found(
+                format!("unknown resource: {uri}"),
+                Some(serde_json::json!({ "uri": uri })),
+            ));
+        };
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(text, uri).with_mime_type(MARKDOWN)]).into())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(vec![
+            Prompt::new(
+                "resume",
+                Some("Load the memdusa hand-off brief and continue the work from it"),
+                Some(vec![
+                    PromptArgument::new("project")
+                        .with_description("Project key (defaults to the current project)")
+                        .with_required(false),
+                ]),
+            ),
+            Prompt::new::<_, &str>(
+                "checkpoint",
+                Some("Save a memdusa checkpoint (goal, done, next, blockers, key files) and durable memories"),
+                None,
+            ),
+        ]))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let text = match request.name.as_str() {
+            "resume" => {
+                let project = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("project"))
+                    .and_then(|p| p.as_str())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(String::from);
+                let brief = self.brief_markdown(&ctx, project).await?;
+                format!("{brief}\n\n{RESUME_INSTRUCTION}")
+            }
+            "checkpoint" => CHECKPOINT_PROMPT.to_string(),
+            other => return Err(McpError::invalid_params(format!("unknown prompt: {other}"), None)),
+        };
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)]).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::ServiceExt;
+    use rmcp::model::{CallToolRequestParams, ContentBlock, ErrorCode};
+    use rmcp::service::ServiceError;
+
+    async fn client() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+        let dir = std::env::temp_dir().join(format!("memdusa-mcp-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
+        let server = MemdusaMcp::new(
+            store,
+            Defaults { project: Some("github.com/acme/app".into()), agent: "test".into(), cwd: None },
+        );
+        let (a, b) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            let s = server.serve(a).await.unwrap();
+            let _ = s.waiting().await;
+        });
+        ().serve(b).await.unwrap()
+    }
+
+    async fn save_checkpoint(
+        c: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        project: Option<&str>,
+        goal: &str,
+    ) {
+        let mut args = serde_json::json!({ "goal": goal });
+        if let Some(p) = project {
+            args["project"] = p.into();
+        }
+        let r = c
+            .call_tool(CallToolRequestParams::new("checkpoint").with_arguments(args.as_object().unwrap().clone()))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true));
+    }
+
+    async fn read_text(c: &rmcp::service::RunningService<rmcp::RoleClient, ()>, uri: &str) -> String {
+        let r = c.read_resource(ReadResourceRequestParams::new(uri)).await.unwrap();
+        match &r.contents[0] {
+            ResourceContents::TextResourceContents { text, mime_type, .. } => {
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+                text.clone()
+            }
+            _ => panic!("expected text contents"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_resources_and_templates() {
+        let c = client().await;
+        let uris: Vec<_> = c.list_all_resources().await.unwrap().into_iter().map(|r| r.uri).collect();
+        assert!(uris.contains(&"memdusa://brief".to_string()));
+        assert!(uris.contains(&"memdusa://memories".to_string()));
+        let templates: Vec<_> =
+            c.list_all_resource_templates().await.unwrap().into_iter().map(|t| t.uri_template).collect();
+        assert!(templates.contains(&"memdusa://brief/{project}".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reads_brief_and_project_template() {
+        let c = client().await;
+        save_checkpoint(&c, None, "ship the resources feature").await;
+        save_checkpoint(&c, Some("github.com/acme/shop"), "rebuild the checkout").await;
+
+        let brief = read_text(&c, "memdusa://brief").await;
+        assert!(brief.contains("ship the resources feature"), "{brief}");
+        assert!(!brief.contains("rebuild the checkout"));
+
+        let other = read_text(&c, "memdusa://brief/github.com%2Facme%2Fshop").await;
+        assert!(other.contains("rebuild the checkout"), "{other}");
+        assert!(!other.contains("ship the resources feature"));
+    }
+
+    #[tokio::test]
+    async fn reads_memories() {
+        let c = client().await;
+        let args = serde_json::json!({ "content": "prefer tabs over spaces", "kind": "preference" });
+        c.call_tool(CallToolRequestParams::new("memory_save").with_arguments(args.as_object().unwrap().clone()))
+            .await
+            .unwrap();
+        let text = read_text(&c, "memdusa://memories").await;
+        assert!(text.contains("prefer tabs over spaces"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unknown_resource_is_not_found() {
+        let c = client().await;
+        for uri in ["memdusa://nope", "memdusa://brief/", "memdusa://brief/%zz"] {
+            match c.read_resource(ReadResourceRequestParams::new(uri)).await {
+                Err(ServiceError::McpError(e)) => assert_eq!(e.code, ErrorCode::RESOURCE_NOT_FOUND, "{uri}"),
+                other => panic!("expected resource-not-found for {uri}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prompts_resume_and_checkpoint() {
+        let c = client().await;
+        let names: Vec<_> = c.list_all_prompts().await.unwrap().into_iter().map(|p| p.name).collect();
+        assert!(names.contains(&"resume".to_string()) && names.contains(&"checkpoint".to_string()));
+
+        save_checkpoint(&c, None, "finish the prompt tests").await;
+        let r = c.get_prompt(GetPromptRequestParams::new("resume")).await.unwrap();
+        assert_eq!(r.messages.len(), 1);
+        assert_eq!(r.messages[0].role, Role::User);
+        let ContentBlock::Text(t) = &r.messages[0].content else { panic!("expected text") };
+        assert!(t.text.contains("finish the prompt tests"));
+        assert!(t.text.contains("Continue from this brief"));
+
+        let args = serde_json::json!({ "project": "github.com/acme/other" });
+        let r = c
+            .get_prompt(GetPromptRequestParams::new("resume").with_arguments(args.as_object().unwrap().clone()))
+            .await
+            .unwrap();
+        let ContentBlock::Text(t) = &r.messages[0].content else { panic!("expected text") };
+        assert!(t.text.contains("github.com/acme/other") && !t.text.contains("finish the prompt tests"));
+
+        let r = c.get_prompt(GetPromptRequestParams::new("checkpoint")).await.unwrap();
+        let ContentBlock::Text(t) = &r.messages[0].content else { panic!("expected text") };
+        assert!(t.text.contains("memory_save"));
+
+        assert!(c.get_prompt(GetPromptRequestParams::new("nope")).await.is_err());
     }
 }

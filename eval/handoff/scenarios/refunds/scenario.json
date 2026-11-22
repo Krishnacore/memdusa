@@ -1,0 +1,13 @@
+{
+  "name": "refunds",
+  "description": "Add partial refunds across four files. The user states constraints in conversation that leave no trace in the code until implemented.",
+  "task_prompt": "Please add partial refund support to this shop, in four parts:\n\n1. Create `shop/refunds.py` with `refund(order_id, amount_cents, reason)` that returns the recorded ledger entry. Partial refunds are allowed, but the total refunded for an order must never exceed the order total.\n2. Record every refund in the ledger as kind \"refund\", and add `refunded_cents(order_id)` and `refundable_cents(order_id)` helpers in `shop/refunds.py`.\n3. Add a CLI command: `python3 -m shop.cli refund <order_id> <amount_cents> --reason <text>` that performs the refund and prints the remaining refundable amount in cents.\n4. Add tests in `tests/test_refunds.py` covering all of the above.\n\nSome things I care about (please keep them in mind for the whole task):\n- Money is always integer cents. Never use floats anywhere in refund code.\n- Every refund needs a non-empty reason; store the reason lowercased in the ledger entry's note.\n- Invalid refunds must raise `RefundError`, defined in `shop/refunds.py` as a subclass of `ValueError`. That includes amounts <= 0, unknown orders, and refunds over the remaining refundable amount.\n- Don't add any third-party dependencies.\n\nRun the tests with `python3 -m pytest -q` as you go.",
+  "resume_prompt": "Continue the work in this repository where the previous session left off, and finish the task.",
+  "checks": {
+    "hidden_tests": "hidden_test.py",
+    "forbidden_patterns": [
+      {"path": "shop/refunds.py", "regex": "\\bfloat\\b|\\d\\.\\d", "why": "money must be integer cents"}
+    ],
+    "unchanged_files": ["pyproject.toml"]
+  }
+}

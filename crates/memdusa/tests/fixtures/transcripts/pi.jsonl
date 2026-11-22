@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"sess-pi-1","timestamp":"2026-03-03T08:00:00.000Z","cwd":"/work/demo"}
+{"type":"model_change","id":"e1","timestamp":"2026-03-03T08:00:00.500Z","provider":"x","modelId":"y"}
+{"type":"message","id":"e2","timestamp":"2026-03-03T08:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"Rename the helper"}]}}
+{"type":"message","id":"e3","timestamp":"2026-03-03T08:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"On it."},{"type":"toolCall","id":"c1","name":"write","arguments":{"path":"src/helper.rs","content":"fn h() {}"}}]}}
+{"type":"message","id":"e4","timestamp":"2026-03-03T08:00:02.500Z","message":{"role":"toolResult","toolCallId":"c1","content":[{"type":"text","text":"written"}]}}
+{"type":"message","id":"e5","timestamp":"2026-03-03T08:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"ls -la"}},{"type":"toolCall","id":"c3","name":"read","arguments":{"path":"src/main.rs"}}]}}
+{"type":"message","id":"e6","message":
+{"type":"message","id":"e7","timestamp":"2026-03-03T08:00:04.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c4","name":"edit","arguments":{"path":"src/main.rs","oldText":"a","newText":"b"}}]}}

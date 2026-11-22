@@ -1,3 +1,4 @@
+mod adapters;
 mod config;
 mod hooks;
 mod http;
@@ -8,8 +9,10 @@ mod project;
 mod proxy;
 mod remote;
 mod spool;
+mod transcripts;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -140,8 +143,12 @@ enum Cmd {
     /// Handle a Claude Code hook event (JSON on stdin). Installed by `memdusa install`.
     Hook {
         event: hooks::HookEvent,
-        #[arg(long, env = "MEMDUSA_AGENT", default_value = "claude-code")]
-        agent: String,
+        /// Which harness is calling (decides the payload and output format).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        harness: adapters::Harness,
+        /// Agent name for attribution. Default: the harness name.
+        #[arg(long, env = "MEMDUSA_AGENT")]
+        agent: Option<String>,
         /// Don't journal user prompts.
         #[arg(long, env = "MEMDUSA_NO_PROMPTS")]
         no_prompts: bool,
@@ -149,10 +156,34 @@ enum Cmd {
         #[arg(long, env = "MEMDUSA_STOP_GUARD_MINS", default_value_t = 15)]
         stop_guard_mins: i64,
     },
-    /// Wire memdusa into a harness (currently: claude-code). Registers the MCP server and installs hooks.
+    /// Record a git hook event. Installed by `memdusa install git`.
+    GitHook {
+        #[arg(value_enum)]
+        hook: install::GitHookKind,
+        /// Arguments git passes to the hook (checkout: prev, new, flag; merge: squash).
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Import saved agent sessions (work done before memdusa was installed, or without hooks).
+    ImportTranscript {
+        #[arg(value_enum)]
+        harness: transcripts::TranscriptHarness,
+        /// Transcript files.
+        files: Vec<PathBuf>,
+        /// The most recent session for the current directory's repo.
+        #[arg(long)]
+        latest: bool,
+        /// Import sessions that were already imported (or recorded by hooks).
+        #[arg(long)]
+        force: bool,
+        /// Print what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Wire memdusa into a harness: installs its hooks and registers the MCP server.
     Install {
-        #[arg(value_parser = ["claude-code"])]
-        harness: String,
+        #[arg(value_enum)]
+        harness: adapters::Harness,
         #[arg(long, value_enum, default_value = "user")]
         scope: install::Scope,
         /// Settings file to edit instead of the scope's default.
@@ -170,8 +201,8 @@ enum Cmd {
     },
     /// Remove memdusa's hooks (and MCP registration) from a harness.
     Uninstall {
-        #[arg(value_parser = ["claude-code"])]
-        harness: String,
+        #[arg(value_enum)]
+        harness: adapters::Harness,
         #[arg(long, value_enum, default_value = "user")]
         scope: install::Scope,
         #[arg(long)]
@@ -302,8 +333,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.cmd {
-        Cmd::Install { scope, settings, bin, no_mcp, dry_run, .. } => {
+        Cmd::Install { harness, scope, settings, bin, no_mcp, dry_run } => {
             return install::run(install::InstallOptions {
+                harness,
                 scope,
                 settings,
                 bin,
@@ -312,8 +344,9 @@ async fn main() -> anyhow::Result<()> {
                 uninstall: false,
             });
         }
-        Cmd::Uninstall { scope, settings, no_mcp, .. } => {
+        Cmd::Uninstall { harness, scope, settings, no_mcp } => {
             return install::run(install::InstallOptions {
+                harness,
                 scope,
                 settings,
                 bin: Some("memdusa".into()),
@@ -322,18 +355,33 @@ async fn main() -> anyhow::Result<()> {
                 uninstall: true,
             });
         }
-        Cmd::Hook { event, agent, no_prompts, stop_guard_mins } => {
+        Cmd::Hook { event, harness, agent, no_prompts, stop_guard_mins } => {
             // A hook must never break the user's session: log and exit 0.
+            let agent = agent.unwrap_or_else(|| harness.agent().into());
             let cfg = hooks::HookConfig { agent, journal_prompts: !no_prompts, stop_guard_mins };
-            // Finish well inside Claude Code's hook timeout instead of stalling the session.
-            let deadline = std::time::Duration::from_millis(event.timeout_secs() * 1000 - 500);
-            let result = tokio::time::timeout(deadline, run_hook(event, cfg, cli.project, cli.database_url, deadline))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
+            // Finish well inside the harness's hook timeout instead of stalling the session.
+            let budget = harness.events().iter().filter(|h| h.event == event).map(|h| h.timeout_secs).max();
+            let deadline = Duration::from_millis(budget.unwrap_or(event.timeout_secs()) * 1000 - 500);
+            let result =
+                tokio::time::timeout(deadline, run_hook(event, harness, cfg, cli.project, cli.database_url, deadline))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
             match result {
                 Ok(Some(out)) => println!("{out}"),
                 Ok(None) => {}
                 Err(e) => eprintln!("memdusa hook {}: {e:#}", event.arg()),
+            }
+            return Ok(());
+        }
+        Cmd::GitHook { hook, args } => {
+            // Git hooks must never fail a git operation or print to stdout.
+            let deadline = Duration::from_millis(2500);
+            let result =
+                tokio::time::timeout(deadline, run_git_hook(hook, &args, cli.project, cli.database_url, deadline))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {deadline:?}")));
+            if let Err(e) = result {
+                eprintln!("memdusa git-hook {}: {e:#}", hook.name());
             }
             return Ok(());
         }
@@ -374,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
         _ => Mode::detect(cli.database_url.clone())?,
     };
     let store = match &mode {
-        Mode::Remote(r) => return run_remote(cli.cmd, r, project).await,
+        Mode::Remote(r) => return run_remote(cli.cmd, r, project, cli.project).await,
         Mode::Local(url) => open_store(url).await.with_context(|| format!("connecting to {url}"))?,
     };
 
@@ -385,6 +433,10 @@ async fn main() -> anyhow::Result<()> {
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
+        Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
+            let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
+            transcripts::run(opts, transcripts::Backend::Local(&store)).await?;
+        }
         Cmd::Export { only_project, output } => {
             write_export(&transfer::to_jsonl(&store.export(only_project.as_deref()).await?), output)?
         }
@@ -462,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Project
         | Cmd::Hook { .. }
+        | Cmd::GitHook { .. }
         | Cmd::Install { .. }
         | Cmd::Uninstall { .. }
         | Cmd::Login { .. }
@@ -489,7 +542,12 @@ impl Mode {
     }
 }
 
-async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> anyhow::Result<()> {
+async fn run_remote(
+    cmd: Cmd,
+    r: &config::Remote,
+    project: Option<String>,
+    explicit_project: Option<String>,
+) -> anyhow::Result<()> {
     let client = || remote::Client::new(r.clone(), Duration::from_secs(15));
     match cmd {
         Cmd::Status => {
@@ -508,6 +566,11 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
             }
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
             println!("offline queue: {} event(s)", spool::Spool::open()?.len());
+        }
+        Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
+            let client = client()?;
+            let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: explicit_project };
+            transcripts::run(opts, transcripts::Backend::Remote(&client)).await?;
         }
         Cmd::Prune { dry_run, only_project, policy } => {
             print_prune(&client()?.prune(&policy.into(), only_project.as_deref(), dry_run).await?);
@@ -597,8 +660,121 @@ async fn run_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> an
     Ok(())
 }
 
+/// Collect facts about a git hook event and send them through the hook pipeline.
+/// The git hook wrapper always exits 0, so any error here only reaches stderr.
+async fn run_git_hook(
+    kind: install::GitHookKind,
+    args: &[String],
+    project: Option<String>,
+    database_url: Option<String>,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let Some(input) = git_hook_input(kind, args, &cwd)? else { return Ok(()) };
+    let agent =
+        std::env::var("MEMDUSA_AGENT").ok().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| "git".to_owned());
+    let config = hooks::HookConfig { agent, journal_prompts: true, stop_guard_mins: 0 };
+    run_hook_input(hooks::HookEvent::Git, adapters::Harness::Git, config, input, project, database_url, deadline)
+        .await?;
+    Ok(())
+}
+
+/// Facts for one git hook, or `None` when the hook should record nothing
+/// (a file checkout, or a branch switch that stayed on the same branch).
+fn git_hook_input(
+    kind: install::GitHookKind,
+    args: &[String],
+    dir: &Path,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let root = git(dir, &["rev-parse", "--show-toplevel"])?;
+    let head_sha = || git(dir, &["rev-parse", "HEAD"]);
+    let short_sha =
+        |sha: &str| git(dir, &["rev-parse", "--short", sha]).unwrap_or_else(|_| sha.chars().take(7).collect());
+    let branch = |short: &str| {
+        git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .filter(|b| !b.is_empty() && b != "HEAD")
+            .unwrap_or_else(|| short.to_owned())
+    };
+
+    let (content, data) = match kind {
+        install::GitHookKind::Commit => {
+            let full = head_sha()?;
+            let short = short_sha(&full);
+            let subject = git(dir, &["log", "-1", "--pretty=%s"])?;
+            let branch = branch(&short);
+            let changed = git(dir, &["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"])?;
+            let files = changed.lines().filter(|l| !l.trim().is_empty()).count();
+            let content = format!("{short} on {branch}: {subject} ({files} files)");
+            (
+                content,
+                serde_json::json!({
+                    "sha": full, "branch": branch, "subject": subject, "files": files
+                }),
+            )
+        }
+        install::GitHookKind::Checkout => {
+            let (Some(prev), Some(new), Some(flag)) = (args.first(), args.get(1), args.get(2)) else {
+                return Ok(None);
+            };
+            // flag 1 = branch checkout; 0 is a file checkout, which is not an event.
+            if flag != "1" {
+                return Ok(None);
+            }
+            let to = branch(&short_sha(new));
+            let from = git(dir, &["rev-parse", "--abbrev-ref", "@{-1}"])
+                .ok()
+                .filter(|b| !b.is_empty() && b != "HEAD")
+                .unwrap_or_else(|| short_sha(prev));
+            // `git checkout -b x` keeps HEAD but changes the branch; `git checkout main`
+            // while already on main changes neither.
+            if prev == new && from == to {
+                return Ok(None);
+            }
+            let content = format!("switched from {from} to {to}");
+            (
+                content,
+                serde_json::json!({
+                    "from": from, "to": to, "prev": prev, "new": new
+                }),
+            )
+        }
+        install::GitHookKind::Merge => {
+            let squash = args.first().is_some_and(|a| a == "1");
+            let full = head_sha()?;
+            let short = short_sha(&full);
+            let subject = git(dir, &["log", "-1", "--pretty=%s"])?;
+            let branch = branch(&short);
+            let content = format!("merged into {branch}: {subject}");
+            (
+                content,
+                serde_json::json!({
+                    "branch": branch, "sha": full, "squash": squash
+                }),
+            )
+        }
+    };
+
+    Ok(Some(serde_json::json!({
+        "cwd": root,
+        "git_event": kind.event(),
+        "content": content,
+        "data": data,
+    })))
+}
+
+/// Run git in `dir`; stdout is trimmed. Non-zero exit is an error (with stderr).
+fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+    if !out.status.success() {
+        anyhow::bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 async fn run_hook(
     event: hooks::HookEvent,
+    harness: adapters::Harness,
     config: hooks::HookConfig,
     project: Option<String>,
     database_url: Option<String>,
@@ -606,12 +782,31 @@ async fn run_hook(
 ) -> anyhow::Result<Option<String>> {
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
-    let mut input: serde_json::Value =
+    let native: serde_json::Value =
         if raw.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(&raw)? };
+    run_hook_input(event, harness, config, native, project, database_url, deadline).await
+}
+
+/// The rest of [`run_hook`], on an already-built payload. `memdusa git-hook`
+/// reuses it so git events go through exactly the same pipeline.
+async fn run_hook_input(
+    event: hooks::HookEvent,
+    harness: adapters::Harness,
+    config: hooks::HookConfig,
+    native: serde_json::Value,
+    project: Option<String>,
+    database_url: Option<String>,
+    deadline: Duration,
+) -> anyhow::Result<Option<String>> {
+    // Translate the harness's payload into memdusa's canonical one (or ignore this event).
+    let Some(mut input) = harness.normalize(event, native) else { return Ok(None) };
 
     // The project is always detected here, on the machine that has the repo.
+    let project_dir = ["CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR", "GEMINI_PROJECT_DIR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|d| !d.is_empty()));
     if input.get("cwd").and_then(|v| v.as_str()).is_none()
-        && let (Some(obj), Ok(dir)) = (input.as_object_mut(), std::env::var("CLAUDE_PROJECT_DIR"))
+        && let (Some(obj), Some(dir)) = (input.as_object_mut(), project_dir)
     {
         obj.insert("cwd".into(), dir.into());
     }
@@ -646,7 +841,7 @@ async fn run_hook(
             resp
         }
     };
-    Ok(resp.output)
+    Ok(harness.render(event, resp.output))
 }
 
 /// Remote hook with an offline fallback: replay any backlog first, then send
@@ -766,4 +961,52 @@ fn print_key(k: &ApiKey) {
 fn print_created(k: &CreatedKey) {
     println!("\nAPI key for {} ({}). Shown once, store it now:\n\n  {}\n", k.key.user, k.key.name, k.secret);
     println!("Use it on a machine with:  memdusa login <server-url> --token {}", k.secret);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real repository, so the collector is tested against real git output.
+    #[test]
+    fn git_hook_collects_commit_facts_from_a_real_repo() {
+        let dir = std::env::temp_dir().join(format!("memdusa-git-hook-{}", model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        git(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&dir, &["config", "user.name", "Test User"]).unwrap();
+        git(&dir, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::create_dir_all(dir.join(".git/empty-hooks")).unwrap();
+        git(&dir, &["config", "core.hooksPath", ".git/empty-hooks"]).unwrap();
+
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        git(&dir, &["add", "README.md"]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "Initial commit"]).unwrap();
+
+        // The root commit has no parent: --root must still count its files.
+        let root = git_hook_input(install::GitHookKind::Commit, &[], &dir).unwrap().expect("root commit event");
+        assert_eq!(root["data"]["subject"], "Initial commit");
+        assert_eq!(root["data"]["files"], 1);
+        assert_eq!(root["data"]["sha"], git(&dir, &["rev-parse", "HEAD"]).unwrap());
+
+        std::fs::write(dir.join("refunds.rs"), "fn refunds() {}\n").unwrap();
+        std::fs::write(dir.join("refunds_test.rs"), "#[test] fn t() {}\n").unwrap();
+        git(&dir, &["add", "."]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "Add refunds"]).unwrap();
+
+        let input = git_hook_input(install::GitHookKind::Commit, &[], &dir).unwrap().expect("commit event");
+        let data = &input["data"];
+        assert_eq!(input["git_event"], "commit");
+        assert_eq!(data["subject"], "Add refunds");
+        assert_eq!(data["branch"], "main");
+        assert_eq!(data["files"], 2);
+        assert_eq!(data["sha"], git(&dir, &["rev-parse", "HEAD"]).unwrap());
+        let cwd = input["cwd"].as_str().expect("cwd is recorded");
+        assert_eq!(cwd, git(&dir, &["rev-parse", "--show-toplevel"]).unwrap());
+        assert!(Path::new(cwd).is_dir(), "cwd is the repo root");
+        assert!(input["content"].as_str().unwrap().contains("Add refunds"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

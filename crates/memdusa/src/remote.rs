@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use memdusa_core::model::{ApiKey, CreatedKey, GitState, Memory, MemoryQuery, NewMemory, User};
+use memdusa_core::model::{ApiKey, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, User};
 use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -86,6 +86,15 @@ impl Client {
     /// Replay queued hooks in one request, in order.
     pub async fn hook_batch(&self, items: &[HookBatchItem]) -> Result<HookBatchResponse, RemoteError> {
         self.send(self.request(Method::POST, "/v1/hooks/batch").json(&json!({ "items": items }))).await
+    }
+
+    /// Recent events of a project, newest first, optionally of one session.
+    pub async fn events(&self, project: &str, session: Option<&str>, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let mut q = vec![("project", project.to_owned()), ("limit", limit.to_string())];
+        if let Some(s) = session {
+            q.push(("session", s.to_owned()));
+        }
+        Ok(self.send(self.request(Method::GET, "/v1/events").query(&q)).await?)
     }
 
     /// The brief as JSON (its `markdown` field holds the rendered text).

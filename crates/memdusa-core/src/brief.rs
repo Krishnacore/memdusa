@@ -10,6 +10,9 @@ use crate::store::Store;
 /// Event kinds written automatically by harness hooks.
 pub const FILE_CHANGE: &str = "file_change";
 pub const COMMAND: &str = "command";
+pub const STOP_GUARD: &str = "stop_guard";
+/// Bookkeeping events that would only be noise in the brief.
+const HIDDEN: &[&str] = &[STOP_GUARD];
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Brief {
@@ -71,6 +74,35 @@ fn bullets(out: &mut String, title: &str, items: &[String]) {
         let _ = writeln!(out, "- {i}");
     }
     out.push('\n');
+}
+
+/// Memories grouped by kind, as Markdown (the body of the brief's Memory section).
+fn memory_groups(memories: &[Memory]) -> String {
+    let mut o = String::new();
+    for kind in [MemoryKind::Preference, MemoryKind::Decision, MemoryKind::Fact, MemoryKind::Todo, MemoryKind::Note] {
+        let group: Vec<_> = memories.iter().filter(|m| m.kind == kind).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let _ = writeln!(o, "**{}s:**", kind.as_str());
+        for m in group {
+            let scope = if m.project.is_none() { " _(global)_" } else { "" };
+            let _ = writeln!(o, "- {}{scope}", m.content);
+        }
+        o.push('\n');
+    }
+    o
+}
+
+/// A standalone Markdown document of a project's memories (plus visible globals).
+pub fn memories_markdown(project: &str, memories: &[Memory]) -> String {
+    let mut o = format!("# Memories: {project}\n\n");
+    if memories.is_empty() {
+        o.push_str("_No memories saved yet._\n");
+    } else {
+        o.push_str(&memory_groups(memories));
+    }
+    o
 }
 
 fn render(
@@ -136,19 +168,7 @@ fn render(
 
     if !memories.is_empty() {
         let _ = writeln!(o, "## Memory");
-        for kind in [MemoryKind::Preference, MemoryKind::Decision, MemoryKind::Fact, MemoryKind::Todo, MemoryKind::Note]
-        {
-            let group: Vec<_> = memories.iter().filter(|m| m.kind == kind).collect();
-            if group.is_empty() {
-                continue;
-            }
-            let _ = writeln!(o, "**{}s:**", kind.as_str());
-            for m in group {
-                let scope = if m.project.is_none() { " _(global)_" } else { "" };
-                let _ = writeln!(o, "- {}{scope}", m.content);
-            }
-            o.push('\n');
-        }
+        o.push_str(&memory_groups(memories));
         o.push('\n');
     }
 
@@ -162,7 +182,11 @@ fn render(
             }
         }
         let commands: Vec<_> = events.iter().filter(|e| e.kind == COMMAND).take(5).collect();
-        let others: Vec<_> = events.iter().filter(|e| e.kind != FILE_CHANGE && e.kind != COMMAND).take(12).collect();
+        let others: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind != FILE_CHANGE && e.kind != COMMAND && !HIDDEN.contains(&e.kind.as_str()))
+            .take(12)
+            .collect();
 
         let _ = writeln!(o, "## Recent activity");
         if !files.is_empty() {
