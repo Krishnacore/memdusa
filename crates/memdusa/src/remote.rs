@@ -156,8 +156,13 @@ impl Client {
     }
 
     /// Embed memories missing a vector on the server (admin); the server's embedding config decides.
-    pub async fn embeddings_backfill(&self, all: bool) -> anyhow::Result<memdusa_core::embed::BackfillReport> {
-        let body = json!({ "all": all });
+    /// With `project`, only that project's memories are embedded.
+    pub async fn embeddings_backfill(
+        &self,
+        all: bool,
+        project: Option<&str>,
+    ) -> anyhow::Result<memdusa_core::embed::BackfillReport> {
+        let body = json!({ "all": all, "project": project });
         // embedding a big backlog takes a while
         let req = self.request(Method::POST, "/v1/embeddings/backfill").json(&body).timeout(Duration::from_secs(600));
         Ok(self.send(req).await?)

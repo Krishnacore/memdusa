@@ -207,19 +207,25 @@ impl Store {
     }
 
     /// Embed the memories that have no embedding for the current model or whose content changed
-    /// since; with `all`, re-embed every memory. Provider errors are counted, not raised.
-    pub async fn embeddings_backfill(&self, all: bool) -> Result<BackfillReport> {
+    /// since; with `all`, re-embed every memory. With `project`, only that project's memories are
+    /// considered (`None` embeds the whole corpus, as `memdusa embed` does by default). Scoping is
+    /// useful for a targeted backfill and keeps concurrent users from touching each other's data.
+    /// Provider errors are counted, not raised.
+    pub async fn embeddings_backfill(&self, all: bool, project: Option<&str>) -> Result<BackfillReport> {
         let Some(e) = self.embedder.clone() else {
             return Err(Error::Invalid("semantic search is off: set MEMDUSA_EMBED_URL on the memdusa process".into()));
         };
         let mut report = BackfillReport { model: e.model().to_owned(), ..Default::default() };
-        let rows = Q::new(
+        let mut q = Q::new(
             "SELECT m.id AS id, m.content AS content, m.tags AS tags, e.model AS e_model, e.content_hash AS e_hash \
-             FROM memories m LEFT JOIN memory_embeddings e ON e.memory_id = m.id ORDER BY m.updated_at DESC",
-        )
-        .build()
-        .fetch_all(&self.pool)
-        .await?;
+             FROM memories m LEFT JOIN memory_embeddings e ON e.memory_id = m.id",
+        );
+        if let Some(p) = project {
+            let p = q.text(p);
+            q.push(" WHERE m.project = ").push(&p);
+        }
+        q.push(" ORDER BY m.updated_at DESC");
+        let rows = q.build().fetch_all(&self.pool).await?;
 
         let mut todo: Vec<(String, String, String)> = vec![]; // id, text, hash
         for r in &rows {
