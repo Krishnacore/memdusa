@@ -15,6 +15,7 @@ use sqlx::{AnyPool, Executor, Row};
 
 use crate::model::*;
 use crate::redact::Redactor;
+use crate::sync::{SyncKind, SyncOp, change_append};
 use crate::{Error, Result};
 
 const DEFAULT_LEASE_SECS: i64 = 600;
@@ -116,7 +117,7 @@ fn from_json(s: Option<String>) -> Option<Value> {
 fn list_to_json(v: &[String]) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
 }
-fn list_from_json(s: String) -> Vec<String> {
+pub(crate) fn list_from_json(s: String) -> Vec<String> {
     serde_json::from_str(&s).unwrap_or_default()
 }
 
@@ -504,6 +505,83 @@ const MIGRATIONS: &[Migration] = &[
         "DROP TABLE oauth_device_codes",
         "ALTER TABLE oauth_device_codes_v2 RENAME TO oauth_device_codes",
     ]),
+    // 11: sync (H3a). `changes.seq` is a monotonic cursor: the only part that
+    // differs between backends is how it is generated. `origin` marks changes
+    // a client pushed itself, so the pusher can skip its own echo on pull.
+    Migration::PerBackend {
+        sqlite: &[
+            "CREATE TABLE IF NOT EXISTS changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                project TEXT,
+                op TEXT NOT NULL,
+                at BIGINT NOT NULL,
+                origin TEXT,
+                user_name TEXT)",
+            "CREATE INDEX IF NOT EXISTS changes_project_seq ON changes (project, seq)",
+            "CREATE INDEX IF NOT EXISTS changes_record ON changes (kind, record_id)",
+            "CREATE TABLE IF NOT EXISTS memory_revisions (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                project TEXT,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                source TEXT,
+                user_name TEXT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                superseded_at BIGINT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS memory_revisions_memory ON memory_revisions (memory_id, superseded_at)",
+            "CREATE INDEX IF NOT EXISTS memory_revisions_project ON memory_revisions (project, superseded_at)",
+            "CREATE TABLE IF NOT EXISTS sync_state (
+                remote TEXT NOT NULL,
+                project TEXT NOT NULL,
+                push_after BIGINT NOT NULL DEFAULT 0,
+                pull_after BIGINT NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL,
+                last_ok_at BIGINT,
+                last_error TEXT,
+                PRIMARY KEY (remote, project))",
+        ],
+        postgres: &[
+            "CREATE TABLE IF NOT EXISTS changes (
+                seq BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                project TEXT,
+                op TEXT NOT NULL,
+                at BIGINT NOT NULL,
+                origin TEXT,
+                user_name TEXT)",
+            "CREATE INDEX IF NOT EXISTS changes_project_seq ON changes (project, seq)",
+            "CREATE INDEX IF NOT EXISTS changes_record ON changes (kind, record_id)",
+            "CREATE TABLE IF NOT EXISTS memory_revisions (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                project TEXT,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                source TEXT,
+                user_name TEXT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                superseded_at BIGINT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS memory_revisions_memory ON memory_revisions (memory_id, superseded_at)",
+            "CREATE INDEX IF NOT EXISTS memory_revisions_project ON memory_revisions (project, superseded_at)",
+            "CREATE TABLE IF NOT EXISTS sync_state (
+                remote TEXT NOT NULL,
+                project TEXT NOT NULL,
+                push_after BIGINT NOT NULL DEFAULT 0,
+                pull_after BIGINT NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL,
+                last_ok_at BIGINT,
+                last_error TEXT,
+                PRIMARY KEY (remote, project))",
+        ],
+    },
 ];
 
 /// A SQLite URL for a file path that works on every OS. `sqlite://C:\x.db`
@@ -664,10 +742,23 @@ impl Store {
                 }
             }
             existing.updated_at = now;
+            let mut tx = self.pool.begin().await?;
             let mut q = Q::new("UPDATE memories SET ");
             let (t, u, id) = (q.text(list_to_json(&existing.tags)), q.int(now), q.text(&existing.id));
             q.push(&format!("tags = {t}, updated_at = {u} WHERE id = {id}"));
-            q.build().execute(&self.pool).await?;
+            q.build().execute(&mut *tx).await?;
+            change_append(
+                &mut *tx,
+                SyncKind::Memory,
+                SyncOp::Upsert,
+                &existing.id,
+                existing.project.as_deref(),
+                existing.user.as_deref(),
+                None,
+                None,
+            )
+            .await?;
+            tx.commit().await?;
             return Ok(existing);
         }
 
@@ -695,7 +786,17 @@ impl Store {
                     near.tags.push(t);
                 }
             }
-            self.memory_write(&near.id, &content, near.kind, &near.tags, m.source.as_deref(), now).await?;
+            self.memory_write(
+                &near.id,
+                &content,
+                near.kind,
+                &near.tags,
+                m.source.as_deref(),
+                now,
+                near.project.as_deref(),
+                near.user.as_deref(),
+            )
+            .await?;
             self.embed_memory_best_effort(&near.id, &content, &near.tags).await;
             near.content = content;
             near.updated_at = now;
@@ -733,13 +834,27 @@ impl Store {
             q.int(now),
         ];
         q.push(&vals.join(", ")).push(")");
-        q.build().execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        q.build().execute(&mut *tx).await?;
+        change_append(
+            &mut *tx,
+            SyncKind::Memory,
+            SyncOp::Upsert,
+            &mem.id,
+            mem.project.as_deref(),
+            mem.user.as_deref(),
+            None,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         self.embed_memory_best_effort(&mem.id, &mem.content, &mem.tags).await;
         Ok(mem)
     }
 
     /// Overwrite a memory's editable columns (`source` only when given) and bump `updated_at`.
     /// The full-text index follows: SQLite triggers on content/tags, a generated column on Postgres.
+    #[allow(clippy::too_many_arguments)]
     async fn memory_write(
         &self,
         id: &str,
@@ -748,6 +863,8 @@ impl Store {
         tags: &[String],
         source: Option<&str>,
         now: Millis,
+        project: Option<&str>,
+        user: Option<&str>,
     ) -> Result<()> {
         let mut q = Q::new("UPDATE memories SET ");
         let (c, k, t, u) = (q.text(content), q.text(kind.as_str()), q.text(list_to_json(tags)), q.int(now));
@@ -758,9 +875,12 @@ impl Store {
         }
         let id_p = q.text(id);
         q.push(&format!(" WHERE id = {id_p}"));
-        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+        let mut tx = self.pool.begin().await?;
+        if q.build().execute(&mut *tx).await?.rows_affected() == 0 {
             return Err(Error::NotFound(format!("memory {id}")));
         }
+        change_append(&mut *tx, SyncKind::Memory, SyncOp::Upsert, id, project, user, None, None).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -781,10 +901,6 @@ impl Store {
         } else {
             Err(Error::Forbidden("global memories can only be changed by their owner".into()))
         }
-    }
-
-    async fn memory_authorize(&self, id: &str, actor: &Identity) -> Result<()> {
-        Self::memory_check(&self.memory_get(id).await?, actor)
     }
 
     /// Correct or refine a memory in place, with full access (local use).
@@ -816,7 +932,17 @@ impl Store {
             mem.source = patch.source;
         }
         mem.updated_at = now_ms();
-        self.memory_write(id, &mem.content, mem.kind, &mem.tags, mem.source.as_deref(), mem.updated_at).await?;
+        self.memory_write(
+            id,
+            &mem.content,
+            mem.kind,
+            &mem.tags,
+            mem.source.as_deref(),
+            mem.updated_at,
+            mem.project.as_deref(),
+            mem.user.as_deref(),
+        )
+        .await?;
         self.embed_memory_best_effort(id, &mem.content, &mem.tags).await;
         Ok(mem)
     }
@@ -898,13 +1024,27 @@ impl Store {
 
     /// Delete a memory on behalf of `actor`; see [`Store::memory_update_as`] for who may.
     pub async fn memory_forget_as(&self, id: &str, actor: &Identity) -> Result<()> {
-        self.memory_authorize(id, actor).await?;
+        let mem = self.memory_get(id).await?;
+        Self::memory_check(&mem, actor)?;
         let mut q = Q::new("DELETE FROM memories WHERE id = ");
         let id_p = q.text(id);
         q.push(&id_p);
-        if q.build().execute(&self.pool).await?.rows_affected() == 0 {
+        let mut tx = self.pool.begin().await?;
+        if q.build().execute(&mut *tx).await?.rows_affected() == 0 {
             return Err(Error::NotFound(format!("memory {id}")));
         }
+        change_append(
+            &mut *tx,
+            SyncKind::Memory,
+            SyncOp::Delete,
+            id,
+            mem.project.as_deref(),
+            mem.user.as_deref(),
+            None,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         self.embedding_delete(id).await?;
         Ok(())
     }
@@ -935,7 +1075,10 @@ impl Store {
             q.int(ev.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
-        q.build().execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        q.build().execute(&mut *tx).await?;
+        change_append(&mut *tx, SyncKind::Event, SyncOp::Upsert, &ev.id, Some(&ev.project), None, None, None).await?;
+        tx.commit().await?;
         Ok(ev)
     }
 
@@ -1071,7 +1214,11 @@ impl Store {
             q.int(cp.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
-        q.build().execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        q.build().execute(&mut *tx).await?;
+        change_append(&mut *tx, SyncKind::Checkpoint, SyncOp::Upsert, &cp.id, Some(&cp.project), None, None, None)
+            .await?;
+        tx.commit().await?;
         Ok(cp)
     }
 

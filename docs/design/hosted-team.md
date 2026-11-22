@@ -1,6 +1,6 @@
 # Design: memdusa as a team server
 
-Status: H1 done; H2 in progress; H3 proposed.
+Status: H1 and H2 done; H3 in progress.
 
 A memdusa server (`memdusa serve`, Postgres or SQLite) already has per-user API keys, server-side attribution
 (`user/agent`) and private global memories. What a team needs next, in dependency order:
@@ -120,17 +120,28 @@ rotated_from, revoked_at), `user_identities` (user, provider, subject, email/log
 - **H2b**: GitHub + Google upstream sign-in, identity linking, optional allowlist auto-provisioning.
 - **H2c**: `memdusa login --browser` / `--device`, transparent refresh in the client.
 
-## H3: continuous local ⇄ hosted sync (proposed)
+## H3: continuous local ⇄ hosted sync
 
-Goal: agents always write to a fast local DB (works offline, no hook latency); a background `memdusa sync --watch`
-replicates to and from the team server.
-- IDs are already UUIDv7 (time-ordered, globally unique); every table gets `updated_at` (most have it) and a
-  `sync_state` table stores per-remote cursors.
-- Push: local rows changed since the push cursor, via a batch endpoint; pull: server rows changed since the pull cursor,
-  filtered by H1 grants.
-- Conflict rules: events and checkpoints are append-only (no conflicts); memories last-writer-wins by `updated_at`
-  with the loser kept as a superseded revision; runs/steps are server-authoritative (claims/leases must be decided in
-  one place, so delegated work goes through the server, never the local copy).
-- Deletes propagate as tombstones.
-- The existing offline spool (`~/.memdusa/spool`) becomes a special case of push.
-Open questions: which projects sync (all readable vs opt-in list); embedding vectors (re-embed locally vs replicate).
+Status: in progress (H3a protocol + one-shot sync; H3b background sync mode).
+
+Goal: agents write to a fast local SQLite database (works offline, no network in hooks); memdusa replicates the
+chosen projects to and from the team server.
+
+### Decisions
+| Topic | Decision |
+|---|---|
+| What syncs | Projects the user opts into: `memdusa sync add <project>` / `memdusa sync add --all` (every project the user can read on the server). Global memories of the user: opt-in with `--globals`. |
+| Tables | memories (+ deletions), events, checkpoints. **Not** synced: runs/steps (server-authoritative: in sync mode, delegate/claim/step calls go straight to the server), embeddings (each side embeds its own copy), users/keys/grants/audit/OAuth. |
+| Change tracking | A `changes` log on both sides: `(seq INTEGER/BIGSERIAL, kind, record_id, project, op, at)`, appended in the same transaction as each write (op = `upsert` / `delete`). Server `seq` is the global pull cursor; local `seq` is the push cursor. Timestamps are never used as cursors (clock skew). |
+| Push | `POST /v1/sync/push {project, changes:[{kind, op, record}]}` in batches; server applies idempotently (ids are UUIDv7, globally unique): events/checkpoints insert-if-absent; memories last-writer-wins by `updated_at` (tie → larger id); a losing version is kept in `memory_revisions`; deletes become tombstones. Requires write access (H1). Response: per-change result + the server `seq` of each applied change. |
+| Pull | `GET /v1/sync/pull?project=&after=<seq>&limit=` returns changes after the cursor (records inline, tombstones for deletes), filtered by H1 read access; local applies with the same rules. Changes the client pushed itself come back with an `origin` marker and are skipped. |
+| Attribution | Records keep their original `source`/`user` (server checks the pusher may write them: a user can't push records attributed to another user; agent names are re-qualified as `user/agent` on the server, like hooks are). |
+| Redaction | Applied by each store on write (the server redacts pushed content again). |
+| Conflicts surfaced | `memdusa sync status` lists recent LWW losers per project; `memdusa memories revisions <id>` shows them. |
+| Mode | `memdusa sync` (one-shot push+pull), `memdusa sync --watch [--interval 15s]` (loop; H3b), `memdusa sync status`. In sync mode (`memdusa login <url> --sync`), hooks/MCP/CLI use the local DB; a background sync runs from `memdusa sync --watch` (launchd/systemd snippets in README) and opportunistically after SessionEnd. |
+| Offline spool | Superseded in sync mode (local DB is the queue); kept for plain remote mode. |
+
+### Migration
+v11 (portable): `changes`, `memory_revisions`, `sync_state(remote, project, push_after, pull_after, last_ok_at,
+last_error)`. Deletes stay hard deletes; the tombstone lives only in `changes` (so it can be pushed/pulled). Existing
+rows get no backfilled changes: the first `memdusa sync add` does an initial full push/pull of that project.

@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use memdusa_core::access::AccessPolicy;
 use memdusa_core::model::*;
 use memdusa_core::retention::{PruneReport, RetentionPolicy};
+use memdusa_core::sync::{self, PullResponse, PushResponse, SyncActor};
 use memdusa_core::transfer;
 use memdusa_core::{Error, Store, brief};
 use rmcp::transport::streamable_http_server::{
@@ -244,6 +245,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/memories", post(memory_save).get(memory_search))
         .route("/v1/memories/review", get(memory_review))
         .route("/v1/memories/{id}", delete(memory_forget).patch(memory_update))
+        .route("/v1/memories/{id}/revisions", get(memory_revisions))
         .route("/v1/events", post(event_append).get(events_recent))
         .route("/v1/checkpoints", post(checkpoint_save).get(checkpoints_latest))
         .route("/v1/runs", post(run_start).get(run_list))
@@ -254,6 +256,9 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/runs/{id}/steps/{key}/begin", post(step_begin))
         .route("/v1/runs/{id}/steps/{key}/complete", post(step_complete))
         .route("/v1/runs/{id}/steps/{key}/fail", post(step_fail))
+        .route("/v1/sync/push", post(sync_push).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
+        .route("/v1/sync/pull", get(sync_pull))
+        .route("/v1/sync/projects", get(sync_projects))
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn(mcp_session_close_status))
         .merge(oauth::identity_routes())
@@ -1093,10 +1098,88 @@ async fn step_fail(
     Ok(Json(s.store.step_fail(&rid, &key, &b.error).await?))
 }
 
+// ---------------------------------------------------------------- sync (H3a)
+
+/// Apply a batch of local changes. Only counts/outcomes are audited, never
+/// record bodies (they may contain prompts and other user text).
+async fn sync_push(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Json(b): Json<sync::PushBody>,
+) -> ApiResult<PushResponse> {
+    if b.project != sync::SYNC_GLOBALS {
+        check(&access, &id, &b.project, Access::Write, "sync.push").await?;
+    }
+    // Globals are private to their owner (or ownerless on an open server):
+    // no H1 grant applies, and sync_apply/sync_pull enforce ownership.
+    let n = b.changes.len();
+    let results = s.store.sync_apply(Some(&b.project), &b.changes, &SyncActor::Server(id.clone()), None).await?;
+    let applied = results.iter().filter(|r| r.outcome == "applied").count();
+    s.store
+        .audit(
+            NewAuditEvent::ok(id.actor(), "sync.push")
+                .project(&b.project)
+                .detail(json!({"changes": n, "applied": applied})),
+        )
+        .await?;
+    Ok(Json(PushResponse { results }))
+}
+
+#[derive(Deserialize)]
+struct SyncPullQ {
+    project: String,
+    #[serde(default)]
+    after: i64,
+    limit: Option<i64>,
+}
+
+async fn sync_pull(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Query(q): Query<SyncPullQ>,
+) -> ApiResult<PullResponse> {
+    if q.project != sync::SYNC_GLOBALS {
+        check(&access, &id, &q.project, Access::Read, "sync.pull").await?;
+    }
+    let page = s.store.sync_pull(Some(&q.project), q.after, q.limit.unwrap_or(sync::SYNC_BATCH), &id).await?;
+    let n = page.changes.len();
+    s.store
+        .audit(
+            NewAuditEvent::ok(id.actor(), "sync.pull")
+                .project(&q.project)
+                .detail(json!({"changes": n, "after": q.after})),
+        )
+        .await?;
+    Ok(Json(page))
+}
+
+async fn sync_projects(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+) -> ApiResult<Vec<String>> {
+    Ok(Json(access.readable_projects(&s.store, &id).await?))
+}
+
+async fn memory_revisions(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path(mid): Path<String>,
+) -> ApiResult<Vec<Memory>> {
+    if let Some(project) = s.store.memory_project(&mid).await? {
+        check(&access, &id, &project, Access::Read, "memory.revisions").await?;
+    }
+    Ok(Json(s.store.memory_revisions(&mid).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use memdusa_core::sync::{SyncActor, SyncRecord};
     use serde_json::json;
 
     use super::*;
@@ -1741,5 +1824,389 @@ mod tests {
         assert_eq!(st, 200);
         let (_, me) = call(M::GET, &u("/v1/whoami"), Some(&alice), None).await;
         assert_eq!(me["default_access"], "write");
+    }
+
+    // ---------------------------------------------------------------- sync (H3a)
+
+    async fn local_store() -> Store {
+        let dir = std::env::temp_dir().join(format!("memdusa-sync-local-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Store::connect(&memdusa_core::store::sqlite_url(&dir.join("local.db"))).await.unwrap()
+    }
+
+    fn smem(id: &str, project: &str, content: &str, at: Millis) -> SyncRecord {
+        use memdusa_core::sync::{SyncKind, SyncOp, SyncRecord};
+        SyncRecord {
+            kind: SyncKind::Memory,
+            op: SyncOp::Upsert,
+            record_id: id.into(),
+            record: Some(
+                serde_json::to_value(Memory {
+                    id: id.into(),
+                    project: Some(project.into()),
+                    kind: MemoryKind::Fact,
+                    content: content.into(),
+                    tags: vec![],
+                    source: Some("codex".into()),
+                    user: None,
+                    created_at: at,
+                    updated_at: at,
+                    merged: false,
+                })
+                .unwrap(),
+            ),
+            at: Some(at),
+            origin: None,
+        }
+    }
+
+    fn sevent(project: &str, content: &str) -> SyncRecord {
+        use memdusa_core::sync::{SyncKind, SyncOp, SyncRecord};
+        let id = new_id();
+        let at = now_ms();
+        SyncRecord {
+            kind: SyncKind::Event,
+            op: SyncOp::Upsert,
+            record_id: id.clone(),
+            record: Some(json!({
+                "id": id, "project": project, "session": null, "source": null,
+                "kind": "note", "content": content, "data": null, "created_at": at
+            })),
+            at: Some(at),
+            origin: None,
+        }
+    }
+
+    fn sdel(kind: memdusa_core::sync::SyncKind, id: &str, at: Millis) -> SyncRecord {
+        use memdusa_core::sync::{SyncOp, SyncRecord};
+        SyncRecord { kind, op: SyncOp::Delete, record_id: id.into(), record: None, at: Some(at), origin: None }
+    }
+
+    fn project() -> String {
+        format!("sync/http/{}", new_id())
+    }
+
+    async fn push(url: &str, key: Option<&str>, project: &str, changes: &[SyncRecord]) -> (u16, serde_json::Value) {
+        call(
+            reqwest::Method::POST,
+            &format!("{url}/v1/sync/push"),
+            key,
+            Some(json!({
+                "project": project, "changes": changes
+            })),
+        )
+        .await
+    }
+
+    async fn pull(url: &str, key: Option<&str>, project: &str, after: i64, limit: i64) -> (u16, serde_json::Value) {
+        call(
+            reqwest::Method::GET,
+            &format!("{url}/v1/sync/pull?project={project}&after={after}&limit={limit}"),
+            key,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn sync_events_and_checkpoints_round_trip_idempotently() {
+        let (url, server) = spawn(None).await;
+        let local = local_store().await;
+        let p = project();
+        local
+            .event_append(NewEvent {
+                project: p.clone(),
+                kind: "note".into(),
+                content: "local event".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        local
+            .checkpoint_save(NewCheckpoint {
+                project: p.clone(),
+                goal: "local checkpoint".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut changes, _) = local.sync_local_changes(Some(&p), 0, 500).await.unwrap();
+        for c in &mut changes {
+            c.origin = Some("client-A".into());
+        }
+        let (st, body) = push(&url, None, &p, &changes).await;
+        assert_eq!(st, 200, "{body}");
+        assert!(body["results"].as_array().unwrap().iter().all(|r| r["outcome"] == "applied"));
+        assert_eq!(server.events_recent(&p, None, 10).await.unwrap().len(), 1, "{body}");
+        assert_eq!(server.checkpoints_recent(&p, 10).await.unwrap().len(), 1);
+
+        // Re-pushing the same ids inserts nothing and creates no new changes.
+        let (st, body) = push(&url, None, &p, &changes).await;
+        assert_eq!(st, 200);
+        assert!(body["results"].as_array().unwrap().iter().all(|r| r["outcome"] == "duplicate"), "{body}");
+        assert_eq!(server.events_recent(&p, None, 10).await.unwrap().len(), 1);
+
+        // Server-originated rows flow back with no origin marker.
+        server
+            .event_append(NewEvent {
+                project: p.clone(),
+                kind: "note".into(),
+                content: "server event".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (st, page) = pull(&url, None, &p, 0, 500).await;
+        assert_eq!(st, 200, "{page}");
+        let recs: Vec<SyncRecord> = serde_json::from_value(page["changes"].clone()).unwrap();
+        assert!(recs.iter().any(|c| c.origin.as_deref() == Some("client-A")), "pushed changes echo back");
+        let fresh: Vec<_> = recs.into_iter().filter(|c| c.origin.is_none()).collect();
+        local.sync_apply(Some(&p), &fresh, &SyncActor::Local, None).await.unwrap();
+        assert_eq!(local.events_recent(&p, None, 10).await.unwrap().len(), 2);
+        assert_eq!(local.checkpoints_recent(&p, 10).await.unwrap().len(), 1);
+        // Applying the same page twice is still one copy of everything.
+        local.sync_apply(Some(&p), &fresh, &SyncActor::Local, None).await.unwrap();
+        assert_eq!(local.events_recent(&p, None, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_lww_conflict_leaves_loser_in_revisions_on_both_sides() {
+        let (url, server) = spawn(None).await;
+        let local = local_store().await;
+        let p = project();
+        let id = new_id();
+        local.sync_apply(Some(&p), &[smem(&id, &p, "v1", 100)], &SyncActor::Local, None).await.unwrap();
+        let mut first = vec![smem(&id, &p, "v1", 100)];
+        for c in &mut first {
+            c.origin = Some("client-A".into());
+        }
+        push(&url, None, &p, &first).await;
+
+        // Another client edits on the server while A is offline; A makes an
+        // older edit of its own. The server must keep the newer one.
+        let mut remote = smem(&id, &p, "remote wins", 300);
+        remote.origin = Some("client-B".into());
+        server.sync_apply(Some(&p), &[remote], &SyncActor::Server(Identity::root()), None).await.unwrap();
+        local.sync_apply(Some(&p), &[smem(&id, &p, "local loses", 200)], &SyncActor::Local, None).await.unwrap();
+        let mut second = vec![smem(&id, &p, "local loses", 200)];
+        for c in &mut second {
+            c.origin = Some("client-A".into());
+        }
+        let (st, body) = push(&url, None, &p, &second).await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body["results"][0]["outcome"], "revision", "{body}");
+        let on_server =
+            server.memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap();
+        assert_eq!(on_server[0].content, "remote wins");
+        assert!(server.memory_revisions(&id).await.unwrap().iter().any(|m| m.content == "local loses"));
+
+        // A skips its own echoes and learns the winner, keeping its own loser.
+        let (_, page) = pull(&url, None, &p, 0, 500).await;
+        let recs: Vec<SyncRecord> = serde_json::from_value(page["changes"].clone()).unwrap();
+        let fresh: Vec<_> = recs.into_iter().filter(|c| c.origin.as_deref() != Some("client-A")).collect();
+        local.sync_apply(Some(&p), &fresh, &SyncActor::Local, None).await.unwrap();
+        let on_local =
+            local.memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap();
+        assert_eq!(on_local[0].content, "remote wins");
+        assert!(local.memory_revisions(&id).await.unwrap().iter().any(|m| m.content == "local loses"));
+    }
+
+    #[tokio::test]
+    async fn sync_delete_propagates_both_ways() {
+        use memdusa_core::sync::SyncKind;
+        let (url, server) = spawn(None).await;
+        let local = local_store().await;
+        let p = project();
+        let id = new_id();
+        local.sync_apply(Some(&p), &[smem(&id, &p, "to delete", 100)], &SyncActor::Local, None).await.unwrap();
+        let mut first = vec![smem(&id, &p, "to delete", 100)];
+        for c in &mut first {
+            c.origin = Some("client-A".into());
+        }
+        push(&url, None, &p, &first).await;
+        assert_eq!(
+            server.memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() }).await.unwrap().len(),
+            1
+        );
+
+        // Local delete → server.
+        local.sync_apply(Some(&p), &[sdel(SyncKind::Memory, &id, 200)], &SyncActor::Local, None).await.unwrap();
+        let mut tomb = vec![sdel(SyncKind::Memory, &id, 200)];
+        for c in &mut tomb {
+            c.origin = Some("client-A".into());
+        }
+        push(&url, None, &p, &tomb).await;
+        assert!(
+            server
+                .memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Server delete → local.
+        let sid = new_id();
+        server
+            .sync_apply(Some(&p), &[smem(&sid, &p, "server memory", 100)], &SyncActor::Server(Identity::root()), None)
+            .await
+            .unwrap();
+        server
+            .sync_apply(Some(&p), &[sdel(SyncKind::Memory, &sid, 200)], &SyncActor::Server(Identity::root()), None)
+            .await
+            .unwrap();
+        let (_, page) = pull(&url, None, &p, 0, 500).await;
+        let recs: Vec<SyncRecord> = serde_json::from_value(page["changes"].clone()).unwrap();
+        let fresh: Vec<_> = recs.into_iter().filter(|c| c.origin.as_deref() != Some("client-A")).collect();
+        local.sync_apply(Some(&p), &fresh, &SyncActor::Local, None).await.unwrap();
+        assert!(
+            local
+                .memory_search(MemoryQuery { project: Some(p.clone()), ..Default::default() })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_echo_pagination_and_cursors() {
+        let (url, _) = spawn(None).await;
+        let local = local_store().await;
+        let p = project();
+        for i in 0..5 {
+            local
+                .event_append(NewEvent {
+                    project: p.clone(),
+                    kind: "note".into(),
+                    content: format!("e{i}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let mut after = 0;
+        let mut pushed = 0;
+        loop {
+            let (mut changes, last) = local.sync_local_changes(Some(&p), after, 2).await.unwrap();
+            for c in &mut changes {
+                c.origin = Some("client-A".into());
+            }
+            let (st, body) = push(&url, None, &p, &changes).await;
+            assert_eq!(st, 200, "{body}");
+            pushed += changes.len();
+            after = last;
+            if (changes.len() as i64) < 2 {
+                break;
+            }
+        }
+        assert_eq!(pushed, 5);
+
+        let mut after = 0;
+        let mut seen: Vec<SyncRecord> = vec![];
+        let mut pages = 0;
+        loop {
+            let (st, page) = pull(&url, None, &p, after, 2).await;
+            assert_eq!(st, 200, "{page}");
+            let next = page["next_cursor"].as_i64().unwrap();
+            assert!(next > after);
+            seen.extend(serde_json::from_value::<Vec<SyncRecord>>(page["changes"].clone()).unwrap());
+            after = next;
+            pages += 1;
+            if !page["has_more"].as_bool().unwrap() {
+                break;
+            }
+            assert!(pages < 10);
+        }
+        assert_eq!(seen.len(), 5, "{pages} pages");
+        assert!(seen.iter().all(|c| c.origin.as_deref() == Some("client-A")), "all changes are echoes");
+        let (_, page) = pull(&url, None, &p, after, 10).await;
+        assert!(page["changes"].as_array().unwrap().is_empty() && !page["has_more"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_h1_read_access_denials_and_audit() {
+        let (url, store) = spawn_with(Some("root-token"), DefaultPolicy::None).await;
+        let (admin, alice) = admin_and_user(&store, "alice", false).await;
+        let readable = format!("sync/read/{}", new_id());
+        let secret = format!("sync/secret/{}", new_id());
+        store.grant_create(&readable, "alice", Role::Read, "admin").await.unwrap();
+        for p in [&readable, &secret] {
+            store
+                .event_append(NewEvent {
+                    project: p.to_string(),
+                    kind: "note".into(),
+                    content: "data".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (st, page) = pull(&url, Some(&alice), &readable, 0, 50).await;
+        assert_eq!(st, 200, "{page}");
+        assert!(!page["changes"].as_array().unwrap().is_empty());
+        let (st, _) = pull(&url, Some(&alice), &secret, 0, 50).await;
+        assert_eq!(st, 403, "no read access to other projects");
+
+        let (st, body) = push(&url, Some(&alice), &readable, &[sevent(&readable, "denied")]).await;
+        assert_eq!(st, 403, "{body}");
+        let (_, audit) =
+            call(reqwest::Method::GET, &format!("{url}/v1/admin/audit?actor=alice"), Some(&admin), None).await;
+        assert!(
+            audit.as_array().unwrap().iter().any(|e| {
+                e["outcome"] == "denied"
+                    && e["detail"]["action"] == "sync.push"
+                    && e["detail"]["needed"] == "write"
+                    && e["project"] == json!(readable)
+            }),
+            "{audit}"
+        );
+        // Nothing was written by the denied push.
+        assert_eq!(store.events_recent(&readable, None, 20).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_records_attributed_to_another_user() {
+        let (url, store) = spawn(Some("root-token")).await;
+        let (_, alice) = admin_and_user(&store, "alice", false).await;
+        let p = project();
+        let mut rec = smem(&new_id(), &p, "bob's memory", 100);
+        rec.record.as_mut().unwrap().as_object_mut().unwrap().insert("user".into(), json!("bob"));
+        let (st, body) = push(&url, Some(&alice), &p, &[rec]).await;
+        assert_eq!(st, 403, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("bob"));
+        assert!(store.memory_search(MemoryQuery { project: Some(p), ..Default::default() }).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_globals_are_private_to_their_owner() {
+        use memdusa_core::sync::SYNC_GLOBALS;
+        let (url, store) = spawn(Some("root-token")).await;
+        let alice = store.key_create(&store.user_create("alice", false).await.unwrap().name, "k").await.unwrap().secret;
+        let bob = store.key_create(&store.user_create("bob", false).await.unwrap().name, "k").await.unwrap().secret;
+        let id = new_id();
+        let rec = SyncRecord {
+            kind: memdusa_core::sync::SyncKind::Memory,
+            op: memdusa_core::sync::SyncOp::Upsert,
+            record_id: id.clone(),
+            record: Some(json!({
+                "id": id, "project": null, "kind": "fact", "content": "alice's private preference",
+                "tags": [], "source": null, "user": null, "created_at": 100, "updated_at": 100
+            })),
+            at: Some(100),
+            origin: Some("client-A".into()),
+        };
+        let (st, body) = push(&url, Some(&alice), SYNC_GLOBALS, &[rec]).await;
+        assert_eq!(st, 200, "{body}");
+        let stored =
+            store.memory_search(MemoryQuery { user: Some("alice".into()), ..Default::default() }).await.unwrap();
+        assert_eq!(stored[0].user.as_deref(), Some("alice"));
+
+        let (st, page) = pull(&url, Some(&alice), SYNC_GLOBALS, 0, 50).await;
+        assert_eq!(st, 200);
+        let found: Vec<SyncRecord> = serde_json::from_value(page["changes"].clone()).unwrap();
+        assert_eq!(found.len(), 1, "alice sees her own global");
+        let (st, page) = pull(&url, Some(&bob), SYNC_GLOBALS, 0, 50).await;
+        assert_eq!(st, 200);
+        let found: Vec<SyncRecord> = serde_json::from_value(page["changes"].clone()).unwrap();
+        assert!(found.is_empty(), "bob can't pull alice's globals: {found:?}");
     }
 }

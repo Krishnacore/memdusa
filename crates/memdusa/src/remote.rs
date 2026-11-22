@@ -9,6 +9,7 @@ use memdusa_core::model::{
     ApiKey, AuditEvent, AuditQuery, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, ProjectGrant, Role,
     RunWithSteps, Step, User,
 };
+use memdusa_core::sync::{PullResponse, PushBody, PushResponse, SyncRecord};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -265,6 +266,29 @@ impl Client {
 
     pub async fn memory_review(&self, project: &str) -> anyhow::Result<memdusa_core::review::MemoryReview> {
         Ok(self.send(self.request(Method::GET, "/v1/memories/review").query(&[("project", project)])).await?)
+    }
+
+    /// Superseded versions kept by last-writer-wins conflicts.
+    pub async fn memory_revisions(&self, id: &str) -> anyhow::Result<Vec<Memory>> {
+        let path = format!("/v1/memories/{}/revisions", path_segment(id));
+        Ok(self.send(self.request(Method::GET, &path)).await?)
+    }
+
+    // ---------------------------------------------------------------- sync (H3a)
+
+    pub async fn sync_push(&self, project: &str, changes: &[SyncRecord]) -> anyhow::Result<PushResponse> {
+        let body = PushBody { project: project.into(), changes: changes.to_vec() };
+        Ok(self.send(self.request(Method::POST, "/v1/sync/push").json(&body)).await?)
+    }
+
+    pub async fn sync_pull(&self, project: &str, after: i64, limit: i64) -> anyhow::Result<PullResponse> {
+        let q = [("project", project.to_owned()), ("after", after.to_string()), ("limit", limit.to_string())];
+        Ok(self.send(self.request(Method::GET, "/v1/sync/pull").query(&q)).await?)
+    }
+
+    /// Projects the caller may read, for `sync add --all`.
+    pub async fn sync_projects(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.send(self.request(Method::GET, "/v1/sync/projects")).await?)
     }
 
     /// Embed memories missing a vector on the server (admin); the server's embedding config decides.
