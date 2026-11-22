@@ -95,6 +95,38 @@ jobs:
           echo "nothex  file" > "$dir/memdusa-v1.2.3-x86_64-apple-darwin.tar.gz.sha256"
           if "$script" v1.2.3 "$dir" owner/repo > /dev/null; then echo "malformed checksum was accepted"; exit 1; fi
 
+  install-scripts:
+    name: install scripts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - name: Run install.sh
+        if: runner.os != 'Windows'
+        shell: sh
+        env:
+          MEMDUSA_INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          sh install.sh
+          "$MEMDUSA_INSTALL_DIR/memdusa" --version
+      - name: Run install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MEMDUSA_INSTALL_DIR: ${{ runner.temp }}\memdusa\bin
+        run: |
+          & ./install.ps1
+          & (Join-Path $env:MEMDUSA_INSTALL_DIR 'memdusa.exe') --version
+
   docker:
     name: docker build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
