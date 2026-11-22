@@ -35,7 +35,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p memdusa
+        # local-embed: built-in semantic search (off until MEMDUSA_EMBED_URL=local); ONNX Runtime is linked in statically
+        run: cargo build --release --locked --target ${{ matrix.target }} -p memdusa --features local-embed
       - name: Package
         shell: bash
         env:
