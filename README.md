@@ -32,6 +32,13 @@ machine and in every harness. Without a remote it falls back to the git root pat
 ## Install
 
 - **Homebrew** (macOS and Linux, arm64 and x86_64): `brew install krishnacore/tap/memdusa`
+- **One-line installers** (no Homebrew needed):
+  - macOS / Linux (arm64 or x86_64): `curl -fsSL https://raw.githubusercontent.com/Krishnacore/memdusa/main/install.sh | sh`
+  - Windows (PowerShell, x86_64): `irm https://raw.githubusercontent.com/Krishnacore/memdusa/main/install.ps1 | iex`
+
+  Both download the matching release archive, verify its SHA-256 checksum and install `memdusa` to `~/.local/bin`
+  (Windows: `%LOCALAPPDATA%\memdusa\bin`). Set `MEMDUSA_VERSION=v0.1.1` to pin a version and `MEMDUSA_INSTALL_DIR`
+  to change the destination. Then connect a harness, e.g. `memdusa install claude-code`.
 - **Prebuilt binaries** (Linux x86_64/arm64, macOS Intel/Apple Silicon, Windows): download from the GitHub release
   for each `v*` tag, unpack, and put `memdusa` on your `PATH`.
 - **Server image**: `docker run -p 7077:7077 -v memdusa:/data ghcr.io/<owner>/memdusa` (SQLite in the `/data`
@@ -404,7 +411,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [ ] **Easy installation on every platform** (today: download a release archive, `cargo install`, or Docker)
   - ✓ macOS/Linux: a Homebrew tap (`brew install krishnacore/tap/memdusa`) whose formula the release workflow updates
     automatically (version, URLs, SHA-256 per platform); later, a homebrew-core submission (not done yet)
-  - one-line install script (`curl -fsSL …/install.sh | sh`) that picks the right archive, verifies its checksum and
+  - ✓ one-line install script (`curl -fsSL …/install.sh | sh`) that picks the right archive, verifies its checksum and
     installs to `~/.local/bin`, plus a PowerShell equivalent for Windows
   - Windows: Scoop bucket and winget manifest, generated per release
   - `cargo binstall memdusa` (metadata pointing at the release archives) and publishing to crates.io
