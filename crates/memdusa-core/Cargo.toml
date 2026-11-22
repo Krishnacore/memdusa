@@ -14,5 +14,6 @@ sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 sha2 = "0.11"
+base64 = "0.22"
 getrandom = "0.4"
 regex = "1"

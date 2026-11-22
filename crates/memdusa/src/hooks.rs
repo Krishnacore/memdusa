@@ -431,6 +431,11 @@ async fn session_start(ctx: &Ctx<'_>, source: &str) -> Result<Option<String>> {
 const RECALL_MAX: usize = 5;
 /// Ranked candidates fetched (some are dropped as weak matches or already shown).
 const RECALL_CANDIDATES: i64 = 25;
+/// Longest the prompt waits for the query embedding (semantic search), then recall is lexical.
+const RECALL_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Cosine similarity from which a memory is recalled without sharing words with the prompt
+/// (stricter than the search floor: recall runs on every prompt).
+const RECALL_COSINE: f32 = 0.55;
 /// Prompt terms searched for.
 const RECALL_TERMS: usize = 16;
 /// Longest memory shown, in characters.
@@ -463,15 +468,19 @@ async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
     // "Meaningful": at least two of the prompt's terms (one, if it only has one).
     let need = terms.len().min(2);
 
+    // A slow embedding API must not stall the prompt: cap it, then fall back to lexical search.
     let candidates = ctx
         .store
-        .memory_search_ranked(MemoryQuery {
-            query: Some(terms.join(" ")),
-            project: Some(ctx.project.clone()),
-            limit: Some(RECALL_CANDIDATES),
-            user: ctx.user.clone(),
-            ..Default::default()
-        })
+        .memory_search_scored(
+            MemoryQuery {
+                query: Some(terms.join(" ")),
+                project: Some(ctx.project.clone()),
+                limit: Some(RECALL_CANDIDATES),
+                user: ctx.user.clone(),
+                ..Default::default()
+            },
+            Some(RECALL_EMBED_TIMEOUT),
+        )
         .await?;
     if candidates.is_empty() {
         return Ok(None);
@@ -486,13 +495,18 @@ async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
 
     let picked: Vec<&Memory> = candidates
         .iter()
-        .map(|(m, _)| m)
-        .filter(|m| !shown.contains(&m.id))
-        .filter(|m| {
+        .filter(|s| !shown.contains(&s.memory.id))
+        .filter(|s| {
+            // a close embedding match is relevant even when the words differ
+            if s.cosine.is_some_and(|c| c >= RECALL_COSINE) {
+                return true;
+            }
+            let m = &s.memory;
             let have: std::collections::HashSet<String> =
                 words(&format!("{} {}", m.content, m.tags.join(" "))).into_iter().collect();
             terms.iter().filter(|t| have.contains(*t)).count() >= need
         })
+        .map(|s| &s.memory)
         .take(RECALL_MAX)
         .collect();
     if picked.is_empty() {

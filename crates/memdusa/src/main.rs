@@ -1,5 +1,6 @@
 mod adapters;
 mod config;
+mod embedder;
 mod hooks;
 mod http;
 mod install;
@@ -114,6 +115,12 @@ enum Cmd {
     Recall { query: Option<String> },
     /// List memories that need consolidating: related ones to merge, possibly outdated ones, old todos.
     Review,
+    /// Compute embeddings for memories that lack one for the current model (semantic search, MEMDUSA_EMBED_URL).
+    Embed {
+        /// Re-embed every memory, not just the missing or outdated ones.
+        #[arg(long)]
+        all: bool,
+    },
     /// Print the detected project key.
     Project,
     /// Use a remote memdusa server for hooks, MCP and the CLI on this machine.
@@ -505,8 +512,11 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => {
             let Mode::Local(url) = &mode else { unreachable!() };
             println!("mode: local database {url} (schema ok, {} users)", store.user_count().await?);
+            let s = store.embedding_stats().await?;
+            println!("{}", semantic_line(s.model.as_deref(), s.embedded, s.total));
             println!("project: {}", project.as_deref().unwrap_or("<none>"));
         }
+        Cmd::Embed { all } => print_backfill(&store.embeddings_backfill(all).await?),
         Cmd::Sync => println!("local mode: nothing to sync (the queue is only used with a remote server)"),
         Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
             let opts = transcripts::ImportOptions { harness, files, latest, force, dry_run, project: cli.project };
@@ -664,6 +674,15 @@ async fn run_remote(
                         info["backend"].as_str().unwrap_or("?")
                     );
                     println!("identity: {}", describe_identity(&info));
+                    let sem = &info["semantic"];
+                    println!(
+                        "{} (server side)",
+                        semantic_line(
+                            sem["model"].as_str(),
+                            sem["embedded"].as_i64().unwrap_or(0),
+                            sem["total"].as_i64().unwrap_or(0)
+                        )
+                    );
                 }
                 Err(e) => println!("mode: remote {} (NOT reachable: {e})", r.url),
             }
@@ -699,6 +718,7 @@ async fn run_remote(
             }
             print_import(&total);
         }
+        Cmd::Embed { all } => print_backfill(&client()?.embeddings_backfill(all).await?),
         Cmd::Backup { .. } => anyhow::bail!("backup copies a local SQLite file; against a server use `memdusa export`"),
         Cmd::Sync => {
             let spool = spool::Spool::open()?;
@@ -1046,7 +1066,30 @@ fn redactor_from_env() -> anyhow::Result<Redactor> {
 }
 
 async fn open_store(url: &str) -> anyhow::Result<Store> {
-    Ok(Store::connect(url).await?.with_redactor(redactor_from_env()?))
+    let mut store = Store::connect(url).await?.with_redactor(redactor_from_env()?);
+    // Semantic search is opt-in (MEMDUSA_EMBED_URL); a broken setup must not stop memdusa from working.
+    match embedder::HttpEmbedder::from_env() {
+        Ok(Some(e)) => store = store.with_embedder(e),
+        Ok(None) => {}
+        Err(e) => eprintln!("memdusa: semantic search disabled, bad embedding config: {e:#}"),
+    }
+    Ok(store)
+}
+
+/// `memdusa embed` / `POST /v1/embeddings/backfill` result as a line.
+fn print_backfill(r: &memdusa_core::embed::BackfillReport) {
+    println!("model {}: embedded {}, already up to date {}, failed {}", r.model, r.embedded, r.up_to_date, r.failed);
+    if r.failed > 0 {
+        println!("some memories could not be embedded (see the warning above); run `memdusa embed` again later");
+    }
+}
+
+/// The status line about semantic search.
+fn semantic_line(model: Option<&str>, embedded: i64, total: i64) -> String {
+    match model {
+        Some(m) => format!("semantic search: on (model {m}, {embedded}/{total} memories embedded)"),
+        None => "semantic search: off (set MEMDUSA_EMBED_URL to enable)".into(),
+    }
 }
 
 fn default_db_url() -> anyhow::Result<String> {

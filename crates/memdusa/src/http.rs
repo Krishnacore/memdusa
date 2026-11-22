@@ -158,6 +158,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/admin/users/{name}/keys", post(admin_key_create))
         .route("/v1/admin/keys", get(admin_keys))
         .route("/v1/admin/prune", post(admin_prune))
+        .route("/v1/embeddings/backfill", post(embeddings_backfill))
         .route("/v1/admin/export", get(admin_export))
         .route("/v1/admin/import", post(admin_import).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         .route("/v1/admin/keys/{id}", delete(admin_key_revoke))
@@ -296,13 +297,33 @@ async fn whoami(State(s): State<AppState>, Extension(id): Extension<Identity>) -
         memdusa_core::Backend::Sqlite => "sqlite",
         memdusa_core::Backend::Postgres => "postgres",
     };
+    // semantic search status; a failing count must not break whoami
+    let semantic = s.store.embedding_stats().await.unwrap_or_default();
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "backend": backend,
         "user": id.user,
         "admin": id.admin,
+        "semantic": { "model": semantic.model, "embedded": semantic.embedded, "total": semantic.total },
     }))
+}
+
+#[derive(Deserialize, Default)]
+struct BackfillBody {
+    #[serde(default)]
+    all: bool,
+}
+
+/// Embed memories that have no vector for the server's embedding model (admin).
+async fn embeddings_backfill(
+    State(s): State<AppState>,
+    Extension(id): Extension<Identity>,
+    body: Option<Json<BackfillBody>>,
+) -> ApiResult<memdusa_core::embed::BackfillReport> {
+    admin(&id)?;
+    let all = body.map(|Json(b)| b.all).unwrap_or_default();
+    Ok(Json(s.store.embeddings_backfill(all).await?))
 }
 
 async fn hook(

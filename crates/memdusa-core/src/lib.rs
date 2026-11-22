@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod brief;
+pub mod embed;
 pub mod model;
 pub mod redact;
 pub mod retention;

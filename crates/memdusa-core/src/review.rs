@@ -2,12 +2,14 @@
 //! consolidating (related memories to merge, memories that may be outdated, abandoned todos) and the
 //! agent acts on it with `memory_update` / `memory_forget`.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::brief::FILE_CHANGE;
+use crate::embed::{RELATED_COSINE, cosine};
 use crate::model::*;
 use crate::store::{Store, similarity};
 
@@ -180,7 +182,9 @@ pub(crate) fn stale_hit(m: &Memory, events: &[Event]) -> Option<(String, Millis)
 
 /// Single-link groups of related memories: same kind and scope, pairwise similarity in
 /// `RELATED..NEAR_DUPLICATE` links two memories; groups of 2+ are returned, capped in size and number.
-fn related_groups(memories: &[Memory]) -> Vec<Vec<ReviewItem>> {
+/// Memories also link when both have a vector and their cosine reaches [`RELATED_COSINE`] (same meaning in
+/// other words). Save-time auto-merge is unaffected: it stays lexical.
+fn related_groups(memories: &[Memory], vectors: &HashMap<String, Vec<f32>>) -> Vec<Vec<ReviewItem>> {
     let n = memories.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(p: &mut [usize], mut i: usize) -> usize {
@@ -197,7 +201,11 @@ fn related_groups(memories: &[Memory]) -> Vec<Vec<ReviewItem>> {
                 continue;
             }
             let s = similarity(&a.content, &b.content);
-            if (RELATED..crate::store::NEAR_DUPLICATE).contains(&s) {
+            let semantic = match (vectors.get(&a.id), vectors.get(&b.id)) {
+                (Some(va), Some(vb)) => cosine(va, vb) >= RELATED_COSINE,
+                _ => false,
+            };
+            if semantic || (RELATED..crate::store::NEAR_DUPLICATE).contains(&s) {
                 let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
                 parent[ri] = rj;
             }
@@ -224,6 +232,16 @@ fn related_groups(memories: &[Memory]) -> Vec<Vec<ReviewItem>> {
 /// Review `memories` against recent `file_change` `events` at time `now`. Memories are expected
 /// newest first (as the store returns them).
 pub fn review(memories: &[Memory], events: &[Event], now: Millis) -> MemoryReview {
+    review_with_vectors(memories, events, now, &HashMap::new())
+}
+
+/// [`review`] that also groups memories whose embeddings (`vectors`, by memory id) are close.
+pub fn review_with_vectors(
+    memories: &[Memory],
+    events: &[Event],
+    now: Millis,
+    vectors: &HashMap<String, Vec<f32>>,
+) -> MemoryReview {
     let stale = memories
         .iter()
         .filter_map(|m| {
@@ -235,7 +253,7 @@ pub fn review(memories: &[Memory], events: &[Event], now: Millis) -> MemoryRevie
         .filter(|m| m.kind == MemoryKind::Todo && now - m.updated_at >= OLD_TODO_DAYS * DAY_MS)
         .map(ReviewItem::from)
         .collect();
-    MemoryReview { related: related_groups(memories), stale, old }
+    MemoryReview { related: related_groups(memories, vectors), stale, old }
 }
 
 impl Store {
@@ -261,7 +279,15 @@ impl Store {
             );
         }
         let events = self.events_recent_kind(project, None, FILE_CHANGE, EVENT_WINDOW).await?;
-        Ok(review(&memories, &events, now))
+        let ids: Vec<&str> = memories.iter().map(|m| m.id.as_str()).collect();
+        let vectors = match self.memory_vectors(&ids).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("semantic search: could not load vectors for the review, using lexical grouping: {e}");
+                HashMap::new()
+            }
+        };
+        Ok(review_with_vectors(&memories, &events, now, &vectors))
     }
 }
 
@@ -290,7 +316,7 @@ mod tests {
         let ms: Vec<Memory> = (0..8)
             .map(|i| mem(&format!("a{i}"), MemoryKind::Fact, p, &format!("deploy pipeline config staging step{i}"), 1))
             .collect();
-        let g = related_groups(&ms);
+        let g = related_groups(&ms, &HashMap::new());
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].len(), MAX_GROUP);
 
@@ -299,6 +325,6 @@ mod tests {
             mem("y", MemoryKind::Note, p, "deploy pipeline uses github actions runners", 1),
             mem("z", MemoryKind::Fact, None, "deploy pipeline uses github actions secrets", 1),
         ];
-        assert!(related_groups(&mixed).is_empty());
+        assert!(related_groups(&mixed, &HashMap::new()).is_empty());
     }
 }
