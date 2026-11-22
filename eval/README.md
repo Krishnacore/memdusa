@@ -55,6 +55,17 @@ over 5+ trials, and compare changes to memdusa (brief format, hooks) against the
 | `refunds` | The baseline scenario: A is interrupted mid-task while implementing partial refunds. Its default `a_mode` is `interrupt`. |
 | `audit-trail` | A finishes only part 1 (the event queue) and stops; B must add the audit trail. The decisions about part 2 live only in A's last message, and a project convention lives only in a seeded memory. Its `a_mode` is `complete`. |
 
+### Results so far (Sonnet, 3 trials each)
+
+| Scenario | memdusa B: hidden tests | baseline B: hidden tests | baseline runs with constraint violations |
+|---|---|---|---|
+| `refunds` (A stopped after its first edit) | 12/12 in 3/3 trials | 11/12 | n/a |
+| `audit-trail` (2026-11-22) | 100%, 0/3 runs with violations | 20% | 3/3 |
+
+In `audit-trail`, baseline B always found the remaining work (the repo's README mentions an audit trail) but guessed its
+own API and used the wall clock, because A's decisions and the timestamp convention were only in memdusa. memdusa B made
+one MCP call on average and cost about the same ($0.09 vs $0.08 per run).
+
 ### Adding a scenario
 
 `scenarios/<name>/` with:
