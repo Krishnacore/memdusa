@@ -795,3 +795,92 @@ async fn brief_flags_memories_about_files_changed_since() {
         let _ = before;
     }
 }
+
+/// 30 memories, the 2 about the checkpoint's goal are the oldest.
+async fn seed_many(s: &Store, p: &str) {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(3));
+    let project = Some(p.to_owned());
+    for text in ["Zebra migration must keep ids stable", "Run zebra migration dry first"] {
+        s.memory_save(mem(&project, text, &[])).await.unwrap();
+        pause().await;
+    }
+    for i in 0..28 {
+        s.memory_save(mem(&project, &format!("filler{i} lorem{i} ipsum{i} dolor{i} sit{i} amet{i}"), &[]))
+            .await
+            .unwrap();
+        pause().await;
+    }
+}
+
+fn goal(p: &str, goal: &str) -> NewCheckpoint {
+    NewCheckpoint { project: p.into(), goal: goal.into(), ..Default::default() }
+}
+
+#[tokio::test]
+async fn brief_prefers_memories_relevant_to_the_checkpoint() {
+    for (name, s) in stores().await {
+        let p = project();
+        seed_many(&s, &p).await;
+        s.checkpoint_save(goal(&p, "finish the zebra migration")).await.unwrap();
+
+        let b = brief::build_with_budget(&s, &p, None, None, 500).await.unwrap();
+        for needle in ["Zebra migration must keep ids stable", "Run zebra migration dry first"] {
+            assert!(b.markdown.contains(needle), "{name}: missing {needle}:\n{}", b.markdown);
+        }
+        assert!(b.markdown.contains("more memories not shown: use the memory_search tool"), "{name}");
+        assert!(b.memories.len() < 30, "{name}");
+        let omitted = 30 - b.memories.len();
+        assert!(b.markdown.contains(&format!("_{omitted} more memories not shown")), "{name}:\n{}", b.markdown);
+
+        // the latest prompt counts when newer than the checkpoint
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s.event_append(NewEvent {
+            project: p.clone(),
+            kind: "prompt".into(),
+            content: "look at filler7".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let b = brief::build_with_budget(&s, &p, None, None, 500).await.unwrap();
+        assert!(b.memories.iter().any(|m| m.content.starts_with("filler7")), "{name}: prompt ignored");
+    }
+}
+
+#[tokio::test]
+async fn brief_always_keeps_preferences_and_respects_budget() {
+    for (name, s) in stores().await {
+        let p = project();
+        seed_many(&s, &p).await;
+        let pref = NewMemory {
+            kind: MemoryKind::Preference,
+            ..mem(&Some(p.clone()), &format!("prefers tabs {}", "wide ".repeat(40)), &[])
+        };
+        s.memory_save(pref).await.unwrap();
+        s.checkpoint_save(goal(&p, "finish the zebra migration")).await.unwrap();
+
+        // the preference alone is bigger than the budget: it is still shown
+        let b = brief::build_with_budget(&s, &p, None, None, 100).await.unwrap();
+        assert!(b.memories.iter().any(|m| m.kind == MemoryKind::Preference), "{name}");
+        assert_eq!(b.memories.len(), 1, "{name}: nothing else fits");
+
+        let b = brief::build_with_budget(&s, &p, None, None, 1_000).await.unwrap();
+        let used: usize = b.memories.iter().filter(|m| m.kind != MemoryKind::Preference).map(|m| m.content.len()).sum();
+        assert!(used <= 1_000, "{name}: budget exceeded");
+        assert!(b.markdown.contains("more memories not shown"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn brief_without_focus_lists_recent_memories() {
+    for (name, s) in stores().await {
+        let p = project();
+        seed_many(&s, &p).await;
+        // no checkpoint, no prompt: most recent first, nothing reordered, all fit a big budget
+        let b = brief::build_with_budget(&s, &p, None, None, 1_000_000).await.unwrap();
+        assert_eq!(b.memories.len(), 30, "{name}");
+        assert!(b.memories[0].content.starts_with("filler27"), "{name}");
+        assert!(b.memories[29].content.starts_with("Zebra migration"), "{name}");
+        assert!(!b.markdown.contains("more memories not shown"), "{name}");
+    }
+}

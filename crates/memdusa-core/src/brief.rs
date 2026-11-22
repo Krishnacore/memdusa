@@ -19,6 +19,14 @@ pub const MEMORY_RECALL: &str = "memory_recall";
 const HIDDEN: &[&str] = &[STOP_GUARD, AGENT_MESSAGE, COMPACT_SUMMARY, MEMORY_RECALL];
 /// How much of a compaction summary the brief quotes.
 const SUMMARY_CHARS: usize = 1_500;
+/// Default character budget of the brief's Memory section.
+pub const MEMORY_BUDGET: usize = 4_000;
+/// Memories loaded when there is nothing to rank them by.
+const RECENT_LIMIT: i64 = 50;
+/// Memories considered when ranking by the current focus.
+const CANDIDATES: i64 = 200;
+/// How much of the focus text is used as the search query.
+const FOCUS_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Brief {
@@ -38,27 +46,102 @@ pub struct Brief {
 /// `current_git` is the caller's code state, compared against the latest
 /// checkpoint's to warn about a different branch, commit or machine.
 pub async fn build(store: &Store, project: &str, user: Option<&str>, current_git: Option<&GitState>) -> Result<Brief> {
+    build_with_budget(store, project, user, current_git, MEMORY_BUDGET).await
+}
+
+/// [`build`] with an explicit character budget for the Memory section.
+pub async fn build_with_budget(
+    store: &Store,
+    project: &str,
+    user: Option<&str>,
+    current_git: Option<&GitState>,
+    memory_budget: usize,
+) -> Result<Brief> {
     let checkpoints = store.checkpoints_latest(project, 5).await?;
     let mut active_runs = vec![];
     for run in store.run_list(Some(project), Some(RunStatus::Running), 10).await? {
         active_runs.push(store.run_get(&run.id).await?);
     }
-    let memories = store
-        .memory_search(MemoryQuery {
-            project: Some(project.into()),
-            limit: Some(50),
-            user: user.map(String::from),
-            ..Default::default()
-        })
-        .await?;
     let recent_events = store.events_recent(project, None, 100).await?;
+    let focus = focus_text(store, project, checkpoints.first()).await?;
+    let (memories, omitted) =
+        select_memories(store, project, user, focus.as_deref(), memory_budget, &recent_events).await?;
 
     let git_warnings = match (checkpoints.first().and_then(|c| c.git.as_ref()), current_git) {
         (Some(saved), Some(current)) => saved.drift(current),
         _ => vec![],
     };
-    let markdown = render(project, &checkpoints, &active_runs, &memories, &recent_events, &git_warnings);
+    let markdown = render(project, &checkpoints, &active_runs, &memories, omitted, &recent_events, &git_warnings);
     Ok(Brief { project: project.into(), checkpoints, active_runs, memories, recent_events, git_warnings, markdown })
+}
+
+/// What the current work is about: the latest checkpoint's goal, next steps, blockers and files, plus
+/// the latest prompt when it is newer than that checkpoint (or there is no checkpoint).
+async fn focus_text(store: &Store, project: &str, latest: Option<&Checkpoint>) -> Result<Option<String>> {
+    let mut parts: Vec<String> = vec![];
+    if let Some(c) = latest {
+        parts.push(c.goal.clone());
+        parts.extend(c.next.iter().chain(&c.blockers).chain(&c.files).cloned());
+    }
+    let prompt = store.events_recent_kind(project, None, "prompt", 1).await?.into_iter().next();
+    if let Some(e) = prompt.filter(|e| latest.is_none_or(|c| e.created_at > c.created_at)) {
+        let full = e.data.as_ref().and_then(|d| d.get("text")).and_then(|t| t.as_str());
+        parts.push(full.unwrap_or(&e.content).to_owned());
+    }
+    let text: String = parts.join(" ").chars().take(FOCUS_CHARS).collect();
+    Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Rendered size of a memory's bullet in the Memory section (what the budget counts).
+fn memory_cost(m: &Memory, events: &[Event]) -> usize {
+    m.content.chars().count() + stale_note(m, events).chars().count() + 16
+}
+
+/// Pick the memories to show and how many candidates were left out. Order of priority: preferences, then
+/// memories matching the focus (best score first), then the rest by recency; the budget cuts the tail.
+/// Without focus text this is the most recent memories, as before.
+async fn select_memories(
+    store: &Store,
+    project: &str,
+    user: Option<&str>,
+    focus: Option<&str>,
+    budget: usize,
+    events: &[Event],
+) -> Result<(Vec<Memory>, usize)> {
+    let query = |query: Option<String>, limit: i64| MemoryQuery {
+        query,
+        project: Some(project.into()),
+        limit: Some(limit),
+        user: user.map(String::from),
+        ..Default::default()
+    };
+    let (candidates, scored) = match focus {
+        None => (store.memory_search(query(None, RECENT_LIMIT)).await?, vec![]),
+        Some(f) => (
+            store.memory_search(query(None, CANDIDATES)).await?,
+            store.memory_search_ranked(query(Some(f.into()), CANDIDATES)).await?,
+        ),
+    };
+    let mut ordered: Vec<&Memory> = candidates.iter().filter(|m| m.kind == MemoryKind::Preference).collect();
+    ordered.extend(scored.iter().filter(|(m, s)| *s > 0.0 && m.kind != MemoryKind::Preference).map(|(m, _)| m));
+    for m in &candidates {
+        if !ordered.iter().any(|o| o.id == m.id) {
+            ordered.push(m);
+        }
+    }
+
+    let mut shown = vec![];
+    let mut used = 0;
+    for m in &ordered {
+        let cost = memory_cost(m, events);
+        if m.kind != MemoryKind::Preference && used + cost > budget {
+            break;
+        }
+        used += cost;
+        shown.push((*m).clone());
+    }
+    let omitted = ordered.len() - shown.len();
+    Ok((shown, omitted))
 }
 
 fn ago(ts: Millis) -> String {
@@ -159,6 +242,7 @@ fn render(
     checkpoints: &[Checkpoint],
     runs: &[RunWithSteps],
     memories: &[Memory],
+    omitted: usize,
     events: &[Event],
     git_warnings: &[String],
 ) -> String {
@@ -248,6 +332,12 @@ fn render(
     if !memories.is_empty() {
         let _ = writeln!(o, "## Memory");
         o.push_str(&memory_groups(memories, events));
+        if omitted > 0 {
+            let _ = writeln!(
+                o,
+                "_{omitted} more memories not shown: use the memory_search tool or `memdusa recall <query>` to see them._"
+            );
+        }
         o.push('\n');
     }
 

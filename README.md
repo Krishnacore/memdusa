@@ -400,6 +400,7 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [x] Transcript import (Claude Code, Codex, pi; OpenCode not yet)
 - [x] Ranked full-text memory search
 - [x] Relevant memories injected on each prompt
+- [x] Task-aware brief: memories ranked by the latest checkpoint/prompt, preferences always kept, 4,000-character budget
 - [ ] **Easy installation on every platform** (today: download a release archive, `cargo install`, or Docker)
   - ✓ macOS/Linux: a Homebrew tap (`brew install krishnacore/tap/memdusa`) whose formula the release workflow updates
     automatically (version, URLs, SHA-256 per platform); later, a homebrew-core submission (not done yet)
