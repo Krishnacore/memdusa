@@ -87,7 +87,7 @@ impl Harness {
             ],
             Self::Cursor => vec![
                 // sessionStart is fire-and-forget: the agent doesn't wait for it. Keep the installed
-                // timeout close to the hook's 2s brief budget so a stalled hook can't linger into the session.
+                // timeout just above the hook's 4 s brief budget so a stalled hook can't linger into the session.
                 hook("sessionStart", SessionStart, None, 5),
                 hook("beforeSubmitPrompt", UserPromptSubmit, None, 5),
                 hook("afterFileEdit", PostToolUse, None, 5),
