@@ -264,6 +264,17 @@ fn write_export(text: &str, output: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `remember` did: a new memory, a near-duplicate updated in place, or an identical one refreshed.
+fn saved_line(m: &model::Memory) -> String {
+    if m.merged {
+        format!("updated existing {} (near-duplicate, newer wording kept)", m.id)
+    } else if m.updated_at != m.created_at {
+        format!("already saved {} (refreshed)", m.id)
+    } else {
+        format!("saved {}", m.id)
+    }
+}
+
 fn print_import(r: &transfer::ImportReport) {
     println!(
         "imported {} memories, {} events, {} checkpoints, {} runs ({} steps); skipped {} existing",
@@ -507,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
                     user: None,
                 })
                 .await?;
-            println!("saved {}", m.id);
+            println!("{}", saved_line(&m));
         }
         Cmd::Recall { query } => {
             for m in store.memory_search(MemoryQuery { query, project, ..Default::default() }).await? {
@@ -650,7 +661,7 @@ async fn run_remote(
                 source: Some("cli".into()),
                 user: None, // the server sets it from the key
             };
-            println!("saved {}", client()?.memory_save(&m).await?.id);
+            println!("{}", saved_line(&client()?.memory_save(&m).await?));
         }
         Cmd::Recall { query } => {
             for m in client()?.memory_search(&MemoryQuery { query, project, ..Default::default() }).await? {
