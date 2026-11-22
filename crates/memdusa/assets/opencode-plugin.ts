@@ -23,6 +23,17 @@ function logError(what: string, err?: unknown) {
   } catch {}
 }
 
+/**
+ * The environment for `memdusa hook`. The harness may run plugins in a long-lived shared process whose environment
+ * comes from whoever started it first (OpenCode's background service does), so a stale MEMDUSA_PROJECT there would
+ * file every session under the wrong project. The payload's `cwd` is the reliable source: drop the variable.
+ */
+function hookEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  delete env.MEMDUSA_PROJECT
+  return env
+}
+
 /** Run `memdusa hook <event>` with a canonical payload; resolves to its JSON output (or null). Never throws. */
 function memdusa(event: string, payload: Record<string, unknown>): Promise<any> {
   return new Promise((resolve) => {
@@ -35,7 +46,7 @@ function memdusa(event: string, payload: Record<string, unknown>): Promise<any> 
       }
     }
     try {
-      const child = spawn(BIN, ["hook", event, "--agent", AGENT__MEMDUSA_EXTRA_ARGS__], { stdio: ["pipe", "pipe", "ignore"] })
+      const child = spawn(BIN, ["hook", event, "--agent", AGENT__MEMDUSA_EXTRA_ARGS__], { stdio: ["pipe", "pipe", "ignore"], env: hookEnv() })
       const timer = setTimeout(() => {
         logError(`hook ${event} timed out`)
         child.kill()

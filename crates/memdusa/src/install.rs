@@ -137,8 +137,25 @@ fn db_args(db: Option<&str>) -> Vec<String> {
     db.map(|u| vec!["--database-url".to_owned(), u.to_owned()]).unwrap_or_default()
 }
 
+/// Cursor silently ignores its whole `.cursor/hooks.json` when any command contains `://` (verified with
+/// cursor-agent, November 2026), so SQLite URLs are written in the equivalent `sqlite:<path>` form there.
+/// Other URLs can't avoid `://`: the installer warns instead (see [`cursor_db_note`]).
+fn cursor_safe_db(db: &str) -> String {
+    db.strip_prefix("sqlite://").map_or_else(|| db.to_owned(), |path| format!("sqlite:{path}"))
+}
+
+/// The warning for a Cursor install whose database URL still contains `://` after [`cursor_safe_db`].
+fn cursor_db_note(db: Option<&str>) -> Option<String> {
+    db.map(cursor_safe_db).filter(|u| u.contains("://")).map(|_| {
+        "Cursor ignores every hook in .cursor/hooks.json when a command contains `://`, so the database URL can't \
+         be written there: use `memdusa login <server>` (stored in ~/.memdusa) or a SQLite database instead."
+            .to_owned()
+    })
+}
+
 pub(crate) fn hook_command(bin: &str, h: Harness, event: crate::hooks::HookEvent, db: Option<&str>) -> String {
-    let flag = db_flag(db);
+    let cursor_db = (h == Harness::Cursor).then(|| db.map(cursor_safe_db)).flatten();
+    let flag = db_flag(cursor_db.as_deref().or(db));
     match h {
         Harness::ClaudeCode => format!("{} hook {}{flag}", shell_quote(bin), event.arg()),
         _ => format!("{} hook {} --harness {}{flag}", shell_quote(bin), event.arg(), h.agent()),
@@ -495,7 +512,8 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     }
 
     if !opts.uninstall && !opts.dry_run {
-        for note in notes(h)? {
+        let cursor_note = (h == Harness::Cursor).then(|| cursor_db_note(db)).flatten();
+        for note in notes(h)?.into_iter().chain(cursor_note) {
             println!("\nnote: {note}");
         }
         println!("\nDone. Start a new session: it will load the resume brief automatically.");
@@ -619,7 +637,8 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
         }
     }
     if !opts.uninstall && !opts.dry_run {
-        for note in notes(h)? {
+        let cursor_note = (h == Harness::Cursor).then(|| cursor_db_note(db)).flatten();
+        for note in notes(h)?.into_iter().chain(cursor_note) {
             println!("\nnote: {note}");
         }
         println!("\nDone. Start a new session: it will load the resume brief automatically.");
@@ -928,6 +947,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_hook_commands_never_contain_a_url_scheme() {
+        use crate::hooks::HookEvent;
+        // Cursor drops its whole hooks.json when a command contains `://`
+        let cmd = hook_command("/b/memdusa", Harness::Cursor, HookEvent::SessionStart, Some("sqlite:///x/m.db"));
+        assert!(cmd.ends_with(" --database-url sqlite:/x/m.db"), "{cmd}");
+        assert!(!cmd.contains("://"), "{cmd}");
+        // other harnesses keep the URL as given
+        let claude = hook_command("/b/memdusa", Harness::ClaudeCode, HookEvent::SessionStart, Some("sqlite:///x/m.db"));
+        assert!(claude.ends_with(" --database-url sqlite:///x/m.db"), "{claude}");
+        // a URL that can't avoid `://` gets a warning instead
+        assert!(cursor_db_note(Some("sqlite:///x/m.db")).is_none());
+        assert!(cursor_db_note(None).is_none());
+        assert!(cursor_db_note(Some("postgres://u@h/db")).is_some_and(|n| n.contains("memdusa login")));
+    }
+
+    #[test]
     fn database_url_is_written_into_every_harness_format() {
         const URL: &str = "sqlite:///x/memdusa.db";
         let flag = " --database-url sqlite:///x/memdusa.db";
@@ -943,7 +978,9 @@ mod tests {
             assert_eq!(merge_hooks(v, h, BIN, None, true).unwrap(), json!({}), "{h:?} uninstall");
         }
         let cur = merge_hooks(json!({}), Harness::Cursor, BIN, Some(URL), false).unwrap();
-        assert!(cur["hooks"]["stop"][0]["command"].as_str().unwrap().ends_with(&format!("--harness cursor{flag}")));
+        // Cursor gets the `sqlite:<path>` form: it drops hooks.json when a command contains `://`
+        let cur_cmd = cur["hooks"]["stop"][0]["command"].as_str().unwrap();
+        assert!(cur_cmd.ends_with("--harness cursor --database-url sqlite:/x/memdusa.db"), "{cur_cmd}");
         let agy = merge_hooks(json!({}), Harness::Antigravity, BIN, Some(URL), false).unwrap();
         assert!(agy["memdusa"]["Stop"][0]["command"].as_str().unwrap().ends_with(flag));
 
@@ -988,7 +1025,7 @@ mod tests {
     /// Event registrations verified against the real tools (OpenCode 2.2.6, pi 0.73.1; fixtures in tests/fixtures/harness).
     #[test]
     fn plugin_templates_register_the_events_that_really_fire() {
-        let oc = plugin_source(Harness::OpenCode, BIN);
+        let oc = plugin_source(Harness::OpenCode, BIN, None);
         for needle in [
             r#"ctx.session.hook("prompt""#,
             r#"ctx.tool.hook("execute.after""#,
@@ -998,11 +1035,12 @@ mod tests {
             "last_assistant_message",
             "event.background?.length", // `background: []` is truthy
             "plugin.log",
+            "delete env.MEMDUSA_PROJECT", // the shared service's env may carry a stale project
         ] {
             assert!(oc.contains(needle), "OpenCode plugin lacks {needle}");
         }
         assert!(!oc.contains("if (event.background) return"));
-        let pi = plugin_source(Harness::Pi, BIN);
+        let pi = plugin_source(Harness::Pi, BIN, None);
         for needle in [
             r#"on("agent_end""#,
             r#"on("agent_before_settle""#,
@@ -1010,6 +1048,7 @@ mod tests {
             r#"on("before_agent_start""#,
             "last_assistant_message",
             "plugin.log",
+            "delete env.MEMDUSA_PROJECT",
         ] {
             assert!(pi.contains(needle), "pi extension lacks {needle}");
         }
