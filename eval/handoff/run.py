@@ -5,9 +5,11 @@
 """Handoff eval: does memdusa let agent B continue agent A's interrupted work?
 
 For each trial:
-  1. Agent A starts the scenario's task (with memdusa hooks + MCP) and is
-     interrupted after --interrupt-after seconds, like an abandoned or crashed
-     session.
+  1. Agent A starts the scenario's task (with memdusa hooks + MCP). By default it
+     is interrupted mid-task (after N edits / --interrupt-after seconds); a
+     scenario with "a_mode": "complete" instead lets A finish its turn so its
+     last message is captured by the Stop hook. A scenario's "seed_memories" are
+     written to the trial database before A starts.
   2. The repo (and memdusa's database) are snapshotted.
   3. Agent B gets only "continue where the previous session left off", once
      per condition, from the same snapshot:
@@ -111,6 +113,23 @@ def claude_config(trial: Path, memdusa: Path | None, env: dict, agent: str) -> t
         }
     mcp.write_text(json.dumps({"mcpServers": servers}, indent=2))
     return settings, mcp
+
+
+def seed_memories(memdusa: Path, trial: Path, scenario: dict, env: dict) -> int:
+    """Write a scenario's `seed_memories` into this trial's memdusa database before A runs.
+
+    They live only in the database, which the memdusa condition of B snapshots.
+    Nothing is written into the repo, so the baseline condition cannot see them.
+    """
+    seeds = scenario.get("seed_memories", [])
+    for m in seeds:
+        cmd = [str(memdusa), "--database-url", env["MEMDUSA_DATABASE_URL"],
+               "--project", env["MEMDUSA_PROJECT"], "remember", m["content"],
+               "--kind", m.get("kind", "fact")]
+        if m.get("scope", "project") == "global":
+            cmd.append("--global")
+        sh(cmd, cwd=trial / "repo", env=env)
+    return len(seeds)
 
 
 # ---------------------------------------------------------------- running an agent
@@ -271,11 +290,18 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     prepare(scenario_dir, trial)
     name = scenario["name"]
 
-    # --- A: starts the task, gets interrupted
+    # --- A: starts the task; "interrupt" stops it mid-task, "complete" lets it finish
+    a_mode = scenario.get("a_mode", "interrupt")
+    stop_edits = None if a_mode == "complete" else args.interrupt_after_edits
     env_a = agent_env(trial, name, "agent-a")
     settings, mcp = claude_config(trial, memdusa, env_a, "agent-a")
+    a_seeded = seed_memories(memdusa, trial, scenario, env_a)
+    # --interrupt-after is only a safety timer here (the Stop hook records A's last words)
     a = run_claude(scenario["task_prompt"], trial / "repo", env_a, settings, mcp, args.model, args.interrupt_after,
-                   trial / "agent-a.jsonl", memdusa=True, stop_after_edits=args.interrupt_after_edits)
+                   trial / "agent-a.jsonl", memdusa=True, stop_after_edits=stop_edits)
+    a["mode"] = a_mode
+    a["ended_naturally"] = not a["killed"]
+    a["seed_memories"] = a_seeded
     repo = trial / "repo"
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "-c", "user.email=eval@memdusa", "-c", "user.name=eval", "commit", "-qm", "A-state", "--allow-empty"],
@@ -321,8 +347,12 @@ def summarize(trials: list[dict], conditions: list[str]) -> str:
             f"| {fmt(mean('cost_usd'), '${:.2f}')} | {fmt(mean('memdusa_calls'), '{:.1f}')} |"
         )
     a_tests = statistics.mean(t["a"]["hidden_tests"]["passed"] / max(t["a"]["hidden_tests"]["total"], 1) for t in trials)
+    a_mode = trials[0]["a"].get("mode", "interrupt") if trials else "interrupt"
+    natural = sum(1 for t in trials if t["a"].get("ended_naturally", False))
+    a_line = (f"Agent A (complete mode, ended naturally in {natural}/{len(trials)} trials) "
+              if a_mode == "complete" else "Agent A (interrupted) ")
     return "\n".join([
-        f"Agent A (interrupted) left hidden tests at {a_tests:.0%} on average.\n",
+        f"{a_line}left hidden tests at {a_tests:.0%} on average.\n",
         "| B condition | hidden tests | runs with constraint violations | rework | turns | tool calls before first edit | cost | memdusa calls |",
         "|---|---|---|---|---|---|---|---|",
         *rows,
@@ -337,13 +367,17 @@ def regrade(out: Path, scenario_dir: Path, scenario: dict, conditions: list[str]
         a = log_stats(trial / "agent-a.jsonl")
         a.update(killed=a["result"] is None, files_changed=changed_files(repo, "initial", "A-state"),
                  hidden_tests=hidden_tests(trial, repo, scenario_dir, "after-a"))
+        a["mode"] = scenario.get("a_mode", "interrupt")
+        a["ended_naturally"] = not a["killed"]
         b = {}
         for cond in conditions:
             b_dir = trial / f"b-{cond}"
             b[cond] = {**log_stats(b_dir / "agent-b.jsonl"), **grade(b_dir, b_dir / "repo", scenario_dir, scenario, cond)}
         trials.append({"trial": int(trial.name.split("-")[1]), "a": a, "b": b})
-    (out / "results.json").write_text(json.dumps({"scenario": scenario["name"], "regraded": True, "trials": trials},
-                                                 indent=2))
+    (out / "results.json").write_text(json.dumps({"scenario": scenario["name"], "regraded": True,
+                                                  "a_mode": scenario.get("a_mode", "interrupt"),
+                                                  "seed_memories": scenario.get("seed_memories", []),
+                                                  "trials": trials}, indent=2))
     report = summarize(trials, conditions)
     (out / "report.md").write_text(f"# Handoff eval: {scenario['name']} (regraded)\n\n{report}\n")
     print(report)
@@ -377,17 +411,22 @@ def main() -> int:
     print("building memdusa…", file=sys.stderr)
     memdusa = build_memdusa()
 
+    a_mode = scenario.get("a_mode", "interrupt")
     trials = []
     for i in range(1, args.trials + 1):
-        print(f"trial {i}/{args.trials}: agent A (stopped after {args.interrupt_after_edits} edit(s)) then B × "
-              f"{args.conditions}", file=sys.stderr)
+        a_desc = (f"complete mode (timer {args.interrupt_after:g}s is a safety limit)"
+                  if a_mode == "complete" else f"stopped after {args.interrupt_after_edits} edit(s)")
+        print(f"trial {i}/{args.trials}: agent A ({a_desc}) then B × {args.conditions}", file=sys.stderr)
         trials.append(trial_run(i, args, scenario_dir, scenario, memdusa, out))
         (out / "results.json").write_text(json.dumps(
-            {"scenario": args.scenario, "model": args.model, "interrupt_after_edits": args.interrupt_after_edits,
+            {"scenario": args.scenario, "model": args.model, "a_mode": a_mode,
+             "interrupt_after_edits": args.interrupt_after_edits, "seed_memories": scenario.get("seed_memories", []),
              "trials": trials}, indent=2))
     report = summarize(trials, args.conditions)
+    a_desc = ("runs to completion (timer is a safety limit)" if a_mode == "complete"
+              else f"A interrupted after {args.interrupt_after_edits} edit(s)")
     (out / "report.md").write_text(f"# Handoff eval: {args.scenario}\n\nmodel `{args.model}`, {args.trials} trial(s), "
-                                   f"A interrupted after {args.interrupt_after_edits} edit(s)\n\n{report}\n")
+                                   f"{a_desc}\n\n{report}\n")
     print(report)
     print(f"\nfull results: {out}", file=sys.stderr)
     return 0
