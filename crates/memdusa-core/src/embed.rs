@@ -37,6 +37,10 @@ pub trait Embedder: Send + Sync {
 pub const COSINE_WEIGHT: f64 = 0.6;
 /// A memory with at least this cosine similarity to the query is a semantic hit.
 pub const COSINE_FLOOR: f32 = 0.3;
+/// A memory found by meaning alone (no lexical match) must also be within this much of the best
+/// cosine in the result set: absolute similarities differ a lot between models (unrelated text scores
+/// ~0.3-0.4 with some local models), so a fixed floor alone would let everything through.
+pub const COSINE_MARGIN: f32 = 0.08;
 /// Pairwise cosine from which two memories count as related in a memory review.
 pub const RELATED_COSINE: f32 = 0.80;
 /// Most recent memories scored semantically per search.
@@ -292,7 +296,7 @@ impl Store {
     /// With an embedder and a query the result is hybrid: `0.6 * cosine + 0.4 * lexical` (lexical
     /// relevance normalized to 0..1 within the result; a memory without a vector scores its
     /// normalized lexical relevance alone). A memory is returned when its cosine reaches
-    /// [`COSINE_FLOOR`] or the lexical search matched it. `embed_timeout` caps the one embedding call
+    /// [`COSINE_FLOOR`] (and within [`COSINE_MARGIN`] of the best match) or the lexical search matched it. `embed_timeout` caps the one embedding call
     /// for the query; on timeout or any provider error this falls back to the lexical search.
     pub async fn memory_search_scored(&self, f: MemoryQuery, embed_timeout: Option<Duration>) -> Result<Vec<Scored>> {
         if let (Some(e), Some(text)) = (&self.embedder, f.query.as_deref())
@@ -351,9 +355,11 @@ impl Store {
             }
         }
 
+        let best = entries.iter().filter_map(|e| e.cosine).fold(f32::MIN, f32::max);
+        let cutoff = COSINE_FLOOR.max(best - COSINE_MARGIN);
         let mut out: Vec<Scored> = entries
             .into_iter()
-            .filter(|e| e.lexical.is_some() || e.cosine.is_some_and(|c| c >= COSINE_FLOOR))
+            .filter(|e| e.lexical.is_some() || e.cosine.is_some_and(|c| c >= cutoff))
             .map(|e| {
                 let lexical = e.lexical.unwrap_or(0.0);
                 let score = match e.cosine {
