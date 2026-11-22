@@ -595,6 +595,11 @@ fn ids(v: Vec<Memory>) -> Vec<String> {
     ids
 }
 
+/// Hits scoped to this test's own project: Postgres tests share one database with other tests' globals.
+async fn project_hits(s: &Store, p: &str, q: &str) -> Vec<Memory> {
+    s.memory_search(query(p, q)).await.unwrap().into_iter().filter(|m| m.project.as_deref() == Some(p)).collect()
+}
+
 fn sorted(mut v: Vec<&String>) -> Vec<String> {
     v.sort();
     v.into_iter().cloned().collect()
@@ -684,6 +689,33 @@ async fn search_survives_special_characters() {
             1,
             "{name}: blank query lists recent"
         );
+    }
+}
+
+#[tokio::test]
+async fn search_drops_stopwords_and_short_words() {
+    for (name, s) in stores().await {
+        let p = project();
+        let proj = Some(p.clone());
+        let release = s
+            .memory_save(mem(
+                &proj,
+                "the release workflow pushes binaries and the docker image when a tag is pushed",
+                &[],
+            ))
+            .await
+            .unwrap();
+        s.memory_save(mem(&proj, "database schema changes are versioned migrations in store.rs", &[])).await.unwrap();
+        s.memory_save(mem(&proj, "money is always stored as integer cents, never floats", &[])).await.unwrap();
+
+        // a question full of glue words must not match memories that merely contain "the"/"is"
+        assert!(project_hits(&s, &p, "what color is the sky").await.is_empty(), "{name}: stopwords matched");
+        assert!(project_hits(&s, &p, "the is are was were").await.is_empty(), "{name}: all-stopword query");
+        // the meaningful words still find the right memory
+        assert_eq!(ids(project_hits(&s, &p, "release docker").await), vec![release.id], "{name}");
+        // edge case: no searchable terms means no results, not a fallback to the raw words
+        assert!(project_hits(&s, &p, "is it").await.is_empty(), "{name}: stopword/short-word query");
+        assert!(project_hits(&s, &p, "a an").await.is_empty(), "{name}: short-word query");
     }
 }
 
