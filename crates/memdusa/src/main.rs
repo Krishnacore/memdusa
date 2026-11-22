@@ -440,8 +440,19 @@ enum KeyCmd {
     Revoke { key: String },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Stack for the main thread and the runtime's workers. Windows gives the main thread only 1 MB
+/// (8 MB on macOS/Linux), and the CLI's async state machine outgrew that ("thread 'main' has
+/// overflowed its stack" in CI), so run everything on threads with an explicit, uniform stack.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    let worker = std::thread::Builder::new().name("memdusa".into()).stack_size(STACK_SIZE).spawn(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(STACK_SIZE).build()?.block_on(run())
+    })?;
+    worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // stdout is the MCP channel in stdio mode: logs must go to stderr.
