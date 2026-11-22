@@ -303,6 +303,7 @@ memdusa status         # "semantic search: on (model ..., 12/12 memories embedde
 | `MEMDUSA_EMBED_URL` | Base URL of the API (`POST {url}/embeddings`). Unset = semantic search off |
 | `MEMDUSA_EMBED_MODEL` | Model name (default `text-embedding-3-small`). Changing it re-embeds on the next `memdusa embed` |
 | `MEMDUSA_EMBED_API_KEY` | Bearer token. Falls back to `OPENAI_API_KEY`, but only when the URL host is `api.openai.com` |
+| `MEMDUSA_EMBED_RECALL_MIN` | Similarity (0..1) from which a memory is added to a prompt by meaning alone, without sharing words with it. Default `0.5`. Scores differ by model: with `nomic-embed-text`, related text scores about 0.45-0.6 and unrelated 0.3-0.42; OpenAI's `text-embedding-3-*` score lower overall, so try `0.35`-`0.4` there. Too low and every prompt pulls in loosely related memories |
 
 How it works:
 

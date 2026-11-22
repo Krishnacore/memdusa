@@ -433,9 +433,14 @@ const RECALL_MAX: usize = 5;
 const RECALL_CANDIDATES: i64 = 25;
 /// Longest the prompt waits for the query embedding (semantic search), then recall is lexical.
 const RECALL_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-/// Cosine similarity from which a memory is recalled without sharing words with the prompt
-/// (stricter than the search floor: recall runs on every prompt).
-const RECALL_COSINE: f32 = 0.55;
+/// Default cosine similarity from which a memory is recalled without sharing words with the prompt
+/// (stricter than the search floor: recall runs on every prompt). Similarities differ between models,
+/// so `MEMDUSA_EMBED_RECALL_MIN` overrides it (read where the hook runs: the server in remote mode).
+const RECALL_COSINE: f32 = 0.5;
+
+fn recall_cosine() -> f32 {
+    std::env::var("MEMDUSA_EMBED_RECALL_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(RECALL_COSINE)
+}
 /// Prompt terms searched for.
 const RECALL_TERMS: usize = 16;
 /// Longest memory shown, in characters.
@@ -493,12 +498,13 @@ async fn recall(ctx: &Ctx<'_>, prompt: &str) -> Result<Option<String>> {
         }
     }
 
+    let min_cosine = recall_cosine();
     let picked: Vec<&Memory> = candidates
         .iter()
         .filter(|s| !shown.contains(&s.memory.id))
         .filter(|s| {
             // a close embedding match is relevant even when the words differ
-            if s.cosine.is_some_and(|c| c >= RECALL_COSINE) {
+            if s.cosine.is_some_and(|c| c >= min_cosine) {
                 return true;
             }
             let m = &s.memory;

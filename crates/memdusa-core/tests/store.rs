@@ -1278,12 +1278,23 @@ async fn brief_nudges_to_review_from_three_flagged_memories() {
             content: format!("src/{f}_mod.rs"),
             ..Default::default()
         };
+        // Postgres tests share one database: other tests' global memories can be flagged too, so
+        // count relative to what is flagged before this test's files change
+        let flagged = |md: &str| -> usize {
+            md.lines()
+                .find(|l| l.contains(NUDGE))
+                .and_then(|l| l.trim_start_matches('_').split_whitespace().next()?.parse().ok())
+                .unwrap_or(0)
+        };
+        let base = flagged(&brief::build(&s, &p, None, None, None).await.unwrap().markdown);
         s.event_append(change("a")).await.unwrap();
         s.event_append(change("b")).await.unwrap();
         let two = brief::build(&s, &p, None, None, None).await.unwrap();
-        assert!(!two.markdown.contains(NUDGE), "{name}: only 2 flagged\n{}", two.markdown);
+        if base == 0 {
+            assert!(!two.markdown.contains(NUDGE), "{name}: only 2 flagged\n{}", two.markdown);
+        }
         s.event_append(change("c")).await.unwrap();
         let three = brief::build(&s, &p, None, None, None).await.unwrap();
-        assert!(three.markdown.contains("3 memories may need consolidation"), "{name}\n{}", three.markdown);
+        assert!(flagged(&three.markdown) >= base + 3, "{name}\n{}", three.markdown);
     }
 }

@@ -75,7 +75,9 @@ fn fact(p: &str, content: &str) -> NewMemory {
 }
 
 fn q(p: &str, text: &str) -> MemoryQuery {
-    MemoryQuery { project: Some(p.into()), query: Some(text.into()), ..Default::default() }
+    // a high limit: Postgres tests share one database, and other tests' global memories must not
+    // push this test's memories out of the results
+    MemoryQuery { project: Some(p.into()), query: Some(text.into()), limit: Some(200), ..Default::default() }
 }
 
 fn mine(p: &str, found: Vec<Memory>) -> Vec<String> {
@@ -189,7 +191,10 @@ async fn embedding_follows_content_changes() {
 
 #[tokio::test]
 async fn backfill_fills_gaps_and_follows_model_changes() {
-    for (name, base) in stores().await {
+    // Backfill embeds every memory in the database. On the shared Postgres test database it would
+    // re-embed other tests' memories with this test's models while they run, so only the private
+    // SQLite store runs it.
+    for (name, base) in stores().await.into_iter().filter(|(name, _)| *name == "sqlite") {
         let p = project();
         let old = base.memory_save(fact(&p, "we ship the artifacts on friday")).await.unwrap();
         assert!(base.memory_embedding(&old.id).await.unwrap().is_none(), "{name}: no embedder, no vector");
