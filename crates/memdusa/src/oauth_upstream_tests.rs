@@ -280,6 +280,8 @@ async fn spawn(github: Option<GitHubConfig>, google: Option<GoogleConfig>) -> Ha
         absolute_secs: 365 * 24 * 3600,
         code_secs: 600,
         txn_secs: 600,
+        device_secs: 600,
+        device_interval_secs: 5,
         upstream: UpstreamConfig { github: gh, google: g },
     };
     let opts = HttpOptions {

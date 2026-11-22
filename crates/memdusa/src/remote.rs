@@ -1,31 +1,43 @@
 //! REST client for a remote `memdusa serve`, used by hooks and the CLI in
 //! remote mode.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::Context;
 use memdusa_core::model::{
     ApiKey, AuditEvent, AuditQuery, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, ProjectGrant, Role,
     RunWithSteps, Step, User,
 };
-use reqwest::{Method, RequestBuilder};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::config::Remote;
+use crate::config::{self, OAuthTokens, Remote};
 use crate::hooks::{HookBatchItem, HookBatchResponse, HookEvent, HookRequest, HookResponse};
 
 /// A failed call to the server. `retryable` means the server couldn't be
 /// reached or had a transient problem, as opposed to rejecting the request.
+/// `needs_login` means the OAuth grant is gone: hooks must spool the event and
+/// exit successfully instead of failing the harness.
 #[derive(Debug)]
 pub struct RemoteError {
     pub retryable: bool,
+    pub needs_login: bool,
     pub message: String,
 }
 
 impl RemoteError {
     pub fn unreachable(message: impl Into<String>) -> Self {
-        Self { retryable: true, message: message.into() }
+        Self { retryable: true, needs_login: false, message: message.into() }
+    }
+
+    fn auth(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true, needs_login: true, message: format!("{} — run `memdusa login` again", message.into())
+        }
     }
 }
 
@@ -37,9 +49,16 @@ impl std::fmt::Display for RemoteError {
 
 impl std::error::Error for RemoteError {}
 
+enum Auth {
+    ApiKey(Option<String>),
+    OAuth(OAuthTokens),
+}
+
 pub struct Client {
     http: reqwest::Client,
-    remote: Remote,
+    url: String,
+    /// A rotated token is written back here so later calls in this process use it.
+    auth: Mutex<Auth>,
 }
 
 impl Client {
@@ -49,33 +68,125 @@ impl Client {
             .connect_timeout(timeout.min(Duration::from_secs(3)))
             .user_agent(concat!("memdusa/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self { http, remote })
+        let url = remote.url.clone();
+        let auth = match remote.oauth {
+            Some(tokens) => Auth::OAuth(tokens),
+            None => Auth::ApiKey(remote.token),
+        };
+        Ok(Self { http, url, auth: Mutex::new(auth) })
+    }
+
+    /// Build from the current config file: another hook may have rotated the
+    /// refresh token since this process started.
+    pub fn from_config(timeout: Duration) -> anyhow::Result<Self> {
+        let remote = config::remote()?.context("not logged in to a remote server; run `memdusa login`")?;
+        Self::new(remote, timeout)
+    }
+
+    fn bearer(&self) -> Option<String> {
+        match &*self.auth.lock().expect("auth lock poisoned") {
+            Auth::ApiKey(token) => token.clone(),
+            Auth::OAuth(tokens) => Some(tokens.access_token.clone()),
+        }
+    }
+
+    fn is_oauth(&self) -> bool {
+        matches!(&*self.auth.lock().expect("auth lock poisoned"), Auth::OAuth(_))
+    }
+
+    fn near_expiry(&self) -> bool {
+        match &*self.auth.lock().expect("auth lock poisoned") {
+            Auth::OAuth(tokens) => {
+                tokens.expires_at <= memdusa_core::model::now_ms() + crate::cli_auth::REFRESH_SKEW_MS
+            }
+            Auth::ApiKey(_) => false,
+        }
+    }
+
+    /// Refresh once under a cross-process lock and update our in-memory token.
+    async fn refresh(&self) -> Result<String, RemoteError> {
+        let token =
+            crate::cli_auth::access_token(&self.url, true).await.map_err(|e| RemoteError::auth(e.to_string()))?;
+        if let Ok(Some(remote)) = config::remote()
+            && let Some(tokens) = remote.oauth
+        {
+            *self.auth.lock().expect("auth lock poisoned") = Auth::OAuth(tokens);
+        }
+        Ok(token)
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        let req = self.http.request(method, format!("{}{path}", self.remote.url));
-        match &self.remote.token {
-            Some(t) => req.bearer_auth(t),
-            None => req,
+        let mut req = self.http.request(method, format!("{}{path}", self.url));
+        if let Some(token) = self.bearer() {
+            req = req.bearer_auth(token);
         }
+        req
+    }
+
+    async fn ensure_success(&self, resp: Response) -> Result<Response, RemoteError> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let url = &self.url;
+        let body: Value = resp.json().await.unwrap_or_default();
+        let msg = body.get("error").and_then(Value::as_str).unwrap_or("no details");
+        Err(RemoteError {
+            // the server is struggling (or rate limiting): try again later
+            retryable: status.is_server_error() || status.as_u16() == 429,
+            needs_login: false,
+            message: format!("{url} returned {status}: {msg}"),
+        })
+    }
+
+    /// Replace (not append to) the old bearer header. `bearer_auth` appends,
+    /// which would leave the stale token in the retried request too.
+    fn with_bearer(&self, req: RequestBuilder, token: &str) -> Result<reqwest::Request, RemoteError> {
+        let mut request = req.build().map_err(|e| RemoteError::unreachable(e.to_string()))?;
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| RemoteError::unreachable(format!("bad access token header: {e}")))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+        Ok(request)
+    }
+
+    /// Refresh before an expired token is even used, and retry once on 401.
+    async fn send_raw(&self, req: RequestBuilder) -> Result<Response, RemoteError> {
+        let retry = req.try_clone(); // None only for streaming bodies (we never use those)
+        if self.near_expiry() {
+            let token = self.refresh().await?;
+            let request = self.with_bearer(retry.unwrap_or(req), &token)?;
+            let resp = self
+                .http
+                .execute(request)
+                .await
+                .map_err(|e| RemoteError::unreachable(format!("contacting {}: {e}", self.url)))?;
+            return self.ensure_success(resp).await;
+        }
+        let resp = req.send().await.map_err(|e| RemoteError::unreachable(format!("contacting {}: {e}", self.url)))?;
+        if resp.status() == StatusCode::UNAUTHORIZED
+            && self.is_oauth()
+            && let Some(retry_req) = retry
+        {
+            let token = self.refresh().await?;
+            let request = self.with_bearer(retry_req, &token)?;
+            let resp = self
+                .http
+                .execute(request)
+                .await
+                .map_err(|e| RemoteError::unreachable(format!("contacting {}: {e}", self.url)))?;
+            return self.ensure_success(resp).await;
+        }
+        self.ensure_success(resp).await
     }
 
     async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, RemoteError> {
-        let url = &self.remote.url;
-        let resp = req.send().await.map_err(|e| RemoteError::unreachable(format!("contacting {url}: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or_default();
-            let msg = body.get("error").and_then(Value::as_str).unwrap_or("no details");
-            return Err(RemoteError {
-                // the server is struggling (or rate limiting): try again later
-                retryable: status.is_server_error() || status.as_u16() == 429,
-                message: format!("{url} returned {status}: {msg}"),
-            });
-        }
-        resp.json()
-            .await
-            .map_err(|e| RemoteError { retryable: false, message: format!("bad response from {url}: {e}") })
+        let url = self.url.clone();
+        let resp = self.send_raw(req).await?;
+        resp.json().await.map_err(|e| RemoteError {
+            retryable: false,
+            needs_login: false,
+            message: format!("bad response from {url}: {e}"),
+        })
     }
 
     pub async fn whoami(&self) -> anyhow::Result<Value> {
@@ -185,13 +296,8 @@ impl Client {
         if let Some(p) = project {
             req = req.query(&[("project", p)]);
         }
-        let resp = req.send().await.map_err(|e| RemoteError::unreachable(e.to_string()))?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            anyhow::bail!("{} returned {status}: {text}", self.remote.url);
-        }
-        Ok(text)
+        let resp = self.send_raw(req).await?;
+        Ok(resp.text().await?)
     }
 
     pub async fn import(&self, jsonl: &str) -> anyhow::Result<memdusa_core::transfer::ImportReport> {

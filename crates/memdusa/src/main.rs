@@ -1,4 +1,5 @@
 mod adapters;
+mod cli_auth;
 mod config;
 mod embedder;
 mod hermes;
@@ -148,6 +149,12 @@ enum Cmd {
         /// Bearer token (as set with `memdusa serve --token`).
         #[arg(long, env = "MEMDUSA_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Sign in with a browser: authorization code + PKCE on a loopback redirect.
+        #[arg(long)]
+        browser: bool,
+        /// Sign in without a browser (SSH/headless) using a short user code.
+        #[arg(long, conflicts_with = "browser")]
+        device: bool,
     },
     /// Forget the remote server and go back to the local database.
     Logout,
@@ -560,7 +567,26 @@ async fn run() -> anyhow::Result<()> {
         Cmd::SelfUpdate { version, check } => {
             return self_update::run(version, check).await;
         }
-        Cmd::Login { url, token } => {
+        Cmd::Login { url, token, browser, device } => {
+            if browser || device {
+                let timeout = std::env::var("MEMDUSA_LOGIN_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .map(Duration::from_secs)
+                    .unwrap_or(Duration::from_secs(300));
+                let tokens = if browser {
+                    cli_auth::browser_login(
+                        &url,
+                        &cli_auth::BrowserOptions { opener: cli_auth::BrowserOpener::System, timeout },
+                    )
+                    .await?
+                } else {
+                    cli_auth::device_login(&url, &cli_auth::DeviceOptions { timeout, on_code: None }).await?
+                };
+                print_login(&config::Remote::new(&url, None)?.url, &tokens);
+                return Ok(());
+            }
             let r = config::Remote::new(&url, token)?;
             let info = remote::Client::new(r.clone(), Duration::from_secs(10))?
                 .whoami()
@@ -578,6 +604,11 @@ async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::Logout => {
+            if let Some(r) = config::remote()?
+                && r.oauth.is_some()
+            {
+                cli_auth::logout(&r.url).await?;
+            }
             config::save_remote(None)?;
             println!("logged out; using the local database");
             return Ok(());
@@ -848,33 +879,14 @@ async fn run_remote(
     project: Option<String>,
     explicit_project: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = || remote::Client::new(r.clone(), Duration::from_secs(15));
+    // Re-read config each time: a previous call (or another hook process) may
+    // have rotated the refresh token since this command started.
+    let client = || remote::Client::from_config(Duration::from_secs(15));
     match cmd {
         Cmd::Status => {
-            // Still useful when the server is down: that's when the queue matters.
-            match client()?.whoami().await {
-                Ok(info) => {
-                    println!(
-                        "mode: remote {} (server v{}, {}, reachable)",
-                        r.url,
-                        info["version"].as_str().unwrap_or("?"),
-                        info["backend"].as_str().unwrap_or("?")
-                    );
-                    println!("identity: {}", describe_identity(&info));
-                    let sem = &info["semantic"];
-                    println!(
-                        "{} (server side)",
-                        semantic_line(
-                            sem["model"].as_str(),
-                            sem["embedded"].as_i64().unwrap_or(0),
-                            sem["total"].as_i64().unwrap_or(0)
-                        )
-                    );
-                }
-                Err(e) => println!("mode: remote {} (NOT reachable: {e})", r.url),
+            for line in status_lines(r, project.as_deref()).await? {
+                println!("{line}");
             }
-            println!("project: {}", project.as_deref().unwrap_or("<none>"));
-            println!("offline queue: {} event(s)", spool::Spool::open()?.len());
         }
         Cmd::ImportTranscript { harness, files, latest, force, dry_run } => {
             let client = client()?;
@@ -1250,7 +1262,7 @@ async fn remote_hook(
     let mut unreachable = None;
     if !spool.is_empty() {
         // a short budget, so a hanging server can't eat this hook's whole deadline
-        let flush_client = remote::Client::new(r.clone(), (deadline / 3).min(Duration::from_secs(2)))?;
+        let flush_client = remote::Client::from_config((deadline / 3).min(Duration::from_secs(2)))?;
         match spool.flush(&flush_client, &r.url).await {
             Ok(n) if n > 0 => eprintln!("memdusa: synced {n} queued event(s)"),
             Ok(_) => {}
@@ -1260,7 +1272,7 @@ async fn remote_hook(
     }
     let result = match unreachable {
         Some(e) => Err(e), // just failed to connect: don't wait for another timeout
-        None => remote::Client::new(r.clone(), deadline)?.hook(event, &req).await,
+        None => remote::Client::from_config(deadline)?.hook(event, &req).await,
     };
     match result {
         Ok(resp) => {
@@ -1275,7 +1287,9 @@ async fn remote_hook(
             let project = req.project.clone();
             if event.queueable() {
                 spool.push(&r.url, hooks::HookBatchItem { event: event.arg().into(), request: req })?;
-                eprintln!("memdusa: server unreachable, queued {} for later ({e})", event.arg());
+                let why =
+                    if e.needs_login { "sign-in expired; run `memdusa login` again" } else { "server unreachable" };
+                eprintln!("memdusa: {why}, queued {} for later ({e})", event.arg());
             }
             if let hooks::HookEvent::SessionStart = event {
                 return Ok(spool::cached_brief(&project, &e.message).unwrap_or_default());
@@ -1342,6 +1356,78 @@ fn describe_identity(whoami: &serde_json::Value) -> String {
     match whoami["user"].as_str() {
         Some(u) => format!("{u}{admin}"),
         None => format!("shared token / open server{admin}"),
+    }
+}
+
+/// Lines printed by `memdusa status` in remote mode. Kept separate from I/O so
+/// tests can assert on the "log in again" hint without capturing stdout.
+async fn status_lines(r: &config::Remote, project: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let mut lines = vec![];
+    if let Some(oauth) = &r.oauth {
+        match cli_auth::access_token(&r.url, false).await {
+            Ok(_) => {
+                let fresh = config::remote().ok().flatten().and_then(|r| r.oauth).unwrap_or_else(|| oauth.clone());
+                lines.push(format!(
+                    "sign-in: OAuth ({}), user {}, expires {}, scopes {}",
+                    fresh.method,
+                    fresh.user.as_deref().unwrap_or("<unknown>"),
+                    expires_in(fresh.expires_at),
+                    fresh.scope
+                ));
+            }
+            Err(e) => lines.push(format!("sign-in: {e} — run `memdusa login` again")),
+        }
+    }
+    // Still useful when the server is down: that's when the queue matters.
+    match remote::Client::from_config(Duration::from_secs(15))?.whoami().await {
+        Ok(info) => {
+            lines.push(format!(
+                "mode: remote {} (server v{}, {}, reachable)",
+                r.url,
+                info["version"].as_str().unwrap_or("?"),
+                info["backend"].as_str().unwrap_or("?")
+            ));
+            lines.push(format!("identity: {}", describe_identity(&info)));
+            let sem = &info["semantic"];
+            lines.push(format!(
+                "{} (server side)",
+                semantic_line(
+                    sem["model"].as_str(),
+                    sem["embedded"].as_i64().unwrap_or(0),
+                    sem["total"].as_i64().unwrap_or(0)
+                )
+            ));
+        }
+        Err(e) => lines.push(format!("mode: remote {} (NOT reachable: {e})", r.url)),
+    }
+    lines.push(format!("project: {}", project.unwrap_or("<none>")));
+    lines.push(format!("offline queue: {} event(s)", spool::Spool::open()?.len()));
+    Ok(lines)
+}
+
+/// What OAuth login prints: identity and lifetimes, never the secrets.
+fn print_login(url: &str, tokens: &config::OAuthTokens) {
+    println!("logged in to {url} with OAuth ({})", tokens.method);
+    if let Some(user) = &tokens.user {
+        println!("identity: {user}");
+    }
+    println!("scopes: {}", tokens.scope);
+    println!("access token expires {}", expires_in(tokens.expires_at));
+    println!(
+        "saved to {}",
+        config::dir()
+            .map(|d| d.join("config.json").display().to_string())
+            .unwrap_or_else(|_| "~/.memdusa/config.json".into())
+    );
+}
+
+fn expires_in(ms: i64) -> String {
+    let secs = (ms - model::now_ms()).max(0) / 1000;
+    match secs {
+        0 => "already (will refresh on first use)".into(),
+        1..60 => format!("in {secs}s"),
+        60..3600 => format!("in {}m", secs / 60),
+        _ => format!("in {}h", secs / 3600),
     }
 }
 

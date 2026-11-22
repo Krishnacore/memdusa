@@ -141,7 +141,11 @@ impl Spool {
     /// Replay everything queued for `url`. Returns how many events were
     /// delivered. On failure, undelivered events stay queued.
     pub async fn flush(&self, client: &Client, url: &str) -> Result<usize, RemoteError> {
-        let local = |e: anyhow::Error| RemoteError { retryable: false, message: format!("offline queue: {e:#}") };
+        let local = |e: anyhow::Error| RemoteError {
+            retryable: false,
+            needs_login: false,
+            message: format!("offline queue: {e:#}"),
+        };
         let Some(_lock) = self.lock() else { return Ok(0) };
 
         let queue = self.queue_path();

@@ -10,18 +10,25 @@
 //!   agent never has to pass `project` explicitly.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context;
+use futures::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse,
-    Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock,
+    GetPromptRequestParams, GetPromptResponse, Implementation, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::streamable_http_client::{
+    SseError, StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
+    StreamableHttpPostResponse, StreamableHttpResponseLimits,
+};
 use rmcp::{ErrorData as McpError, RoleClient, RoleServer, ServerHandler, ServiceExt};
+use sse_stream::Sse;
 
 use crate::config::Remote;
 use crate::mcp::{AGENT_HEADER, PROJECT_HEADER};
@@ -31,6 +38,179 @@ struct Proxy {
     instructions: Option<String>,
     /// Project detected from the directory this proxy runs in.
     project: Option<String>,
+}
+
+// --------------------------------------------------------- OAuth token source
+
+#[derive(Debug, thiserror::Error)]
+enum ProxyHttpError {
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error("{0}")]
+    Refresh(String),
+}
+
+type HttpResult<T> = Result<T, StreamableHttpError<ProxyHttpError>>;
+
+/// A reqwest transport that asks for a fresh access token on every request
+/// (refreshing under a lock when near expiry) and retries once on a 401.
+#[derive(Clone)]
+struct RefreshingHttp {
+    inner: reqwest::Client,
+    url: String,
+}
+
+impl RefreshingHttp {
+    async fn token(&self, force: bool) -> Result<String, ProxyHttpError> {
+        crate::cli_auth::access_token(&self.url, force)
+            .await
+            .map_err(|e| ProxyHttpError::Refresh(format!("{e}; run `memdusa login` again")))
+    }
+}
+
+fn map_http_error(e: StreamableHttpError<reqwest::Error>) -> StreamableHttpError<ProxyHttpError> {
+    use StreamableHttpError as E;
+    match e {
+        E::Sse(e) => E::Sse(e),
+        E::Io(e) => E::Io(e),
+        E::Client(e) => E::Client(e.into()),
+        E::HttpStatus(e) => E::HttpStatus(e),
+        E::UnexpectedEndOfStream => E::UnexpectedEndOfStream,
+        E::UnexpectedServerResponse(s) => E::UnexpectedServerResponse(s),
+        E::ResponseBodyTooLarge { max_size } => E::ResponseBodyTooLarge { max_size },
+        E::UnexpectedContentType(c) => E::UnexpectedContentType(c),
+        E::ServerDoesNotSupportSse => E::ServerDoesNotSupportSse,
+        E::ServerDoesNotSupportDeleteSession => E::ServerDoesNotSupportDeleteSession,
+        E::TokioJoinError(e) => E::TokioJoinError(e),
+        E::Deserialize(e) => E::Deserialize(e),
+        E::TransportChannelClosed => E::TransportChannelClosed,
+        E::MissingSessionIdInResponse => E::MissingSessionIdInResponse,
+        E::AuthRequired(e) => E::AuthRequired(e),
+        E::InsufficientScope(e) => E::InsufficientScope(e),
+        E::ReservedHeaderConflict(s) => E::ReservedHeaderConflict(s),
+        E::SessionExpired => E::SessionExpired,
+        E::SessionRecoveryTimeout => E::SessionRecoveryTimeout,
+        E::ReinitializationFailed(e) => E::ReinitializationFailed(e),
+        E::ControlRequestTimeout => E::ControlRequestTimeout,
+        other => E::UnexpectedServerResponse(format!("unsupported transport error: {other}").into()),
+    }
+}
+
+fn auth_error(e: ProxyHttpError) -> StreamableHttpError<ProxyHttpError> {
+    StreamableHttpError::Client(e)
+}
+
+impl StreamableHttpClient for RefreshingHttp {
+    type Error = ProxyHttpError;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        let result = self
+            .inner
+            .post_message(uri.clone(), message.clone(), session_id.clone(), Some(token), custom_headers.clone())
+            .await;
+        if matches!(&result, Err(StreamableHttpError::AuthRequired(_))) {
+            let token = self.token(true).await.map_err(auth_error)?;
+            return self
+                .inner
+                .post_message(uri, message, session_id, Some(token), custom_headers)
+                .await
+                .map_err(map_http_error);
+        }
+        result.map_err(map_http_error)
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        self.inner
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                Some(token),
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+            .map_err(map_http_error)
+    }
+
+    async fn post_message_with_response_limits(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        limits: StreamableHttpResponseLimits,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        self.inner
+            .post_message_with_response_limits(uri, message, session_id, Some(token), custom_headers, limits)
+            .await
+            .map_err(map_http_error)
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<()> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        self.inner.delete_session(uri, session_id, Some(token), custom_headers).await.map_err(map_http_error)
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        self.inner.get_stream(uri, session_id, last_event_id, Some(token), custom_headers).await.map_err(map_http_error)
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
+        let token = self.token(false).await.map_err(auth_error)?;
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                Some(token),
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+            .map_err(map_http_error)
+    }
 }
 
 /// Upstream protocol errors (e.g. resource not found) pass through unchanged;
@@ -155,14 +335,48 @@ pub async fn run(remote: &Remote, project: Option<String>, agent: &str) -> anyho
     if let Some(t) = &remote.token {
         config = config.auth_header(t.clone());
     }
-    let upstream =
+    let oauth = remote.oauth.is_some();
+    let upstream = if oauth {
+        // Static headers can't rotate: the transport asks our client for the
+        // current access token on every HTTP request instead.
+        let http = reqwest::Client::builder().build()?;
+        let refreshing = RefreshingHttp { inner: http, url: remote.url.clone() };
+        ().serve(StreamableHttpClientTransport::with_client(refreshing, config))
+            .await
+            .with_context(|| format!("connecting to {}/mcp", remote.url))?
+    } else {
         ().serve(StreamableHttpClientTransport::from_config(config))
             .await
-            .with_context(|| format!("connecting to {}/mcp", remote.url))?;
+            .with_context(|| format!("connecting to {}/mcp", remote.url))?
+    };
     let instructions = upstream.peer_info().and_then(|i| i.instructions.clone());
     tracing::info!(url = remote.url, ?project, agent, "memdusa MCP proxy on stdio");
 
     let server = Proxy { upstream, instructions, project }.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::cli_auth::tests::{Home, login_and_tokens, spawn, test_config};
+
+    #[tokio::test]
+    async fn mcp_transport_refreshes_oauth_token() {
+        let _home = Home::new();
+        let mut cfg = test_config();
+        cfg.access_secs = 1; // always "near expiry", so every request refreshes
+        let (url, store) = spawn(cfg).await;
+        login_and_tokens(&url, &store, "proxy-user").await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let http = RefreshingHttp { inner: reqwest::Client::new(), url: url.clone() };
+        let config = StreamableHttpClientTransportConfig::with_uri(format!("{url}/mcp"));
+        let upstream = ().serve(StreamableHttpClientTransport::with_client(http, config)).await.unwrap();
+        let tools = upstream.list_tools(None).await;
+        assert!(tools.is_ok(), "MCP through a refreshing token should work: {tools:?}");
+    }
 }
