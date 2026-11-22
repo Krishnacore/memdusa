@@ -132,7 +132,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
             Ok(MemdusaMcp::new(
                 mcp_store.clone(),
                 // Remote clients have no cwd: they must name the project.
-                Defaults { project: None, agent: "mcp-http".into(), cwd: None },
+                Defaults { project: None, agent: "mcp-http".into(), cwd: None, task: None },
             ))
         },
         Arc::new(LocalSessionManager::default()),
@@ -529,6 +529,8 @@ struct ResumeQ {
     project: String,
     /// Caller's code state as JSON (`GitState`), to get drift warnings.
     git: Option<String>,
+    /// A worker's delegated task: the brief covers that task only.
+    task: Option<String>,
 }
 
 async fn resume(
@@ -538,7 +540,8 @@ async fn resume(
 ) -> ApiResult<memdusa_core::Brief> {
     let git: Option<GitState> =
         q.git.map(|g| serde_json::from_str(&g)).transpose().map_err(|e| Error::Invalid(format!("git: {e}")))?;
-    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref(), git.as_ref()).await?))
+    let task = q.task.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    Ok(Json(brief::build(&s.store, &q.project, id.user.as_deref(), git.as_ref(), task).await?))
 }
 
 /// Attribution always comes from the credential, never from the request body.
@@ -742,6 +745,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_hooks_carry_the_delegated_task() {
+        let (url, store) = spawn(None).await;
+        let c = client(&url, None);
+        let req = |task: Option<&str>, input| HookRequest {
+            project: "shop".into(),
+            config: HookConfig { agent: "codex".into(), journal_prompts: true, stop_guard_mins: 15, recall: true },
+            input,
+            git: None,
+            at: None,
+            task: task.map(String::from),
+            parent: task.map(|_| "lead".into()),
+        };
+        c.hook(HookEvent::SessionStart, &req(Some("docs"), json!({"session_id": "W", "source": "startup"})))
+            .await
+            .unwrap();
+        let edit =
+            json!({"session_id": "W", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
+        c.hook(HookEvent::PostToolUse, &req(Some("docs"), edit)).await.unwrap();
+        c.hook(HookEvent::SessionEnd, &req(Some("docs"), json!({"session_id": "W", "reason": "logout"})))
+            .await
+            .unwrap();
+
+        let started = store.events_recent_kind("shop", None, "delegated_session", 10).await.unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].data.as_ref().unwrap()["task"], "docs");
+        assert_eq!(started[0].data.as_ref().unwrap()["parent"], "lead");
+        assert_eq!(store.checkpoints_latest("shop", 1).await.unwrap()[0].task.as_deref(), Some("docs"));
+
+        // an old client sends neither field: still accepted, nothing delegated
+        let old = json!({"project": "shop", "agent": "x", "journal_prompts": true, "stop_guard_mins": 0,
+                         "input": {"session_id": "O", "source": "startup"}});
+        let r: HookRequest = serde_json::from_value(old).unwrap();
+        assert!(r.task.is_none() && r.parent.is_none());
+    }
+
+    #[tokio::test]
     async fn remote_hooks_round_trip_with_auth() {
         let (url, store) = spawn(Some("s3cret")).await;
         assert!(client(&url, Some("wrong")).whoami().await.is_err(), "bad token rejected");
@@ -759,6 +798,8 @@ mod tests {
             input,
             git: None,
             at: None,
+            task: None,
+            parent: None,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -803,7 +844,7 @@ mod tests {
             user: None,
         };
         assert_eq!(c.memory_search(&q).await.unwrap().len(), 1);
-        assert!(c.resume("p", None).await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
+        assert!(c.resume("p", None, None).await.unwrap()["markdown"].as_str().unwrap().contains("use Stripe"));
     }
 
     /// Raw request helper: (status, body).
@@ -1003,6 +1044,8 @@ mod tests {
             input,
             git: None,
             at: Some(at),
+            task: None,
+            parent: None,
         };
         let item = |event: &str, input: Value, at: i64| HookBatchItem { event: event.into(), request: req(input, at) };
         let t0 = now_ms() - 60_000;

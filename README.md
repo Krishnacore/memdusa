@@ -138,6 +138,31 @@ through the same hook pipeline as the harness hooks (redaction, offline queue, r
 background and never block or fail a git command. They are installed in `git rev-parse --git-path hooks`, so
 `core.hooksPath` (for example Husky) is respected. Existing user hooks are kept; memdusa only adds its own line.
 
+## Multi-agent setups
+
+A coordinator agent can delegate tasks to workers in other harnesses (Claude Code, OpenCode, Codex, ...) in the same
+project. Launch each worker with environment variables:
+
+```sh
+MEMDUSA_TASK=install-scripts MEMDUSA_PARENT=lead-session claude   # or opencode, codex, ...
+```
+
+`MEMDUSA_TASK` marks the worker (required); `MEMDUSA_PARENT` is free text naming the coordinator (optional). Then:
+
+- **Worker sessions are recorded.** At session start memdusa journals a `delegated_session` event (task, parent,
+  harness), in local and hosted mode alike.
+- **Worker checkpoints are task-scoped.** A checkpoint saved without a `task` (the `checkpoint` tool, or the automatic
+  fallback checkpoint) gets `task = MEMDUSA_TASK`, so it never replaces the coordinator's. An explicit `task` wins.
+  Over a hosted server the `memdusa mcp` proxy passes the env along.
+- **A worker's brief is its task.** It shows only that task's latest checkpoints and recent activity, and its "Last
+  words" are the last message of *previous sessions of the same task*, whatever harness they ran in. When a worker hits
+  its usage limit, its replacement started with the same `MEMDUSA_TASK` resumes exactly there. The `resume` tool and
+  `memdusa resume` take the same task (the tool also has an optional `task` argument).
+- **The coordinator's brief gets "Delegated work".** Without `MEMDUSA_TASK`, the brief lists tasks delegated in the last
+  7 days (up to 10, newest first): harness, status (`active` until the worker's session ends, then `ended`), the task's
+  latest checkpoint goal and next steps, and the worker's last message. Workers' checkpoints and messages are kept out
+  of the coordinator's own "Where things stand" and "Last words".
+
 ## Importing past sessions
 
 Work done before memdusa was installed, or in a tool without hooks, can still reach memdusa:
@@ -420,10 +445,10 @@ Schema changes: append a new entry to `MIGRATIONS` in `crates/memdusa-core/src/s
 - [ ] **Multi-agent coordination** (one harness coordinating others, like a lead agent delegating to Claude Code,
       OpenCode or Codex workers via `hc`, or a harness's own subagents). Observed while building memdusa itself:
       when a worker hit its usage limit, its replacement in another harness started from scratch. Ideas:
-  - parent/child sessions: link a worker's session to its coordinator (from hook fields like `agent_id`/`agent_type`,
-    Hermes `conversation_id`, or an explicit `MEMDUSA_PARENT_SESSION`), so the coordinator's brief gets a
-    "Delegated work" section with each worker's status, checkpoint and last words
-  - task-scoped checkpoints by default for workers (`task` = the assignment), so they never overwrite the
+  - [x] parent/child sessions via env (`MEMDUSA_TASK`, `MEMDUSA_PARENT`): the coordinator's brief gets a
+    "Delegated work" section with each worker's status, checkpoint and last words (see "Multi-agent setups"; linking
+    from hook fields like `agent_id`/`agent_type` or Hermes `conversation_id` is not done)
+  - [x] task-scoped checkpoints by default for workers (`task` = the assignment), so they never overwrite the
     coordinator's checkpoint, and a worker's replacement resumes exactly that task
   - worktree/branch awareness: workers in different worktrees share the project key, but code-state warnings and
     "files changed" should be per worktree/branch, not mixed

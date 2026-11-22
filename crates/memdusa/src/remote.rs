@@ -98,10 +98,13 @@ impl Client {
     }
 
     /// The brief as JSON (its `markdown` field holds the rendered text).
-    pub async fn resume(&self, project: &str, git: Option<&GitState>) -> anyhow::Result<Value> {
+    pub async fn resume(&self, project: &str, git: Option<&GitState>, task: Option<&str>) -> anyhow::Result<Value> {
         let mut q = vec![("project", project.to_owned())];
         if let Some(g) = git {
             q.push(("git", serde_json::to_string(g)?));
+        }
+        if let Some(t) = task {
+            q.push(("task", t.to_owned()));
         }
         Ok(self.send(self.request(Method::GET, "/v1/resume").query(&q)).await?)
     }

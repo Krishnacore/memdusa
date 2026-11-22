@@ -846,25 +846,42 @@ impl Store {
             if !seen.insert(task.clone()) {
                 continue;
             }
-            out.push(Checkpoint {
-                id: r.try_get("id")?,
-                project: r.try_get("project")?,
-                task,
-                goal: r.try_get("goal")?,
-                done: list_from_json(r.try_get("done")?),
-                next: list_from_json(r.try_get("next")?),
-                blockers: list_from_json(r.try_get("blockers")?),
-                files: list_from_json(r.try_get("files")?),
-                notes: r.try_get("notes")?,
-                source: r.try_get("source")?,
-                git: r.try_get::<Option<String>, _>("git")?.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: r.try_get("created_at")?,
-            });
+            out.push(Self::row_to_checkpoint(&r, task)?);
             if out.len() as i64 >= limit {
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// The newest checkpoints of one task, most recent first.
+    pub async fn checkpoints_for_task(&self, project: &str, task: &str, limit: i64) -> Result<Vec<Checkpoint>> {
+        let mut q = Q::new("SELECT * FROM checkpoints WHERE project = ");
+        let (p, t, l) = (q.text(project), q.text(task), q.int(limit.clamp(1, 50)));
+        q.push(&format!("{p} AND task = {t} ORDER BY created_at DESC, id DESC LIMIT {l}"));
+        q.build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|r| Self::row_to_checkpoint(r, Some(task.to_owned())))
+            .collect()
+    }
+
+    fn row_to_checkpoint(r: &AnyRow, task: Option<String>) -> Result<Checkpoint> {
+        Ok(Checkpoint {
+            id: r.try_get("id")?,
+            project: r.try_get("project")?,
+            task,
+            goal: r.try_get("goal")?,
+            done: list_from_json(r.try_get("done")?),
+            next: list_from_json(r.try_get("next")?),
+            blockers: list_from_json(r.try_get("blockers")?),
+            files: list_from_json(r.try_get("files")?),
+            notes: r.try_get("notes")?,
+            source: r.try_get("source")?,
+            git: r.try_get::<Option<String>, _>("git")?.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: r.try_get("created_at")?,
+        })
     }
 
     // ------------------------------------------------------------ durable runs

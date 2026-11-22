@@ -38,6 +38,9 @@ pub struct Defaults {
     pub agent: String,
     /// Repo directory whose git state is recorded (stdio only; remote callers send it).
     pub cwd: Option<std::path::PathBuf>,
+    /// `MEMDUSA_TASK` (stdio): this agent is a worker on that delegated task. Over HTTP the
+    /// `memdusa mcp` proxy sends it as the `task` argument instead.
+    pub task: Option<String>,
 }
 
 #[derive(Clone)]
@@ -64,6 +67,10 @@ pub struct ProjectArg {
     /// Project key (e.g. `github.com/org/repo`). Defaults to the current project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Delegated task name: brief that task only (checkpoints and last words of its workers). Defaults to
+    /// the `MEMDUSA_TASK` this agent was launched with; omit it as a coordinator to see all delegated work.
+    #[serde(default)]
+    pub task: Option<String>,
     /// Code state, attached automatically by the client (hidden from the model).
     #[serde(default)]
     #[schemars(skip)]
@@ -135,7 +142,8 @@ pub struct CheckpointArgs {
     pub files: Vec<String>,
     #[serde(default)]
     pub notes: Option<String>,
-    /// Optional workstream name when a project has several in flight.
+    /// Optional workstream name when a project has several in flight. Defaults to the delegated task
+    /// (`MEMDUSA_TASK`) this agent was launched with.
     #[serde(default)]
     pub task: Option<String>,
     #[serde(default)]
@@ -260,6 +268,11 @@ impl MemdusaMcp {
     fn agent(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
         Some(self.agent_name(ctx))
     }
+
+    /// The explicit task, else the one this worker was launched with. Blank counts as none.
+    fn task(&self, explicit: Option<String>) -> Option<String> {
+        explicit.or_else(|| self.defaults.task.clone()).map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+    }
 }
 
 /// Over HTTP, clients (or the `memdusa mcp` proxy) identify themselves and
@@ -289,7 +302,8 @@ impl MemdusaMcp {
     async fn resume(&self, Parameters(a): Parameters<ProjectArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
         let git = a.git.or_else(|| self.local_git(&project));
-        Ok(brief::build(&self.store, &project, identity(&ctx).user.as_deref(), git.as_ref())
+        let task = self.task(a.task);
+        Ok(brief::build(&self.store, &project, identity(&ctx).user.as_deref(), git.as_ref(), task.as_deref())
             .await
             .map_err(err)?
             .markdown)
@@ -366,7 +380,7 @@ impl MemdusaMcp {
         let git = a.git.or_else(|| self.local_git(&project));
         let c = NewCheckpoint {
             project,
-            task: a.task,
+            task: self.task(a.task),
             goal: a.goal,
             done: a.done,
             next: a.next,
@@ -494,7 +508,8 @@ impl MemdusaMcp {
     ) -> Result<String, McpError> {
         let project = self.project(ctx, project).map_err(|e| McpError::invalid_params(e, None))?;
         let git = self.local_git(&project);
-        Ok(brief::build(&self.store, &project, identity(ctx).user.as_deref(), git.as_ref())
+        let task = self.task(None);
+        Ok(brief::build(&self.store, &project, identity(ctx).user.as_deref(), git.as_ref(), task.as_deref())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?
             .markdown)
@@ -636,12 +651,22 @@ mod tests {
     use rmcp::service::ServiceError;
 
     async fn client() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+        client_for(None).await
+    }
+
+    /// A client whose server was launched as a worker on `task` (`MEMDUSA_TASK`).
+    async fn client_for(task: Option<&str>) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
         let dir = std::env::temp_dir().join(format!("memdusa-mcp-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
         let server = MemdusaMcp::new(
             store,
-            Defaults { project: Some("github.com/acme/app".into()), agent: "test".into(), cwd: None },
+            Defaults {
+                project: Some("github.com/acme/app".into()),
+                agent: "test".into(),
+                cwd: None,
+                task: task.map(String::from),
+            },
         );
         let (a, b) = tokio::io::duplex(65536);
         tokio::spawn(async move {
@@ -676,6 +701,25 @@ mod tests {
             }
             _ => panic!("expected text contents"),
         }
+    }
+
+    #[tokio::test]
+    async fn worker_checkpoints_default_to_the_env_task_and_resume_accepts_a_task() {
+        let c = client_for(Some("install-scripts")).await;
+        call(&c, "checkpoint", serde_json::json!({ "goal": "windows installer" })).await;
+        call(&c, "checkpoint", serde_json::json!({ "goal": "own pick", "task": "docs" })).await;
+
+        // the worker's brief is its task's; an explicit `task` argument overrides the env
+        let (_, own) = call(&c, "resume", serde_json::json!({})).await;
+        assert!(own.contains("Goal [install-scripts]: windows installer") && !own.contains("own pick"), "{own}");
+        let (_, docs) = call(&c, "resume", serde_json::json!({ "task": "docs" })).await;
+        assert!(docs.contains("Goal [docs]: own pick") && !docs.contains("windows installer"), "{docs}");
+
+        // without MEMDUSA_TASK a checkpoint has no task
+        let plain = client().await;
+        call(&plain, "checkpoint", serde_json::json!({ "goal": "coordinate" })).await;
+        let (_, md) = call(&plain, "resume", serde_json::json!({})).await;
+        assert!(md.contains("Goal: coordinate") && !md.contains("delegated task"), "{md}");
     }
 
     #[tokio::test]
