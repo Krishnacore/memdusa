@@ -5,3 +5,4 @@
 .env
 /eval/results/
 __pycache__/
+/target-linux

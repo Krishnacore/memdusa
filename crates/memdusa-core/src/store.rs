@@ -591,6 +591,42 @@ pub fn sqlite_url(path: &std::path::Path) -> String {
     format!("sqlite:{}", path.display().to_string().replace('\\', "/"))
 }
 
+/// Create memdusa's data directory private to the current user (mode 0700 on
+/// Unix). Directories that already exist are left untouched: a user may have
+/// chosen different permissions for one they created themselves.
+pub fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+}
+
+/// The file a SQLite URL points at, when it is a real file (not `:memory:`).
+#[cfg(unix)]
+fn sqlite_file_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("sqlite:")?;
+    let raw = rest.split('?').next().unwrap_or(rest);
+    // Strip the URL authority: `sqlite:///tmp/x.db` is the absolute `/tmp/x.db`,
+    // while `sqlite://x.db` is relative. `sqlite_url` emits the `sqlite:/...` form.
+    let raw = raw.strip_prefix("//").unwrap_or(raw);
+    if raw.is_empty() || raw.contains(":memory:") || rest.contains("mode=memory") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
 /// SQLite's transient lock errors (`SQLITE_BUSY` / `SQLITE_LOCKED`).
 fn is_sqlite_busy(e: &Error) -> bool {
     let text = format!("{e:?} {e}").to_lowercase();
@@ -644,6 +680,23 @@ impl Store {
             url.to_owned()
         };
 
+        // On Unix, keep SQLite data private: create a missing parent directory
+        // with mode 0700 and restrict files we create to mode 0600. Existing
+        // directories (and files) are never chmod-ed.
+        #[cfg(unix)]
+        let db_files: Vec<std::path::PathBuf> = match (backend, sqlite_file_path(&url)) {
+            (Backend::Sqlite, Some(path)) => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    create_private_dir(parent)
+                        .map_err(|e| Error::Invalid(format!("creating {}: {e}", parent.display())))?;
+                }
+                vec![path.clone(), sqlite_sidecar(&path, "-wal"), sqlite_sidecar(&path, "-shm")]
+            }
+            _ => vec![],
+        };
+        #[cfg(unix)]
+        let existed: Vec<bool> = db_files.iter().map(|p| p.exists()).collect();
+
         let pool = AnyPoolOptions::new()
             .max_connections(if backend == Backend::Sqlite { 4 } else { 16 })
             .after_connect(move |conn, _| {
@@ -658,6 +711,17 @@ impl Store {
             })
             .connect(&url)
             .await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (file, existed) in db_files.iter().zip(existed) {
+                if !existed && file.exists() {
+                    // Best effort: SQLite creates/removes the WAL sidecars as it checkpoints.
+                    let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
 
         let store = Self { pool, backend, redactor: Arc::new(Redactor::new(&[])?), embedder: None };
         store.migrate().await?;
@@ -702,7 +766,7 @@ impl Store {
             )));
         }
         for (i, stmts) in MIGRATIONS.iter().enumerate().skip(current) {
-            tracing::info!("applying schema migration v{}", i + 1);
+            tracing::debug!("applying schema migration v{}", i + 1);
             for stmt in stmts.statements(self.backend) {
                 tx.execute(*stmt).await?;
             }
@@ -712,6 +776,10 @@ impl Store {
         q.push(&v).push(") ON CONFLICT (key) DO UPDATE SET value = excluded.value");
         q.build().execute(&mut *tx).await?;
         tx.commit().await?;
+        // A fresh database (current == 0) must be silent at the default log level.
+        if current > 0 && current < MIGRATIONS.len() {
+            tracing::info!("upgraded database schema from v{current} to v{}", MIGRATIONS.len());
+        }
         Ok(MIGRATIONS.len())
     }
 
@@ -1944,6 +2012,31 @@ mod tests {
             super::sqlite_url(Path::new(r"C:\Users\a\.memdusa\memdusa.db")),
             "sqlite:C:/Users/a/.memdusa/memdusa.db"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_sqlite_store_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("memdusa-private-{}", crate::model::new_id()));
+        let data_dir = root.join("data");
+        let db = data_dir.join("memdusa.db");
+        let store = super::Store::connect(&super::sqlite_url(&db)).await.unwrap();
+        drop(store);
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&data_dir), 0o700, "data directory must be private");
+        assert_eq!(mode(&db), 0o600, "database file must be private");
+        for suffix in ["-wal", "-shm"] {
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            let sidecar = std::path::PathBuf::from(name);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix} file must be private");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
