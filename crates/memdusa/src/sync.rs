@@ -227,7 +227,7 @@ async fn status(local: &Store, remote: &Remote) -> anyhow::Result<()> {
         Some(pid) => println!("watcher: running (pid {pid})"),
         None => println!("watcher: not running"),
     }
-    println!("last sync: {}", watch::last_sync().map_or_else(|| "never".into(), |t| format!("{} ago", ago(t))));
+    println!("last sync: {}", watch::last_sync().map_or_else(|| "never".into(), ago));
     Ok(())
 }
 
@@ -292,7 +292,7 @@ pub async fn status_report(store: &Store, local_url: &str, remote: &Remote) -> a
         Some(pid) => println!("watcher: running (pid {pid})"),
         None => println!("watcher: not running"),
     }
-    println!("last sync: {}", watch::last_sync().map_or_else(|| "never".into(), |t| format!("{} ago", ago(t))));
+    println!("last sync: {}", watch::last_sync().map_or_else(|| "never".into(), ago));
     Ok(())
 }
 
