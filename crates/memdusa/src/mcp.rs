@@ -2,6 +2,8 @@
 //! Cursor, Codex, Gemini CLI, Windsurf, Zed, ...) connects over stdio or
 //! streamable HTTP and gets the same memory, checkpoints and durable runs.
 
+use std::sync::Arc;
+
 use memdusa_core::model::*;
 use memdusa_core::{Store, brief};
 
@@ -53,6 +55,9 @@ pub struct Defaults {
 pub struct MemdusaMcp {
     store: Store,
     defaults: Defaults,
+    /// Sync mode: memory tools use `store`; runs/steps and delegated tasks go
+    /// to the server through this client.
+    remote: Option<Arc<crate::remote::Client>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -350,7 +355,13 @@ pub struct RunListArgs {
 
 impl MemdusaMcp {
     pub fn new(store: Store, defaults: Defaults) -> Self {
-        Self { store, defaults, tool_router: Self::tool_router() }
+        Self { store, defaults, remote: None, tool_router: Self::tool_router() }
+    }
+
+    /// Route delegated work to a server (sync mode).
+    pub fn with_remote(mut self, client: crate::remote::Client) -> Self {
+        self.remote = Some(Arc::new(client));
+        self
     }
 
     fn project(&self, ctx: &RequestContext<RoleServer>, p: Option<String>) -> Result<String, String> {
@@ -614,6 +625,17 @@ impl MemdusaMcp {
     )]
     async fn run_start(&self, Parameters(a): Parameters<RunStartArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        if let Some(remote) = &self.remote {
+            let r = NewRun {
+                project,
+                name: a.name,
+                idempotency_key: a.idempotency_key,
+                input: a.input,
+                owner: self.agent(&ctx),
+                lease_secs: a.lease_secs,
+            };
+            return json(remote.run_start(&r).await.map_err(|e| e.to_string())?);
+        }
         authorize(&ctx, &project, Access::Write, "run.start").await?;
         let r = NewRun {
             project,
@@ -630,6 +652,13 @@ impl MemdusaMcp {
         description = "Enter a step of a durable run. Returns {action: \"replay\", output} if the step already completed (do NOT redo it), or {action: \"execute\", attempt} if you must perform it now and then call run_step_complete / run_step_fail."
     )]
     async fn run_step(&self, Parameters(a): Parameters<StepArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let d = remote
+                .step_begin(&a.run_id, &a.step_key, a.input, &self.agent_name(&ctx))
+                .await
+                .map_err(|e| e.to_string())?;
+            return json(d);
+        }
         authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step").await?;
         json(self.store.step_begin(&a.run_id, &a.step_key, a.input, &self.agent_name(&ctx)).await.map_err(err)?)
     }
@@ -640,6 +669,10 @@ impl MemdusaMcp {
         Parameters(a): Parameters<StepCompleteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let step = remote.step_complete(&a.run_id, &a.step_key, a.output).await.map_err(|e| e.to_string())?;
+            return json(step);
+        }
         authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step_complete").await?;
         json(self.store.step_complete(&a.run_id, &a.step_key, a.output).await.map_err(err)?)
     }
@@ -650,6 +683,10 @@ impl MemdusaMcp {
         Parameters(a): Parameters<StepFailArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let step = remote.step_fail(&a.run_id, &a.step_key, &a.error).await.map_err(|e| e.to_string())?;
+            return json(step);
+        }
         authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.step_fail").await?;
         json(self.store.step_fail(&a.run_id, &a.step_key, &a.error).await.map_err(err)?)
     }
@@ -660,6 +697,10 @@ impl MemdusaMcp {
         Parameters(a): Parameters<RunFinishArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let r = remote.run_finish(&a.run_id, a.outcome, a.output, a.error).await.map_err(|e| e.to_string())?;
+            return json(r);
+        }
         authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.finish").await?;
         json(self.store.run_finish(&a.run_id, a.outcome, a.output, a.error).await.map_err(err)?)
     }
@@ -668,6 +709,11 @@ impl MemdusaMcp {
         description = "Take over a durable run (e.g. a STALE one left by a crashed agent or another tool). Returns the run and its step journal."
     )]
     async fn run_claim(&self, Parameters(a): Parameters<RunClaimArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let r =
+                remote.run_claim(&a.run_id, &self.agent_name(&ctx), None, a.force).await.map_err(|e| e.to_string())?;
+            return json(r);
+        }
         authorize_run(&self.store, &ctx, &a.run_id, Access::Write, "run.claim").await?;
         json(self.store.run_claim(&a.run_id, &self.agent_name(&ctx), None, a.force).await.map_err(err)?)
     }
@@ -677,6 +723,13 @@ impl MemdusaMcp {
     )]
     async fn delegate(&self, Parameters(a): Parameters<DelegateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
+        if let Some(remote) = &self.remote {
+            let run = remote
+                .delegate(&project, &a.name, &a.tasks, a.idempotency_key.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(brief::delegate_report(&run));
+        }
         authorize(&ctx, &project, Access::Write, "delegate").await?;
         let run = self.store.run_delegate(&project, &a.name, a.tasks, a.idempotency_key).await.map_err(err)?;
         Ok(brief::delegate_report(&run))
@@ -691,8 +744,12 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let (run, task) = self.run_task(a.run, a.task)?;
-        authorize_run(&self.store, &ctx, &run, Access::Write, "task.complete").await?;
         let output = a.summary.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).map(Value::String);
+        if let Some(remote) = &self.remote {
+            remote.step_complete(&run, &task, output).await.map_err(|e| e.to_string())?;
+            return Ok(format!("task {task} marked done"));
+        }
+        authorize_run(&self.store, &ctx, &run, Access::Write, "task.complete").await?;
         self.store.step_complete(&run, &task, output).await.map_err(err)?;
         Ok(format!("task {task} marked done"))
     }
@@ -702,6 +759,10 @@ impl MemdusaMcp {
     )]
     async fn task_fail(&self, Parameters(a): Parameters<TaskFailArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let (run, task) = self.run_task(a.run, a.task)?;
+        if let Some(remote) = &self.remote {
+            remote.step_fail(&run, &task, &a.reason).await.map_err(|e| e.to_string())?;
+            return Ok(format!("task {task} marked failed"));
+        }
         authorize_run(&self.store, &ctx, &run, Access::Write, "task.fail").await?;
         self.store.step_fail(&run, &task, &a.reason).await.map_err(err)?;
         Ok(format!("task {task} marked failed"))
@@ -709,12 +770,19 @@ impl MemdusaMcp {
 
     #[tool(description = "Get a durable run with its full step journal.")]
     async fn run_get(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            return json(remote.run_get(&a.id).await.map_err(|e| e.to_string())?);
+        }
         authorize_run(&self.store, &ctx, &a.id, Access::Read, "run.get").await?;
         json(self.store.run_get(&a.id).await.map_err(err)?)
     }
 
     #[tool(description = "List durable runs for the project (or all projects), newest first.")]
     async fn run_list(&self, Parameters(a): Parameters<RunListArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+        if let Some(remote) = &self.remote {
+            let project = if a.all_projects { None } else { Some(self.project(&ctx, a.project)?) };
+            return json(remote.run_list(project.as_deref(), a.status).await.map_err(|e| e.to_string())?);
+        }
         let (project, allowed) = if a.all_projects {
             (None, Some(readable_projects(&self.store, &ctx).await?))
         } else {

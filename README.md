@@ -674,9 +674,10 @@ set them in production.
 ## Team server: sync
 
 Offline-first agents can keep working against a local database and replicate chosen projects to a team server with a
-one-shot `memdusa sync`. The local side is the logged-in server's opposite number: the local database is given by
-`--database-url` (default `~/.memdusa/memdusa.db`), the remote by `memdusa login` (API key **or** OAuth). Nothing
-leaves an opted-out project.
+one-shot `memdusa sync`, a background `memdusa sync --watch`, or full sync mode (`memdusa login <url> --sync`) where
+hooks and MCP never touch the network. The local side is the logged-in server's opposite number: the local database is
+given by `--database-url` (default `~/.memdusa/memdusa.db`), the remote by `memdusa login` (API key **or** OAuth).
+Nothing leaves an opted-out project.
 
 ```sh
 memdusa login https://memdusa.example.com --token mdk_…   # or --browser / --device (see above)
@@ -714,8 +715,51 @@ append-only (seq cursors never reuse timestamps); the cursor advances past skipp
 
 **Not synced:** runs/steps (server-authoritative), embeddings (each side embeds its own pulled memories if an embedder
 is configured), users/keys/grants/audit/OAuth. Global memories are private to their server-side owner and need their
-own opt-in. Background `--watch` (H3b) and a sync mode that redirects hooks to the local DB are not part of this
-one-shot implementation.
+own opt-in.
+
+### Sync mode (hooks write locally)
+
+`memdusa login <url> --sync` (also with `--token`, `--browser` or `--device`) stores the server plus a flag:
+hooks, `memdusa mcp` and all CLI reads/writes use the **local database** (`--database-url`, default
+`~/.memdusa/memdusa.db`), so there is no network in the hot path. Turn it on or off later with
+`memdusa sync mode on|off`; `memdusa login <url>` without `--sync` keeps plain remote mode.
+
+The first hook in a project that is not opted in adds it automatically (the opt-in and initial seeding of existing
+records happen locally; the first sync pushes/pulls them). Set `MEMDUSA_SYNC_AUTO_ADD=0` to disable that and opt in
+explicitly with `memdusa sync add <project>` instead.
+
+Delegated work stays server-authoritative even in sync mode: `delegate`, `run_*`, `task_complete` / `task_fail`, and
+the SessionStart step claim and heartbeats go straight to the server. Nothing creates a local lease. If the server is
+unreachable, the claim fails visibly at the top of the brief notice (telling you no local lease was created) and
+heartbeats are skipped silently; ordinary memory and event writes keep working offline.
+
+`memdusa status` in sync mode reports both sides: the local database, whether the server is reachable, opted-in
+projects, pending local changes, watcher state and last sync time.
+
+### Background watcher
+
+```sh
+memdusa sync --watch                   # push+pull every opted-in project, forever
+memdusa sync --watch --interval 30s    # custom interval (default 15s)
+memdusa sync status                    # also shows watcher pid and last sync
+```
+
+Only one watcher runs per `MEMDUSA_HOME` (a pid lock file); a second instance exits with a message. Sync failures back
+off exponentially from 1 s up to 5 minutes and reset after a success. One log line is printed for each pass that
+actually moved data; a no-op pass is silent. SIGINT/SIGTERM stops it cleanly and releases the lock.
+
+After SessionEnd — and after Stop when files changed — sync mode spawns a detached `memdusa sync --quiet`. It is skipped
+when a watcher holds the lock or a sync ran in the last 10 seconds. Set `MEMDUSA_SYNC_OPPORTUNISTIC=0` to disable it.
+
+To run the watcher as a login service:
+
+```sh
+memdusa sync service install           # launchd agent on macOS, systemd user unit on Linux
+memdusa sync service uninstall
+```
+
+The command prints the file it wrote and how to start/stop it. On Windows it prints Task Scheduler instructions
+instead. Tests use `MEMDUSA_SERVICE_DIR` to render into a temp directory and never touch real service directories.
 
 ## MCP tools
 

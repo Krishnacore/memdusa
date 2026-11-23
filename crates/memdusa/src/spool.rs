@@ -236,5 +236,5 @@ pub fn cached_brief(project: &str, why: &str) -> Option<HookResponse> {
          date. Your activity is queued locally and will sync when the server is back.\n\n"
     );
     *ctx = Value::String(format!("{note}{}", ctx.as_str().unwrap_or_default()));
-    Some(HookResponse { output: Some(out.to_string()) })
+    Some(HookResponse { output: Some(out.to_string()), files_changed: false })
 }

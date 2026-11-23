@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use memdusa_core::model::{
-    ApiKey, AuditEvent, AuditQuery, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, ProjectGrant, Role,
-    RunWithSteps, Step, User,
+    ApiKey, AuditEvent, AuditQuery, ClaimResult, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, NewRun,
+    ProjectGrant, Role, Run, RunOutcome, RunStatus, RunWithSteps, Step, StepDecision, User,
 };
 use memdusa_core::sync::{PullResponse, PushBody, PushResponse, SyncRecord};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -254,6 +254,114 @@ impl Client {
                 self.send(self.request(Method::POST, &format!("{base}/fail")).json(&body)).await?
             }
         })
+    }
+
+    // -------------------------------------------------- delegated work (sync mode)
+
+    /// Start or re-enter a durable run. Runs are server-authoritative when the
+    /// client is in sync mode.
+    pub async fn run_start(&self, r: &NewRun) -> anyhow::Result<RunWithSteps> {
+        Ok(self.send(self.request(Method::POST, "/v1/runs").json(r)).await?)
+    }
+
+    pub async fn step_begin(
+        &self,
+        run: &str,
+        key: &str,
+        input: Option<Value>,
+        owner: &str,
+    ) -> anyhow::Result<StepDecision> {
+        let path = format!("/v1/runs/{}/steps/{}/begin", path_segment(run), path_segment(key));
+        Ok(self.send(self.request(Method::POST, &path).json(&json!({ "owner": owner, "input": input }))).await?)
+    }
+
+    /// Claim a delegated task's step. Used by SessionStart in sync mode: no
+    /// local lease exists, so a server failure must be visible in the brief.
+    pub async fn step_claim(
+        &self,
+        run: &str,
+        key: &str,
+        owner: &str,
+        lease_secs: i64,
+        force: bool,
+    ) -> anyhow::Result<ClaimResult> {
+        let path = format!("/v1/runs/{}/steps/{}/claim", path_segment(run), path_segment(key));
+        Ok(self
+            .send(
+                self.request(Method::POST, &path)
+                    .json(&json!({ "owner": owner, "lease_secs": lease_secs, "force": force })),
+            )
+            .await?)
+    }
+
+    /// Renew a delegated lease on the server. Failure is intentionally silent
+    /// at the call site: heartbeats are best-effort.
+    pub async fn step_heartbeat(&self, run: &str, key: &str, owner: &str, lease_secs: i64) -> anyhow::Result<bool> {
+        let path = format!("/v1/runs/{}/steps/{}/heartbeat", path_segment(run), path_segment(key));
+        let r: Value = self
+            .send(self.request(Method::POST, &path).json(&json!({ "owner": owner, "lease_secs": lease_secs })))
+            .await?;
+        Ok(r["ok"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn step_complete(&self, run: &str, key: &str, output: Option<Value>) -> anyhow::Result<Step> {
+        let path = format!("/v1/runs/{}/steps/{}/complete", path_segment(run), path_segment(key));
+        Ok(self.send(self.request(Method::POST, &path).json(&json!({ "output": output }))).await?)
+    }
+
+    pub async fn step_fail(&self, run: &str, key: &str, error: &str) -> anyhow::Result<Step> {
+        let path = format!("/v1/runs/{}/steps/{}/fail", path_segment(run), path_segment(key));
+        Ok(self.send(self.request(Method::POST, &path).json(&json!({ "error": error }))).await?)
+    }
+
+    pub async fn run_finish(
+        &self,
+        run: &str,
+        outcome: RunOutcome,
+        output: Option<Value>,
+        error: Option<String>,
+    ) -> anyhow::Result<RunWithSteps> {
+        let path = format!("/v1/runs/{}/finish", path_segment(run));
+        Ok(self
+            .send(self.request(Method::POST, &path).json(&json!({
+                "outcome": outcome, "output": output, "error": error
+            })))
+            .await?)
+    }
+
+    pub async fn run_claim(
+        &self,
+        run: &str,
+        owner: &str,
+        lease_secs: Option<i64>,
+        force: bool,
+    ) -> anyhow::Result<RunWithSteps> {
+        let path = format!("/v1/runs/{}/claim", path_segment(run));
+        Ok(self
+            .send(self.request(Method::POST, &path).json(&json!({
+                "owner": owner, "lease_secs": lease_secs, "force": force
+            })))
+            .await?)
+    }
+
+    pub async fn run_get(&self, run: &str) -> anyhow::Result<RunWithSteps> {
+        let path = format!("/v1/runs/{}", path_segment(run));
+        Ok(self.send(self.request(Method::GET, &path)).await?)
+    }
+
+    pub async fn run_list(&self, project: Option<&str>, status: Option<RunStatus>) -> anyhow::Result<Vec<Run>> {
+        let mut req = self.request(Method::GET, "/v1/runs");
+        let mut q = vec![];
+        if let Some(p) = project {
+            q.push(("project", p.to_owned()));
+        }
+        if let Some(s) = status {
+            q.push(("status", s.as_str().to_owned()));
+        }
+        if !q.is_empty() {
+            req = req.query(&q);
+        }
+        Ok(self.send(req).await?)
     }
 
     pub async fn memory_save(&self, m: &NewMemory) -> anyhow::Result<Memory> {

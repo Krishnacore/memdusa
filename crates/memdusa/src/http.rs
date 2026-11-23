@@ -254,6 +254,8 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         .route("/v1/runs/{id}/claim", post(run_claim))
         .route("/v1/runs/{id}/finish", post(run_finish))
         .route("/v1/runs/{id}/steps/{key}/begin", post(step_begin))
+        .route("/v1/runs/{id}/steps/{key}/claim", post(step_claim))
+        .route("/v1/runs/{id}/steps/{key}/heartbeat", post(step_heartbeat))
         .route("/v1/runs/{id}/steps/{key}/complete", post(step_complete))
         .route("/v1/runs/{id}/steps/{key}/fail", post(step_fail))
         .route("/v1/sync/push", post(sync_push).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
@@ -1062,6 +1064,51 @@ async fn step_begin(
     let project = s.store.run_project(&rid).await?;
     check(&access, &who, &project, Access::Write, "step.begin").await?;
     Ok(Json(s.store.step_begin(&rid, &key, b.input, &who.qualify(&b.owner)).await?))
+}
+
+/// A sync-mode worker claims its delegated task on the server (the local
+/// database has no leases). Attribution comes from the credential.
+#[derive(Deserialize)]
+struct StepClaimBody {
+    owner: String,
+    lease_secs: Option<i64>,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn step_claim(
+    State(s): State<AppState>,
+    Extension(who): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path((rid, key)): Path<(String, String)>,
+    Json(b): Json<StepClaimBody>,
+) -> ApiResult<ClaimResult> {
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "step.claim").await?;
+    let lease = b.lease_secs.unwrap_or_else(memdusa_core::store::step_lease_secs);
+    Ok(Json(s.store.step_claim(&rid, &key, &who.qualify(&b.owner), lease, b.force).await?))
+}
+
+/// Renew a server-side delegated lease. Returns `{ok: false}` when the lease
+/// was taken over or finished; callers treat that as a silent no-op.
+#[derive(Deserialize)]
+struct StepHeartbeatBody {
+    owner: String,
+    lease_secs: Option<i64>,
+}
+
+async fn step_heartbeat(
+    State(s): State<AppState>,
+    Extension(who): Extension<Identity>,
+    Extension(access): Extension<AccessCache>,
+    Path((rid, key)): Path<(String, String)>,
+    Json(b): Json<StepHeartbeatBody>,
+) -> ApiResult<Value> {
+    let project = s.store.run_project(&rid).await?;
+    check(&access, &who, &project, Access::Write, "step.heartbeat").await?;
+    let lease = b.lease_secs.unwrap_or_else(memdusa_core::store::step_lease_secs);
+    let ok = s.store.step_heartbeat(&rid, &key, &who.qualify(&b.owner), lease).await?;
+    Ok(Json(json!({ "ok": ok })))
 }
 
 #[derive(Deserialize)]
