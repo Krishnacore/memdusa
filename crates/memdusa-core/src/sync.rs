@@ -344,7 +344,7 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut results = Vec::with_capacity(changes.len());
         for c in changes {
             results.push(self.apply_one(&mut tx, expected, c, actor, log_origin).await?);
