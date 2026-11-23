@@ -26,7 +26,6 @@ mod transcripts;
 mod watch;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1313,7 +1312,13 @@ fn git_hook_input(
 
 /// Run git in `dir`; stdout is trimmed. Non-zero exit is an error (with stderr).
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+    let out = project::git_command()
+        .context("git is not installed (on macOS: `xcode-select --install`)")?
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("running git")?;
     if !out.status.success() {
         anyhow::bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }

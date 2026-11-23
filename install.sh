@@ -161,9 +161,22 @@ printf 'Installed %s\n' "$install_dir/memdusa"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *)
-    dollar='$' # printed literally in the PATH hint below
-    printf '\n%s is not on your PATH. Add it with:\n  export PATH="%s:%sPATH"\n' \
-      "$install_dir" "$install_dir" "$dollar"
+    dollar='$' # printed literally in the PATH hints below
+    # The startup file of the user's login shell, so the PATH change survives new terminals.
+    case "$(basename "${SHELL:-sh}")" in
+      zsh) rc="$HOME/.zshrc" ;;
+      bash) if [ "$(uname -s)" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi ;;
+      fish) rc="" ;;
+      *) rc="$HOME/.profile" ;;
+    esac
+    printf '\n%s is not on your PATH yet.\n' "$install_dir"
+    if [ -n "$rc" ]; then
+      printf 'Add it for new terminals, then open a new one (or run the export line in this one):\n'
+      printf "  echo 'export PATH=\"%s:%sPATH\"' >> %s\n" "$install_dir" "$dollar" "$rc"
+    else
+      printf 'Add it with:\n  fish_add_path %s\n' "$install_dir"
+    fi
+    printf '  export PATH="%s:%sPATH"\n' "$install_dir" "$dollar"
     ;;
 esac
 

@@ -6,8 +6,26 @@ use std::process::Command;
 
 use memdusa_core::model::GitState;
 
+/// A `git` command, or `None` when git can't run here. On a Mac without the developer tools, `/usr/bin/git` is a
+/// placeholder: running it opens the "Install Command Line Developer Tools" dialog instead of running git, so a
+/// hook or `memdusa resume` would pop a system dialog. `xcode-select -p` tells without that side effect.
+pub fn git_command() -> Option<Command> {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    USABLE.get_or_init(git_usable).then(|| Command::new("git"))
+}
+
+fn git_usable() -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    let exe = format!("git{}", std::env::consts::EXE_SUFFIX); // git.exe on Windows
+    let Some(git) = std::env::split_paths(&path).map(|d| d.join(&exe)).find(|p| p.is_file()) else { return false };
+    if cfg!(target_os = "macos") && git == Path::new("/usr/bin/git") {
+        return Command::new("/usr/bin/xcode-select").arg("-p").output().is_ok_and(|o| o.status.success());
+    }
+    true
+}
+
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = git_command()?.arg("-C").arg(dir).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|s| !s.is_empty())
 }
 
@@ -22,7 +40,7 @@ pub fn detect(dir: &Path) -> String {
 /// Code state of the repo containing `dir`, from a single
 /// `git status --porcelain=v2 --branch`. `None` outside a git repo.
 pub fn git_state(dir: &Path) -> Option<GitState> {
-    let out = Command::new("git")
+    let out = git_command()?
         .arg("-C")
         .arg(dir)
         .args(["status", "--porcelain=v2", "--branch", "--untracked-files=normal"])
