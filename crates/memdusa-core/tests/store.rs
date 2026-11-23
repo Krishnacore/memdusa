@@ -1414,3 +1414,146 @@ async fn brief_nudges_to_review_from_three_flagged_memories() {
         assert!(flagged(&three.markdown) >= base + 3, "{name}\n{}", three.markdown);
     }
 }
+
+// ------------------------------------------------------------ delegated assignments
+
+fn assigned(task: &str, assignment: &str) -> DelegateTask {
+    DelegateTask { task: task.into(), assignment: Some(assignment.into()) }
+}
+
+#[tokio::test]
+async fn delegate_stores_assignments_and_only_updates_pending_steps() {
+    for (name, s) in stores().await {
+        let p = project();
+        let (first, second) = ("Build refunds: partial refunds must be capped.", "Build invoices with tests.");
+        let out = s
+            .run_delegate_assigned(
+                &p,
+                "release",
+                vec![assigned("refunds", first), assigned("docs", second), DelegateTask::new("plain")],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.assigned, 2, "{name}");
+        assert!(out.kept.is_empty(), "{name}");
+        assert_eq!(assignment_from_input(step(&out.run, "refunds").input.as_ref()), Some(first), "{name}");
+        assert_eq!(assignment_from_input(step(&out.run, "docs").input.as_ref()), Some(second), "{name}");
+        assert!(step(&out.run, "plain").input.is_none(), "{name}: plain names keep the old behaviour");
+        assert_eq!(s.delegated_assignment(&p, "refunds").await.unwrap().as_deref(), Some(first), "{name}");
+
+        // a pending task is updated; a running or done task keeps what its worker started with
+        s.step_claim(&out.run.run.id, "refunds", "w1", 600, false).await.unwrap();
+        s.step_complete(&out.run.run.id, "docs", None).await.unwrap();
+        let again = s
+            .run_delegate_assigned(
+                &p,
+                "release",
+                vec![assigned("refunds", "NEW refunds"), assigned("docs", "NEW docs"), assigned("new", "NEW new")],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.run.run.id, out.run.run.id, "{name}");
+        assert_eq!(again.assigned, 1, "{name}: only the brand new pending task");
+        assert_eq!(again.kept, vec!["refunds".to_owned(), "docs".to_owned()], "{name}");
+        assert_eq!(assignment_from_input(step(&again.run, "refunds").input.as_ref()), Some(first), "{name}");
+        assert_eq!(assignment_from_input(step(&again.run, "docs").input.as_ref()), Some(second), "{name}");
+        assert_eq!(s.delegated_assignment(&p, "refunds").await.unwrap().as_deref(), Some(first), "{name}");
+
+        // delegating again updates the still-pending step's text
+        let updated = s.run_delegate_assigned(&p, "release", vec![assigned("new", "NEWEST new")], None).await.unwrap();
+        assert_eq!(updated.assigned, 1, "{name}");
+        assert_eq!(assignment_from_input(step(&updated.run, "new").input.as_ref()), Some("NEWEST new"), "{name}");
+        assert_eq!(s.delegated_assignment(&p, "new").await.unwrap().as_deref(), Some("NEWEST new"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn worker_brief_uses_stored_assignment_without_any_prompt() {
+    for (name, s) in stores().await {
+        let p = project();
+        let tail = "Finally add tests covering the refund guard.";
+        let assignment = format!("Build refunds in shop/refunds.py. {tail}");
+        s.run_delegate_assigned(&p, "release", vec![assigned("refunds", &assignment)], None).await.unwrap();
+
+        // no prompt and no delegated_session event at all: the finding this fixes
+        let w = brief::build(&s, &p, None, None, Some("refunds")).await.unwrap();
+        assert!(w.markdown.contains("## Your assignment"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains("_stored by the coordinator_"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains(tail), "{name}: full stored assignment missing\n{}", w.markdown);
+        assert!(!w.markdown.contains("_first given to"), "{name}\n{}", w.markdown);
+
+        // a plain delegate still has no assignment section when there is no prompt
+        let p2 = project();
+        s.run_delegate(&p2, "plain", tasks(&["refunds"]), None).await.unwrap();
+        let none = brief::build(&s, &p2, None, None, Some("refunds")).await.unwrap();
+        assert!(!none.markdown.contains("## Your assignment"), "{name}\n{}", none.markdown);
+    }
+}
+
+#[tokio::test]
+async fn worker_brief_shows_first_prompt_when_it_differs_from_stored_assignment() {
+    for (name, s) in stores().await {
+        let p = project();
+        let assignment = "The coordinator's authoritative text: cap refunds and lower-case reasons.";
+        s.run_delegate_assigned(&p, "release", vec![assigned("refunds", assignment)], None).await.unwrap();
+        let base = now_ms() - 120_000;
+        let ev = |session: &str, kind: &str, text: &str, at: Millis, data: Value| NewEvent {
+            project: p.clone(),
+            session: Some(session.into()),
+            source: Some("opencode".into()),
+            kind: kind.into(),
+            content: text.into(),
+            data: Some(data),
+            created_at: Some(at),
+        };
+        s.event_append(ev("w1", "delegated_session", "refunds", base, json!({ "task": "refunds" }))).await.unwrap();
+        let told = "The first worker was told to skip validation entirely.";
+        s.event_append(ev("w1", "prompt", told, base + 1, json!({ "text": told }))).await.unwrap();
+        let later = "A later worker was told to use a database.";
+        s.event_append(ev("w1", "prompt", later, base + 2, json!({ "text": later }))).await.unwrap();
+
+        let w = brief::build(&s, &p, None, None, Some("refunds")).await.unwrap();
+        assert!(w.markdown.contains("## Your assignment"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains(assignment), "{name}: stored text missing\n{}", w.markdown);
+        assert!(w.markdown.contains("_stored by the coordinator_"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains("_first worker was told (opencode,"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains(told), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains("_latest instruction (opencode,"), "{name}\n{}", w.markdown);
+        assert!(w.markdown.contains(later), "{name}\n{}", w.markdown);
+    }
+}
+
+#[tokio::test]
+async fn stored_assignment_is_redacted_and_capped() {
+    for (name, s) in stores().await {
+        let p = project();
+        let assignment = format!(
+            "export STRIPE_SECRET_KEY=sk_live_51HxQabcdefghijklmnop\n{}",
+            "x".repeat(ASSIGNMENT_MAX_CHARS + 1000)
+        );
+        let out = s.run_delegate_assigned(&p, "release", vec![assigned("refunds", &assignment)], None).await.unwrap();
+        let stored = assignment_from_input(step(&out.run, "refunds").input.as_ref()).unwrap();
+        assert!(stored.contains("[REDACTED:"), "{name}");
+        assert!(!stored.contains("sk_live_"), "{name}");
+        assert!(stored.chars().count() <= ASSIGNMENT_MAX_CHARS, "{name}");
+        assert_eq!(s.delegated_assignment(&p, "refunds").await.unwrap().as_deref(), Some(stored), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn coordinator_brief_lists_first_line_of_stored_assignments() {
+    for (name, s) in stores().await {
+        let p = project();
+        let first = "Build refunds in shop/refunds.py";
+        let assignment = format!("{first}\n{}", "y".repeat(200));
+        s.run_delegate_assigned(&p, "release", vec![assigned("refunds", &assignment)], None).await.unwrap();
+
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(b.markdown.contains("## Delegated work"), "{name}\n{}", b.markdown);
+        assert!(b.markdown.contains(&format!("  - assignment: {first}")), "{name}\n{}", b.markdown);
+        assert!(!b.markdown.contains(&"y".repeat(100)), "{name}: only the first line is shown\n{}", b.markdown);
+        assert_eq!(b.delegated[0].assignment.as_deref(), Some(first), "{name}");
+    }
+}

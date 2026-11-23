@@ -307,8 +307,10 @@ pub struct DelegateArgs {
     /// Name of the piece of work being split up, e.g. "windows release".
     pub name: String,
     /// One short, stable name per task (e.g. "install-scripts"): it becomes the worker's `MEMDUSA_TASK`.
-    #[serde(deserialize_with = "string_list")]
-    pub tasks: Vec<String>,
+    /// Pass `{"task": "refunds", "assignment": "…"}` to store the assignment for that task; a plain
+    /// string keeps the old behaviour (the worker's first prompt was the assignment).
+    #[serde(deserialize_with = "delegate_tasks")]
+    pub tasks: Vec<DelegateTask>,
     /// Calling again with the same key (or, without one, the same name) reuses the run and adds missing tasks.
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -719,20 +721,21 @@ impl MemdusaMcp {
     }
 
     #[tool(
-        description = "Coordinator: split work into tasks for other agents (any harness). Creates one durable run with a pending step per task and returns, per task, the env line (MEMDUSA_RUN=... MEMDUSA_TASK=...) to launch its worker with. Workers claim their task with a lease; a crashed worker's task goes stale and a replacement takes it over; finished tasks are never redone. `resume` shows each task's status."
+        description = "Coordinator: split work into tasks for other agents (any harness). Each task is a plain name or a {task, assignment} object; a stored assignment is shown to the worker's brief even if no prompt was recorded. Creates one durable run with a pending step per task and returns, per task, the env line (MEMDUSA_RUN=... MEMDUSA_TASK=...) to launch its worker with. Workers claim their task with a lease; a crashed worker's task goes stale and a replacement takes it over; finished tasks are never redone. `resume` shows each task's status."
     )]
     async fn delegate(&self, Parameters(a): Parameters<DelegateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
         let project = self.project(&ctx, a.project)?;
         if let Some(remote) = &self.remote {
-            let run = remote
+            let outcome = remote
                 .delegate(&project, &a.name, &a.tasks, a.idempotency_key.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
-            return Ok(brief::delegate_report(&run));
+            return Ok(brief::delegate_report(&outcome));
         }
         authorize(&ctx, &project, Access::Write, "delegate").await?;
-        let run = self.store.run_delegate(&project, &a.name, a.tasks, a.idempotency_key).await.map_err(err)?;
-        Ok(brief::delegate_report(&run))
+        let outcome =
+            self.store.run_delegate_assigned(&project, &a.name, a.tasks, a.idempotency_key).await.map_err(err)?;
+        Ok(brief::delegate_report(&outcome))
     }
 
     #[tool(
@@ -1097,6 +1100,44 @@ mod tests {
         let r = r.unwrap();
         let text = serde_json::to_value(&r.content[0]).unwrap()["text"].as_str().unwrap().to_owned();
         (r.is_error != Some(true), text)
+    }
+
+    #[test]
+    fn delegate_args_accept_plain_names_and_assignment_objects() {
+        let a: DelegateArgs = serde_json::from_value(serde_json::json!({
+            "name": "release",
+            "tasks": ["docs", {"task": "refunds", "assignment": "Build refunds."}]
+        }))
+        .unwrap();
+        assert_eq!(a.tasks.len(), 2);
+        assert_eq!(a.tasks[0].task, "docs");
+        assert_eq!(a.tasks[0].assignment, None);
+        assert_eq!(a.tasks[1].task, "refunds");
+        assert_eq!(a.tasks[1].assignment.as_deref(), Some("Build refunds."));
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_stores_object_assignments() {
+        let c = client().await;
+        let (ok, text) = call(
+            &c,
+            "delegate",
+            serde_json::json!({
+                "name": "release",
+                "tasks": [
+                    {"task": "refunds", "assignment": "Build refunds with a guard. TailMcpXYZ."},
+                    "docs"
+                ]
+            }),
+        )
+        .await;
+        assert!(ok, "{text}");
+        assert!(text.contains("1 assignment stored"), "{text}");
+        assert!(!text.contains("TailMcpXYZ"), "{text}: env lines stay clean");
+
+        let (ok, brief) = call(&c, "resume", serde_json::json!({ "task": "refunds" })).await;
+        assert!(ok, "{brief}");
+        assert!(brief.contains("## Your assignment") && brief.contains("TailMcpXYZ."), "{brief}");
     }
 
     #[tokio::test]

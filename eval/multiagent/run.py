@@ -6,7 +6,8 @@
 
 One trial:
   1. The orchestrator (this script, not an agent) creates a durable run with the
-     scenario's steps via `memdusa delegate`.
+     scenario's steps via `memdusa delegate --from-file`, storing each task's
+     assignment so a replacement's brief carries it even if no prompt was recorded.
   2. Worker 1 (default: OpenCode) gets its full assignment as the prompt and is
      killed as soon as its first `file_change` event reaches the database.
   3. Worker 2 (default: Codex) gets a different assignment and runs to
@@ -599,7 +600,12 @@ def lines_kept(a_text: str | None, b_text: str | None) -> float | None:
 
 
 def brief_check(brief: str, tail: str) -> dict:
-    return {"has_assignment_section": "## Your assignment" in brief, "has_distinctive_tail": tail in brief}
+    return {
+        "has_assignment_section": "## Your assignment" in brief,
+        "has_distinctive_tail": tail in brief,
+        # The coordinator's stored assignment (not merely a worker prompt) was shown.
+        "has_stored_assignment": "_stored by the coordinator_" in brief,
+    }
 
 
 def who_did_what(coordinator_brief: str, sources: list[str]) -> dict[str, bool]:
@@ -623,6 +629,7 @@ def grade(trial: Path, repo: Path, scenario_dir: Path, scenario: dict, task_by_k
     }
     brief = (trial / "brief-before-replacement.md").read_text()
     result["brief"] = brief_check(brief, task_by_key[crash_task]["assignment_tail"])
+    result["brief_used_stored_assignment"] = result["brief"]["has_stored_assignment"]
     result["worker1_lines_kept"] = lines_kept(
         show(repo, "worker1-state", scenario["rework_path"]),
         show(repo, "HEAD", scenario["rework_path"]))
@@ -631,11 +638,15 @@ def grade(trial: Path, repo: Path, scenario_dir: Path, scenario: dict, task_by_k
     result["who_did_what"] = who_did_what(coord, sources)
     result["stats"] = stats
     result["all_steps_done"] = all(result["steps_done"].values())
-    result["brief_carried_assignment"] = all(result["brief"].values())
+    # The `assignment` metric keeps its old meaning: the brief carried the tail.
+    result["brief_carried_assignment"] = (
+        result["brief"]["has_assignment_section"] and result["brief"]["has_distinctive_tail"]
+    )
     result["all_sources_attributed"] = all(result["who_did_what"].values())
     result["passed"] = (
         result["all_steps_done"]
         and result["brief_carried_assignment"]
+        and result["brief_used_stored_assignment"]
         and result["all_sources_attributed"]
         and all(v["passed"] == v["total"] for v in result["hidden_tests"].values())
     )
@@ -658,9 +669,12 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     worker2_task = next(k for k in task_by_key if k != crash_task)
     base = base_environment(trial)
 
-    # --- coordinator: one durable run with one step per task
+    # --- coordinator: one durable run with one step per task, assignments stored at delegation time
+    tasks_file = trial / "tasks.json"
+    tasks_file.write_text(json.dumps(
+        [{"task": t["key"], "assignment": t["assignment"]} for t in scenario["tasks"]], ensure_ascii=False))
     delegate_out = sh(memcli(memdusa, db_url, "--project", PROJECT, "delegate",
-                             scenario["run_name"], *task_by_key), cwd=repo, env=base)
+                             scenario["run_name"], "--from-file", str(tasks_file)), cwd=repo, env=base)
     run_id, _ = parse_delegate(delegate_out)
     (trial / "delegate.txt").write_text(delegate_out)
     install_harnesses(memdusa, db_url, repo, harnesses, base, trial)
@@ -747,17 +761,19 @@ def summarize(trials: list[dict]) -> str:
         cost = s3.get("cost_usd")
         rows.append(
             f"| {t['trial']} | {fmt(h['refunds'])} | {fmt(h['invoices'])} | {b('all_steps_done')} "
-            f"| {b('brief_carried_assignment')} | {'–' if kept is None else f'{kept:.0%}'} "
+            f"| {b('brief_carried_assignment')} | {b('brief_used_stored_assignment')} "
+            f"| {'–' if kept is None else f'{kept:.0%}'} "
             f"| {b('all_sources_attributed')} | {s1.get('duration_s', '–')}s "
             f"| {s2.get('num_turns') or '–'} | {s3.get('num_turns') or '–'} "
             f"| {'–' if cost is None else f'${cost:.2f}'} | {b('passed')} |"
         )
     return "\n".join([
         "Metric: hidden tests are never shown to the workers; `assignment` means the replacement's brief contained",
-        "\"## Your assignment\" and the assignment's distinctive tail; `lines kept` is how much of worker 1's",
+        "\"## Your assignment\" and the assignment's distinctive tail (as before); `stored` means the brief showed",
+        "the coordinator's stored assignment rather than only a worker prompt; `lines kept` is how much of worker 1's",
         "`shop/refunds.py` survived the takeover; `attributed` means \"Who did what\" named all three sources.\n",
-        f"| trial | refunds tests | invoices tests | steps done | assignment | lines kept | attributed | worker1 (s) | {w2_label} turns | {rep_label} turns | {rep_label} cost | passed |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        f"| trial | refunds tests | invoices tests | steps done | assignment | stored | lines kept | attributed | worker1 (s) | {w2_label} turns | {rep_label} turns | {rep_label} cost | passed |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         *rows,
     ])
 
@@ -785,8 +801,12 @@ def self_test() -> int:
     ok(lines_kept(None, "x") is None, "lines_kept missing")
     tail = "Finally, add tests in `tests/test_refunds.py` covering the lowercased reason."
     brief = "## Your assignment\n_first given to opencode 1m ago_\n\n> " + tail + "\n"
-    ok(brief_check(brief, tail) == {"has_assignment_section": True, "has_distinctive_tail": True}, "brief_check")
+    ok(brief_check(brief, tail) == {
+        "has_assignment_section": True, "has_distinctive_tail": True, "has_stored_assignment": False,
+    }, "brief_check")
     ok(not brief_check(brief, "no such tail")["has_distinctive_tail"], "brief_check negative")
+    stored = brief.replace("_first given to opencode 1m ago_", "_stored by the coordinator_")
+    ok(brief_check(stored, tail)["has_stored_assignment"], "brief_check stored")
     coord = ("**Who did what:**\n- **opencode**: changed shop/refunds.py\n"
              "- **codex**: changed shop/invoices.py\n- **claude-code**: last active 1m ago\n\n"
              "**Files changed recently:** shop/refunds.py\n")
