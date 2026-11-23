@@ -144,7 +144,7 @@ impl Store {
     pub async fn import(&self, records: Vec<Record>) -> Result<ImportReport> {
         let mut rep = ImportReport::default();
         let red = self.redactor();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         for rec in records {
             let (sql, args): (&str, Vec<Option<String>>) = match rec {
                 Record::Header { .. } => continue,
