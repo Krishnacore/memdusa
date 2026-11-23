@@ -19,9 +19,14 @@ One trial:
      brief carrying the full assignment, how much of worker 1's file the
      replacement kept, "Who did what" attribution and reported cost/turns.
 
-Harness configs are installed at `--scope project` into a per-trial scratch
-repo (never the user's global harness config). The database URL is baked into
-those installs with `memdusa install --database-url`; worker environments are
+Any harness can play any role: opencode, codex, claude, cursor, pi, antigravity
+and hermes all have headless runners. The first six are installed at
+`--scope project` into a per-trial scratch repo (never the user's global
+harness config). Hermes has only a user config, so its runner copies
+`~/.hermes/config.yaml` aside, installs with `--scope user`, runs, and restores
+the original byte for byte (verified by hash) even on SIGINT/SIGTERM. Hermes is
+only used when `--allow-user-config` is passed. The database URL is baked into
+every install with `memdusa install --database-url`; worker environments are
 stripped of every MEMDUSA_* variable except the four coordination variables.
 
 Usage:
@@ -30,13 +35,18 @@ Usage:
   uv run eval/multiagent/run.py                              # one real trial
   uv run eval/multiagent/run.py --trials 3 --lease-secs 45
   uv run eval/multiagent/run.py --harnesses worker1=opencode,worker2=codex,replacement=claude
+  uv run eval/multiagent/run.py --matrix --dry-run            # stub matrix, all harnesses
+  uv run eval/multiagent/run.py --matrix                      # real 6-harness matrix
+  uv run eval/multiagent/run.py --matrix --allow-user-config  # include hermes
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -58,15 +68,51 @@ PROJECT = "github.com/memdusa-eval/shop-team"
 
 # The only MEMDUSA_* variables a worker's environment is allowed to keep.
 COORD_VARS = ("MEMDUSA_RUN", "MEMDUSA_TASK", "MEMDUSA_PARENT", "MEMDUSA_STEP_LEASE_SECS")
+
 # Memdusa's `source` on journal events for each harness (used by "Who did what").
-SOURCE = {"claude": "claude-code", "codex": "codex", "opencode": "opencode"}
+# Values are Harness::agent() in crates/memdusa/src/adapters.rs.
+SOURCE = {
+    "claude": "claude-code",
+    "codex": "codex",
+    "opencode": "opencode",
+    "cursor": "cursor",
+    "pi": "pi",
+    "antigravity": "antigravity",
+    "hermes": "hermes",
+}
 # `memdusa install` uses the full harness id, while the runners use short names.
-INSTALL_NAME = {"claude": "claude-code", "codex": "codex", "opencode": "opencode"}
+INSTALL_NAME = {
+    "claude": "claude-code", "codex": "codex", "opencode": "opencode",
+    "cursor": "cursor", "pi": "pi", "antigravity": "antigravity", "hermes": "hermes",
+}
+# Absolute paths where known; the rest are resolved on PATH by the caller.
 REAL_BIN = {
     "claude": "claude",
     "codex": "/opt/homebrew/bin/codex",
     "opencode": str(Path.home() / ".opencode" / "bin" / "opencode"),
+    "cursor": "/opt/homebrew/bin/cursor-agent",
+    "pi": str(Path.home() / ".nvm/versions/node/v22.21.1/bin/pi"),
+    "antigravity": str(Path.home() / ".local/bin/agy"),
+    "hermes": str(Path.home() / ".local/bin/hermes"),
 }
+# Exact headless launch lines, verified live on this machine. The prompt is
+# appended last. Cursor/pi/antigravity are project-scope installs; hermes is
+# handled specially because it only has a user config.
+HEADLESS_CMD = {
+    "cursor": lambda b: [b, "-p", "--trust", "--approve-mcps", "--output-format", "text"],
+    "pi": lambda b: [b, "-p", "--approve", "--model", "anthropic/claude-haiku-4-5"],
+    "antigravity": lambda b: [b, "-p"],
+    "hermes": lambda b: [b, "--accept-hooks", "-z"],
+}
+# Default order for --matrix. Hermes is appended only with --allow-user-config.
+MATRIX_HARNESSES = ["opencode", "codex", "claude", "cursor", "pi", "antigravity"]
+# Hermes only has ~/.hermes/config.yaml. Overridable so dry runs never touch it.
+HERMES_CONFIG = Path(os.environ.get("MEMDUSA_EVAL_HERMES_CONFIG",
+                                    str(Path.home() / ".hermes" / "config.yaml")))
+
+
+class HermesInterrupted(BaseException):
+    """Raised from the SIGINT/SIGTERM handler so the config guard can restore."""
 
 
 # ---------------------------------------------------------------- helpers
@@ -134,8 +180,12 @@ def prepare(scenario_dir: Path, trial: Path) -> None:
 
 def install_harnesses(memdusa: Path, db_url: str, repo: Path, harnesses: dict,
                       base: dict, trial: Path) -> None:
-    """Project-scope installs only: every config file lands inside the scratch repo."""
-    for harness in sorted(set(harnesses.values())):
+    """Project-scope installs only: every config file lands inside the scratch repo.
+
+    Hermes is skipped here: it has no project scope, so its runner installs it
+    with `--scope user` and restores the user config immediately after the run.
+    """
+    for harness in sorted(set(harnesses.values()) - {"hermes"}):
         env = dict(base)
         if harness == "opencode":
             # `opencode mcp add` must not write the user's global config.
@@ -249,6 +299,78 @@ def read_log(proc: subprocess.Popen, log: Path) -> None:
         for line in proc.stdout:
             f.write(line)
             f.flush()
+
+
+# ---------------------------------------------------------------- hermes user config
+
+@contextlib.contextmanager
+def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, env: dict):
+    """Back up, install into, and byte-for-byte restore Hermes' only config.
+
+    `memdusa install hermes --scope user` rewrites `~/.hermes/config.yaml` in
+    place and leaves `config.yaml.memdusa-backup`. We keep our own copy (in the
+    trial dir) so we can put the file back even if the harness edited it. The
+    restore runs from a `finally` and from a SIGINT/SIGTERM handler, and the
+    hash is verified. The backup file is removed when it is identical to the
+    restored original, so no global config is left modified.
+    """
+    original = config.read_bytes() if config.exists() else b""
+    before = hashlib.sha256(original).hexdigest()
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_bytes(original)
+
+    # --accept-hooks can also append the trial's hook commands to Hermes'
+    # global allowlist, and Hermes snapshots config.yaml into backups/config/.
+    # Both are global state created by this run: restore them as well.
+    allowlist = config.parent / "shell-hooks-allowlist.json"
+    allow_original = allowlist.read_bytes() if allowlist.exists() else None
+    backup_dir = config.parent / "backups" / "config"
+    pre_backups = ({p.name: p.read_bytes() for p in backup_dir.glob("config.yaml.*")}
+                   if backup_dir.exists() else {})
+
+    previous = {}
+
+    def on_signal(signum, _frame):
+        raise HermesInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.signal(sig, on_signal)
+
+    install_env = dict(env)
+    install_env["HERMES_HOME"] = str(config.parent)
+    try:
+        sh(memcli(memdusa, db_url, "install", "hermes", "--scope", "user"),
+           cwd=backup.parent, env=install_env)
+        yield before
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        config.write_bytes(original)
+        after = hashlib.sha256(config.read_bytes()).hexdigest()
+        if after != before:
+            raise RuntimeError(f"hermes config restore failed: {before} != {after}")
+        memdusa_backup = config.with_name(config.name + ".memdusa-backup")
+        identical = memdusa_backup.exists() and memdusa_backup.read_bytes() == original
+        if identical:
+            memdusa_backup.unlink()
+        if allow_original is None:
+            allowlist.unlink(missing_ok=True)
+        else:
+            allowlist.write_bytes(allow_original)
+        if backup_dir.exists():
+            for new_backup in set(backup_dir.glob("config.yaml.*")) - {backup_dir / n for n in pre_backups}:
+                new_backup.unlink()
+            # Hermes prunes old backups when it writes new ones; put back any
+            # pre-existing file it removed so the global state is unchanged.
+            for name, data in pre_backups.items():
+                if not (backup_dir / name).exists():
+                    (backup_dir / name).write_bytes(data)
+        backup.parent.joinpath("hermes-config-hashes.json").write_text(json.dumps(
+            {"config": str(config), "before": before, "after": after,
+             "backup_removed": identical,
+             "allowlist_before": hashlib.sha256(allow_original).hexdigest() if allow_original else None,
+             "allowlist_after": hashlib.sha256(allowlist.read_bytes()).hexdigest() if allowlist.exists() else None},
+            indent=2))
 
 
 # ---------------------------------------------------------------- harness runners
@@ -385,6 +507,78 @@ def claude_stats(log: Path) -> dict:
     return stats
 
 
+def generic_stats(log: Path) -> dict:
+    """Best-effort effort stats from the JSON lines the new harnesses may print."""
+    stats = {"num_turns": None, "cost_usd": None}
+    for line in log.read_text(errors="replace").splitlines() if log.exists() else []:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("num_turns") is not None:
+            stats["num_turns"] = ev["num_turns"]
+        cost = ev.get("total_cost_usd", ev.get("total_cost"))
+        if cost is not None:
+            stats["cost_usd"] = cost
+    return stats
+
+
+def run_headless(harness: str, binary: str, prompt: str, repo: Path, env: dict, log: Path, timeout: float, *,
+                 memdusa: Path | None = None, db_url: str | None = None, seen: set[str] | None = None,
+                 kill_on_source: str | None = None, hermes_config: Path | None = None,
+                 trial: Path | None = None) -> dict:
+    """Cursor / pi / antigravity / hermes: headless, isolated, timeout-bounded.
+
+    All four use stdin=/dev/null, log stdout+stderr to the trial log and run in
+    their own process group so a worker can be killed as soon as its first
+    file_change event is journaled. Hermes additionally gets a guarded user
+    config (install + restore) and TERMINAL_CWD pinned to the scratch repo.
+    """
+    cmd = HEADLESS_CMD[harness](binary) + [prompt]
+    run_env = dict(env)
+    cfg = None
+    if harness == "hermes":
+        cfg = hermes_config or HERMES_CONFIG
+        run_env["TERMINAL_CWD"] = str(repo)
+        run_env["HERMES_HOME"] = str(cfg.parent)
+        run_env["MEMDUSA_EVAL_HERMES_CONFIG"] = str(cfg)
+    start = time.monotonic()
+    proc = None
+    thread = None
+    first_change = None
+    killed = False
+    guard = (hermes_config_guard(cfg, trial / "hermes-config-original.yaml", memdusa, db_url, run_env)
+             if harness == "hermes" else contextlib.nullcontext())
+    with guard:
+        try:
+            proc = subprocess.Popen(cmd, cwd=repo, env=run_env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True)
+            thread = threading.Thread(target=read_log, args=(proc, log), daemon=True)
+            thread.start()
+            if kill_on_source and memdusa and db_url:
+                ev = wait_for_file_change(memdusa, db_url, kill_on_source, seen or set(), proc, timeout)
+                first_change = ev.get("content") if ev else None
+            else:
+                deadline = start + timeout
+                while proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.2)
+            if proc.poll() is None:
+                killed = True
+                kill_group(proc)
+        finally:
+            if proc is not None and proc.poll() is None:
+                kill_group(proc)
+            if thread is not None:
+                thread.join(timeout=8)
+    stats = {"killed": killed, "first_file_change": first_change,
+             "duration_s": round(time.monotonic() - start, 1),
+             "exit_code": proc.returncode if proc else None,
+             "command": cmd[:-1] + ["<assignment>"]}
+    stats.update(generic_stats(log))
+    return stats
+
+
 # ---------------------------------------------------------------- stub harnesses
 
 STUB_REFUNDS_PARTIAL = '''"""Refunds for the shop. Amounts are integer cents."""
@@ -477,8 +671,13 @@ def test_invoice_format():
 
 
 def make_stub_scripts(trial: Path, memdusa: Path, db_url: str, scenario: dict,
-                      task_by_key: dict, crash_task: str) -> dict[str, str]:
-    """Generate fake harness executables: real hooks/DB, no model calls, no cost."""
+                      task_by_key: dict, crash_task: str, harnesses: dict) -> dict[str, str]:
+    """Generate fake harness executables: real hooks/DB, no model calls, no cost.
+
+    Stubs are keyed by *role*, not by harness, so any harness can play any role.
+    Each one journals events under its harness's real memdusa source, which is
+    what "Who did what" reads. Only the harness that plays a role gets a stub.
+    """
     prelude = '''#!/usr/bin/env python3
 import json, os, pathlib, subprocess, time
 MEMDUSA = {memdusa}
@@ -519,27 +718,31 @@ def write(rel, text):
 '''.format(memdusa=json.dumps(str(memdusa)), db_url=json.dumps(db_url),
            project=json.dumps(PROJECT), repo=json.dumps(str(trial / "repo")))
 
+    agent = {role: json.dumps(SOURCE[harnesses[role]]) for role in harnesses}
+    other_task = next(t["assignment"] for t in scenario["tasks"] if t["key"] != crash_task)
     bodies = {
-        "opencode": f'''
-AGENT = "opencode"
+        "worker1": f'''
+AGENT = {agent["worker1"]}
 assignment = {json.dumps(task_by_key[crash_task]["assignment"])}
 start(assignment)
 write("shop/refunds.py", {json.dumps(STUB_REFUNDS_PARTIAL)})
-print("stub opencode: wrote shop/refunds.py; waiting to be killed", flush=True)
+print(json.dumps({{"type": "result", "num_turns": 1, "total_cost_usd": 0.01}}), flush=True)
+print("stub worker1: wrote shop/refunds.py; waiting to be killed", flush=True)
 if os.environ.get("EVAL_STUB_SLEEP") == "1":
     time.sleep(300)
 ''',
-        "codex": f'''
-AGENT = "codex"
-assignment = {json.dumps(next(t["assignment"] for t in scenario["tasks"] if t["key"] != crash_task))}
+        "worker2": f'''
+AGENT = {agent["worker2"]}
+assignment = {json.dumps(other_task)}
 start(assignment)
 write("shop/invoices.py", {json.dumps(STUB_INVOICES)})
 write("tests/test_invoices.py", {json.dumps(STUB_INVOICES_TESTS)})
-done("invoices implemented by stub codex")
-print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 100, "output_tokens": 50}}}}))
+done("invoices implemented by stub worker2")
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 100, "output_tokens": 50}},
+                  "num_turns": 1, "total_cost_usd": 0.01}}))
 ''',
-        "claude": f'''
-AGENT = "claude-code"
+        "replacement": f'''
+AGENT = {agent["replacement"]}
 start({json.dumps(scenario["replacement_prompt"])})
 existing = (REPO / "shop/refunds.py").read_text()
 write("shop/refunds.py", existing + {json.dumps(STUB_REFUNDS_APPEND)})
@@ -549,11 +752,21 @@ print(json.dumps({{"type": "result", "subtype": "success", "num_turns": 2, "tota
 ''',
     }
     paths = {}
-    for harness, body in bodies.items():
-        path = trial / f"stub-{harness}.py"
+    for role, body in bodies.items():
+        harness = harnesses[role]
+        if harness == "hermes":
+            # Simulate the harness editing its user config during the run: the
+            # runner must restore it byte for byte afterwards.
+            body += '''
+cfg = os.environ.get("MEMDUSA_EVAL_HERMES_CONFIG")
+if cfg:
+    p = pathlib.Path(cfg)
+    p.write_bytes(p.read_bytes() + b"\\n# stub hermes touched this config\\n")
+'''
+        path = trial / f"stub-{role}-{harness}.py"
         path.write_text(prelude + body)
         path.chmod(0o755)
-        paths[harness] = str(path)
+        paths[role] = str(path)
     return paths
 
 
@@ -612,6 +825,10 @@ def who_did_what(coordinator_brief: str, sources: list[str]) -> dict[str, bool]:
     match = re.search(r"\*\*Who did what:\*\*\n(.*?)(?:\n\n|\Z)", coordinator_brief, re.S)
     section = match.group(1) if match else ""
     named = set(re.findall(r"^- \*\*([^*]+)\*\*:", section, re.M))
+    # Cursor runs Claude Code hooks by default ("Third-Party Imports"), so a
+    # Cursor session can name an extra `claude-code` source. Only the sources
+    # that actually played a role are required; extras are tolerated (and
+    # documented in eval/README.md).
     return {source: source in named for source in sources}
 
 
@@ -655,7 +872,8 @@ def grade(trial: Path, repo: Path, scenario_dir: Path, scenario: dict, task_by_k
 
 # ---------------------------------------------------------------- one trial
 
-def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, out: Path) -> dict:
+def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, out: Path,
+              harnesses: dict | None = None) -> dict:
     trial = out / "scratch" / f"trial-{i}"
     trial.mkdir(parents=True)
     prepare(scenario_dir, trial)
@@ -663,11 +881,22 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     db_url = f"sqlite:{(trial / 'home' / 'memdusa.db').as_posix()}"
 
     task_by_key = {t["key"]: t for t in scenario["tasks"]}
-    harnesses = dict(scenario["harnesses"])
-    harnesses.update(args.harnesses)
+    harnesses = dict(harnesses) if harnesses else dict(scenario["harnesses"])
+    if not harnesses or args.harnesses:
+        harnesses.update(args.harnesses)
     crash_task = scenario["crash_task"]
     worker2_task = next(k for k in task_by_key if k != crash_task)
     base = base_environment(trial)
+
+    # Hermes' user config is the only global file this eval ever touches. In
+    # dry-run mode use a synthetic config in the trial dir, never the real one.
+    if args.dry_run:
+        hermes_home = trial / "hermes-home"
+        hermes_home.mkdir(exist_ok=True)
+        hermes_config = hermes_home / "config.yaml"
+        hermes_config.write_text("# synthetic hermes config for dry run\nmodel:\n  provider: anthropic\n")
+    else:
+        hermes_config = args.hermes_config
 
     # --- coordinator: one durable run with one step per task, assignments stored at delegation time
     tasks_file = trial / "tasks.json"
@@ -681,15 +910,25 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
 
     stubs = None
     if args.dry_run:
-        stubs = make_stub_scripts(trial, memdusa, db_url, scenario, task_by_key, crash_task)
+        stubs = make_stub_scripts(trial, memdusa, db_url, scenario, task_by_key, crash_task, harnesses)
 
-    def binary(harness: str) -> str:
-        return stubs[harness] if stubs else REAL_BIN[harness]
+    def binary(role: str, harness: str) -> str:
+        return stubs[role] if stubs else REAL_BIN[harness]
 
     runners = {"opencode": run_opencode, "codex": run_codex, "claude": run_claude}
+    seen = {ev["id"] for ev in export_events(memdusa, db_url)}
+
+    def launch(role: str, harness: str, prompt: str, env: dict, log: Path, *,
+               kill_on_source: str | None = None) -> dict:
+        common = dict(memdusa=memdusa, db_url=db_url, seen=seen, kill_on_source=kill_on_source)
+        if harness in HEADLESS_CMD:
+            common.update(hermes_config=hermes_config, trial=trial)
+            return run_headless(harness, binary(role, harness), prompt, repo, env, log,
+                                args.worker_timeout, **common)
+        return runners[harness](binary(role, harness), prompt, repo, env, log,
+                                args.worker_timeout, **common)
 
     # --- worker 1: full assignment, killed on its first file_change event
-    seen = {ev["id"] for ev in export_events(memdusa, db_url)}
     env1 = worker_env(base, run_id, crash_task, args.lease_secs)
     # Same isolated config dir as the install, so project MCP registration is visible
     # and no global OpenCode config is read or written.
@@ -697,9 +936,8 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     if stubs:
         env1["EVAL_STUB_SLEEP"] = "1"  # only the crashing worker's stub waits to be killed
     h1 = harnesses["worker1"]
-    stats1 = runners[h1](binary(h1), task_by_key[crash_task]["assignment"], repo, env1,
-                         trial / f"worker1-{h1}.log", args.worker_timeout,
-                         memdusa=memdusa, db_url=db_url, seen=seen, kill_on_source=SOURCE[h1])
+    stats1 = launch("worker1", h1, task_by_key[crash_task]["assignment"], env1,
+                    trial / f"worker1-{h1}.log", kill_on_source=SOURCE[h1])
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "-c", "user.email=eval@memdusa", "-c", "user.name=eval", "commit", "-qm", "worker1-state",
         "--allow-empty"], cwd=repo)
@@ -709,8 +947,8 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     # --- worker 2: different harness, different task, runs to `task_complete`
     env2 = worker_env(base, run_id, worker2_task, args.lease_secs)
     h2 = harnesses["worker2"]
-    stats2 = runners[h2](binary(h2), task_by_key[worker2_task]["assignment"], repo, env2,
-                         trial / f"worker2-{h2}.log", args.worker_timeout)
+    stats2 = launch("worker2", h2, task_by_key[worker2_task]["assignment"], env2,
+                    trial / f"worker2-{h2}.log")
 
     # --- wait for the crashed worker's lease to go stale, then capture the handoff
     stale = wait_for_stale(memdusa, db_url, run_id, crash_task, args.stale_timeout)
@@ -722,8 +960,8 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
 
     # --- replacement: only "Continue your delegated task." (brief via memdusa)
     h3 = harnesses["replacement"]
-    stats3 = runners[h3](binary(h3), scenario["replacement_prompt"], repo, env3,
-                         trial / f"replacement-{h3}.log", args.worker_timeout)
+    stats3 = launch("replacement", h3, scenario["replacement_prompt"], env3,
+                    trial / f"replacement-{h3}.log")
     # "Who did what" needs all three sources, so read the coordinator brief again
     # after the replacement has journaled its events.
     (trial / "coordinator-brief.md").write_text(
@@ -737,11 +975,11 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
 
     # Keep the small artifacts, drop the heavy scratch in non---keep runs.
     if not args.keep:
-        for name in ("repo", "venv", "home", "xdg"):
+        for name in ("repo", "venv", "home", "xdg", "hermes-home"):
             shutil.rmtree(trial / name, ignore_errors=True)
         if stubs:
-            for h in stubs:
-                (trial / f"stub-{h}.py").unlink(missing_ok=True)
+            for role, path in stubs.items():
+                Path(path).unlink(missing_ok=True)
     return result
 
 
@@ -776,6 +1014,78 @@ def summarize(trials: list[dict]) -> str:
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         *rows,
     ])
+
+
+def failing_metrics(t: dict) -> list[str]:
+    """Which graded metrics failed in one trial (for the per-harness table)."""
+    bad = []
+    for task, res in t["hidden_tests"].items():
+        if res["passed"] != res["total"]:
+            bad.append(f"{task} tests {res['passed']}/{res['total']}")
+    if not t["all_steps_done"]:
+        bad.append("steps done")
+    if not t["brief_carried_assignment"]:
+        bad.append("assignment")
+    if not t["all_sources_attributed"]:
+        bad.append("attributed")
+    return bad
+
+
+def summarize_matrix(trials: list[dict]) -> str:
+    """Per-trial rows with roles + all metrics, then a per-harness role table."""
+    rows = []
+    for t in trials:
+        h = t["hidden_tests"]
+        hs = t["harnesses"]
+        fmt = lambda d: f"{d['passed']}/{d['total']}"
+        b = lambda key: "yes" if t[key] else "NO"
+        kept = t["worker1_lines_kept"]
+        s1, s2, s3 = t["stats"]["worker1"], t["stats"]["worker2"], t["stats"]["replacement"]
+        cost = s3.get("cost_usd")
+        rows.append(
+            f"| {t['trial']} | {hs['worker1']} | {hs['worker2']} | {hs['replacement']} "
+            f"| {fmt(h['refunds'])} | {fmt(h['invoices'])} | {b('all_steps_done')} "
+            f"| {b('brief_carried_assignment')} | {'–' if kept is None else f'{kept:.0%}'} "
+            f"| {b('all_sources_attributed')} | {s1.get('duration_s', '–')}s "
+            f"| {s2.get('num_turns') or '–'} | {s3.get('num_turns') or '–'} "
+            f"| {'–' if cost is None else f'${cost:.2f}'} | {b('passed')} |"
+        )
+
+    per: dict[tuple[str, str], list[dict]] = {}
+    for t in trials:
+        for role in ("worker1", "worker2", "replacement"):
+            per.setdefault((t["harnesses"][role], role), []).append(t)
+    summary = []
+    for (harness, role), group in sorted(per.items()):
+        passed = sum(1 for t in group if t["passed"])
+        failed = [", ".join(failing_metrics(t)) or "unknown" for t in group if not t["passed"]]
+        summary.append(
+            f"| {harness} | {role} | {len(group)} | {passed} | {len(group) - passed} "
+            f"| {'; '.join(failed) if failed else '–'} |"
+        )
+
+    return "\n".join([
+        "Each harness is rotated through every role. Metrics are the same as the single-trial report; roles name",
+        "the harness that actually ran. `lines kept` is worker 1's share of `shop/refunds.py` that survived.\n",
+        "| trial | worker1 | worker2 | replacement | refunds | invoices | steps | assignment | lines kept | attributed | worker1 (s) | w2 turns | rep turns | rep cost | passed |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        *rows,
+        "\nPer-harness summary (each selected harness appears once per role):\n",
+        "| harness | role | trials | pass | fail | failing metric(s) |",
+        "|---|---|---|---|---|---|",
+        *summary,
+    ])
+
+
+def matrix_trials(harnesses: list[str]) -> list[dict]:
+    """Rotate H so trial i uses H[i], H[i+1], H[i+2] (mod len): every harness
+    plays every role at least once, in `len(harnesses)` trials."""
+    n = len(harnesses)
+    return [
+        {"worker1": harnesses[i % n], "worker2": harnesses[(i + 1) % n],
+         "replacement": harnesses[(i + 2) % n]}
+        for i in range(n)
+    ]
 
 
 def self_test() -> int:
@@ -813,6 +1123,37 @@ def self_test() -> int:
     w = who_did_what(coord, ["opencode", "codex", "claude-code"])
     ok(all(w.values()), "who_did_what")
     ok(not who_did_what(coord, ["cursor"])["cursor"], "who_did_what negative")
+
+    # Every harness must be launchable, installable and attributable.
+    for h in MATRIX_HARNESSES + ["hermes"]:
+        ok(h in SOURCE and h in INSTALL_NAME and h in REAL_BIN, f"harness maps: {h}")
+        ok(h in HEADLESS_CMD or h in ("opencode", "codex", "claude"), f"runner: {h}")
+
+    # Cursor also imports Claude Code hooks, so an extra claude-code source in
+    # a Cursor session must not make attribution fail.
+    cursor_coord = ("**Who did what:**\n- **opencode**: changed shop/refunds.py\n"
+                    "- **codex**: changed shop/invoices.py\n- **claude-code**: last active 1m ago\n"
+                    "- **cursor**: changed shop/refunds.py\n\n")
+    ok(all(who_did_what(cursor_coord, ["cursor", "codex", "opencode"]).values()),
+       "who_did_what tolerates extra claude-code source next to cursor")
+
+    # Rotation: every harness in every role; hermes included only when asked.
+    hs = MATRIX_HARNESSES + ["hermes"]
+    rotated = matrix_trials(hs)
+    ok(len(rotated) == len(hs), "matrix trial count")
+    for h in hs:
+        for role in ("worker1", "worker2", "replacement"):
+            ok(any(t[role] == h for t in rotated), f"matrix covers {h} as {role}")
+    ok(len(matrix_trials([])) == 0, "matrix empty")
+
+    # Failing-metric extraction for the per-harness summary.
+    fake = {"hidden_tests": {"refunds": {"passed": 1, "total": 2},
+                             "invoices": {"passed": 1, "total": 1}},
+            "all_steps_done": False, "brief_carried_assignment": True,
+            "all_sources_attributed": True}
+    bad = failing_metrics(fake)
+    ok(bad == ["refunds tests 1/2", "steps done"], f"failing_metrics: {bad}")
+
     print(f"self-test: {checks} checks passed")
     return 0
 
@@ -828,6 +1169,14 @@ def main() -> int:
     p.add_argument("--stale-timeout", type=float, default=180, help="how long to wait for the stale lease")
     p.add_argument("--dry-run", action="store_true", help="stub harnesses: no model calls, no cost")
     p.add_argument("--self-test", action="store_true", help="unit checks for the grading functions")
+    p.add_argument("--matrix", action="store_true",
+                   help="rotate harnesses through all three roles (one trial per harness)")
+    p.add_argument("--harnesses-only", default="",
+                   help="comma-separated harness set for --matrix, e.g. opencode,codex,cursor")
+    p.add_argument("--allow-user-config", action="store_true",
+                   help="allow hermes, which temporarily edits ~/.hermes/config.yaml")
+    p.add_argument("--hermes-config", type=Path, default=HERMES_CONFIG,
+                   help="hermes config path (overridable for tests; default ~/.hermes/config.yaml)")
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -841,28 +1190,63 @@ def main() -> int:
             override[k.strip()] = v.strip()
     args.harnesses = override
 
+    note = ""
+    if args.matrix:
+        if args.harnesses_only:
+            selected = [h.strip() for h in args.harnesses_only.split(",") if h.strip()]
+        else:
+            selected = list(MATRIX_HARNESSES)
+            if args.allow_user_config:
+                selected.append("hermes")
+        unknown = [h for h in selected if h not in SOURCE]
+        if unknown:
+            p.error(f"unknown harness(es) in --harnesses-only: {', '.join(unknown)} "
+                    f"(choose from {', '.join(SOURCE)})")
+        if "hermes" in selected and not args.allow_user_config:
+            selected.remove("hermes")
+            note = ("NOTE: hermes skipped — it needs an explicit --allow-user-config flag "
+                    "(it temporarily rewrites ~/.hermes/config.yaml).")
+        if not selected:
+            p.error("--harnesses-only left no harnesses to run")
+        schedule = matrix_trials(selected)
+    else:
+        # Empty dict means "resolve from scenario + --harnesses inside trial_run".
+        schedule = [{} for _ in range(args.trials)]
+
     scenario_dir = SCENARIOS / args.scenario
     scenario = json.loads((scenario_dir / "scenario.json").read_text())
     out = (args.out or RESULTS / f"{dt.datetime.now():%Y%m%d-%H%M%S}-multiagent").resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if note:
+        print(note, file=sys.stderr)
     print("building memdusa…", file=sys.stderr)
     memdusa = build_memdusa()
 
     trials = []
-    for i in range(1, args.trials + 1):
-        print(f"trial {i}/{args.trials}: delegate -> crash -> takeover"
+    total = len(schedule)
+    for i, trial_harnesses in enumerate(schedule, 1):
+        label = ("/".join(trial_harnesses.values()) if args.matrix else
+                 "/".join((scenario["harnesses"] | args.harnesses).values()))
+        print(f"trial {i}/{total}: {label} delegate -> crash -> takeover"
               f"{' (stub harnesses)' if args.dry_run else ''}", file=sys.stderr)
-        trials.append(trial_run(i, args, scenario_dir, scenario, memdusa, out))
-    report = summarize(trials)
-    (out / "report.md").write_text(
+        trials.append(trial_run(i, args, scenario_dir, scenario, memdusa, out,
+                                harnesses=trial_harnesses or None))
+    report = summarize_matrix(trials) if args.matrix else summarize(trials)
+    header = (
         f"# Multi-agent eval: {scenario['name']}\n\n"
-        f"{args.trials} trial(s), lease {args.lease_secs}s, "
-        f"harnesses {scenario['harnesses'] | args.harnesses}"
-        f"{' (stub mode)' if args.dry_run else ''}\n\n{report}\n")
+        f"{'matrix, ' if args.matrix else ''}{len(trials)} trial(s), lease {args.lease_secs}s, "
+        f"harnesses {', '.join(selected) if args.matrix else str(scenario['harnesses'] | args.harnesses)}"
+        f"{' (stub mode)' if args.dry_run else ''}\n\n"
+        + (f"{note}\n\n" if note else "")
+    )
+    (out / "report.md").write_text(header + report + "\n")
     (out / "results.json").write_text(json.dumps(
         {"scenario": scenario["name"], "dry_run": args.dry_run, "lease_secs": args.lease_secs,
-         "harnesses": scenario["harnesses"] | args.harnesses, "trials": trials}, indent=2))
+         "matrix": args.matrix, "harnesses": selected if args.matrix else scenario["harnesses"] | args.harnesses,
+         "note": note, "trials": trials}, indent=2))
     print(report)
+    if note:
+        print(f"\n{note}", file=sys.stderr)
     print(f"\nfull results: {out}", file=sys.stderr)
     return 0
 
