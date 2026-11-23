@@ -17,7 +17,7 @@ use anyhow::Context;
 use clap::Subcommand;
 use memdusa_core::Store;
 use memdusa_core::model::now_ms;
-use memdusa_core::sync::{SYNC_BATCH, SYNC_GLOBALS, SyncActor, SyncRecord, SyncState};
+use memdusa_core::sync::{PULLED_ORIGIN, SYNC_BATCH, SYNC_GLOBALS, SyncActor, SyncRecord, SyncState};
 
 use crate::config::Remote;
 use crate::hooks::HookEvent;
@@ -456,17 +456,14 @@ async fn sync_one(
         let incoming: Vec<SyncRecord> =
             page.changes.into_iter().filter(|c| c.origin.as_deref() != Some(origin)).collect();
         if !incoming.is_empty() {
-            local.sync_apply(Some(project), &incoming, &SyncActor::Local, None).await?;
+            local.sync_apply(Some(project), &incoming, &SyncActor::Local, Some(PULLED_ORIGIN)).await?;
             pulled += incoming.len();
         }
-        // Applying a pulled page appends local changes (needed for delete
-        // tombstones). Advance the push cursor past them: they came from the
-        // server and must not be echoed back as new local edits.
-        let local_seq = local.sync_last_seq().await?;
-        let pushed_to = local_seq.max(state.push_after);
-        state.push_after = pushed_to;
+        // Changes written while applying this page are tagged PULLED_ORIGIN and skipped by push. The
+        // push cursor is NOT moved here: jumping it to the newest local change skipped edits other
+        // processes (hooks, the CLI) made during the pass, and those never reached the server.
         state.pull_after = page.next_cursor;
-        local.sync_state_update(&state.remote, project, Some(pushed_to), Some(page.next_cursor), None, false).await?;
+        local.sync_state_update(&state.remote, project, None, Some(page.next_cursor), None, false).await?;
         if !page.has_more {
             break;
         }
