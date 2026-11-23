@@ -70,6 +70,27 @@ struct ConfigFile {
 }
 
 /// The user's home directory (`HOME`, or `USERPROFILE` on Windows).
+/// The path to write into hook commands, MCP entries and service files: this executable, except that a
+/// Homebrew install gives its stable `<prefix>/bin/memdusa` link rather than the versioned Cellar path,
+/// which `brew upgrade` (and its cleanup) removes, breaking every configured hook.
+pub fn stable_exe() -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    Ok(brew_link(&exe).unwrap_or(exe).display().to_string())
+}
+
+/// `<prefix>/bin/<name>` for `<prefix>/Cellar/<formula>/<version>/bin/<name>`, when that link exists and
+/// currently resolves to `exe`.
+fn brew_link(exe: &Path) -> Option<PathBuf> {
+    let name = exe.file_name()?;
+    let bin_dir = exe.parent()?;
+    let cellar = bin_dir.parent()?.parent()?.parent()?; // bin -> <version> -> <formula> -> Cellar
+    if bin_dir.file_name()? != "bin" || cellar.file_name()? != "Cellar" {
+        return None;
+    }
+    let link = cellar.parent()?.join("bin").join(name);
+    (link.canonicalize().ok()? == exe).then_some(link)
+}
+
 pub fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -213,6 +234,28 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_installs_use_the_stable_link() {
+        let root = std::env::temp_dir().join(format!("memdusa-brew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = root.join("Cellar/memdusa/0.1.10/bin/memdusa");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink("../Cellar/memdusa/0.1.10/bin/memdusa", root.join("bin/memdusa")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let exe = exe.canonicalize().unwrap();
+        assert_eq!(super::brew_link(&exe), Some(root.join("bin/memdusa")));
+        // not a Cellar path: keep the executable's own path
+        assert_eq!(super::brew_link(&root.join("bin/memdusa")), None);
+        // a link that points elsewhere (another install): keep the executable's own path
+        std::fs::remove_file(root.join("bin/memdusa")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", root.join("bin/memdusa")).unwrap();
+        assert_eq!(super::brew_link(&exe), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use super::{Remote, save_oauth};
 
     #[test]

@@ -66,7 +66,7 @@ fn bin() -> anyhow::Result<String> {
     if let Some(bin) = std::env::var("MEMDUSA_SERVICE_BIN").ok().filter(|b| !b.trim().is_empty()) {
         return Ok(bin);
     }
-    Ok(std::env::current_exe()?.display().to_string())
+    crate::config::stable_exe()
 }
 
 pub fn render_launchd(bin: &str) -> String {
