@@ -66,14 +66,42 @@ fn spawn_server(dir: &Path, db: &str, port: u16) -> Child {
     c.spawn().unwrap()
 }
 
-fn wait_ready(port: u16) {
+/// Wait until `port` answers AND the answer comes from our own `server`. `free_port` releases the
+/// port before the server binds it; under a parallel test run another test's server can grab it, our
+/// server then exits on the bind error, and the test would talk to the wrong server.
+fn ready_and_ours(server: &mut Child, port: u16) -> bool {
     for _ in 0..200 {
+        if server.try_wait().unwrap().is_some() {
+            return false; // ours died (port taken)
+        }
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+            sleep(Duration::from_millis(150));
+            return server.try_wait().unwrap().is_none();
         }
         sleep(Duration::from_millis(25));
     }
-    panic!("server on {port} never came up");
+    false
+}
+
+/// Start a server on a free port, retrying on another port if one was taken in between.
+fn start_server(dir: &Path, db: &str) -> (Child, u16) {
+    for _ in 0..5 {
+        let port = free_port();
+        let mut server = spawn_server(dir, db, port);
+        if ready_and_ours(&mut server, port) {
+            return (server, port);
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+    panic!("could not start a test server");
+}
+
+/// Restart on a known port (the login points at it).
+fn restart_server(dir: &Path, db: &str, port: u16) -> Child {
+    let mut server = spawn_server(dir, db, port);
+    assert!(ready_and_ours(&mut server, port), "server on {port} didn't come back (port taken?)");
+    server
 }
 
 fn stop(mut server: Child) {
@@ -115,9 +143,7 @@ fn context(out: &str) -> String {
 #[tokio::test]
 async fn hooks_write_locally_with_the_server_down_then_sync_delivers_to_a_second_machine() {
     let (root, server_dir, one, server_db) = scratch("offline");
-    let port = free_port();
-    let server = spawn_server(&server_dir, &server_db, port);
-    wait_ready(port);
+    let (server, port) = start_server(&server_dir, &server_db);
     let url = format!("http://127.0.0.1:{port}");
     let key = key(&server_dir, &server_db);
     login_sync(&one, &url, &key);
@@ -149,8 +175,7 @@ async fn hooks_write_locally_with_the_server_down_then_sync_delivers_to_a_second
     assert_eq!(memories.len(), 1, "{memories:?}");
 
     // Bring the server back and sync. Memory and event both cross the wire.
-    let server = spawn_server(&server_dir, &server_db, port);
-    wait_ready(port);
+    let server = restart_server(&server_dir, &server_db, port);
     let out = ok(&one, &["sync"], &[]);
     assert!(out.contains("pushed 2"), "{out}");
     let remote = Store::connect(&server_db).await.unwrap();
@@ -182,9 +207,7 @@ async fn hooks_write_locally_with_the_server_down_then_sync_delivers_to_a_second
 #[tokio::test]
 async fn auto_opt_in_can_be_disabled() {
     let (root, server_dir, one, server_db) = scratch("auto-add");
-    let port = free_port();
-    let server = spawn_server(&server_dir, &server_db, port);
-    wait_ready(port);
+    let (server, port) = start_server(&server_dir, &server_db);
     let url = format!("http://127.0.0.1:{port}");
     let key = key(&server_dir, &server_db);
     login_sync(&one, &url, &key);
@@ -211,9 +234,7 @@ async fn auto_opt_in_can_be_disabled() {
 #[tokio::test]
 async fn delegate_and_claim_are_server_authoritative_in_sync_mode() {
     let (root, server_dir, one, server_db) = scratch("delegated");
-    let port = free_port();
-    let server = spawn_server(&server_dir, &server_db, port);
-    wait_ready(port);
+    let (server, port) = start_server(&server_dir, &server_db);
     let url = format!("http://127.0.0.1:{port}");
     let key = key(&server_dir, &server_db);
     login_sync(&one, &url, &key);
@@ -262,9 +283,7 @@ async fn delegate_and_claim_are_server_authoritative_in_sync_mode() {
 #[tokio::test]
 async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
     let (root, server_dir, one, server_db) = scratch("watch");
-    let port = free_port();
-    let server = spawn_server(&server_dir, &server_db, port);
-    wait_ready(port);
+    let (server, port) = start_server(&server_dir, &server_db);
     let url = format!("http://127.0.0.1:{port}");
     let key = key(&server_dir, &server_db);
     login_sync(&one, &url, &key);

@@ -148,7 +148,11 @@ Things to know per tool:
   `# >>> memdusa` / `# <<< memdusa` blocks (under your existing `hooks:` / `mcp_servers:` keys, or as new sections),
   leaving the rest of the file untouched; `memdusa uninstall hermes` removes exactly those blocks. Hermes runs hooks from
   its own install dir, so memdusa reads the session's real workspace from `$HERMES_HOME/state.db` (read-only) to pick the
-  project, falling back to the payload `cwd` and then `MEMDUSA_PROJECT`.
+  project, falling back to the payload `cwd` and then `MEMDUSA_PROJECT`. On macOS, if the memdusa binary lives under a
+  TCC-protected folder (`~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive), `memdusa install hermes` stages a copy
+  under `~/.memdusa/bin/` and points the hooks at it: Hermes launches hooks from a background daemon, and dyld can stall
+  until the hook timeout when that daemon executes a binary from a protected folder. A symlink is not enough (dyld
+  resolves it); the hooks need a real copy outside those folders. `--bin` with a bare command name is left as-is.
 - The checkpoint reminder fires **at most once per session per window** for every harness, so it can't trap an agent that
   has no way to checkpoint.
 

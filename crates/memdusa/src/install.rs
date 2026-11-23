@@ -914,10 +914,68 @@ fn opencode_mcp(bin: &str, db: Option<&str>, user: bool, dry_run: bool, uninstal
     Ok(())
 }
 
+/// macOS TCC guards the obvious user folders (Desktop, Documents, Downloads and
+/// iCloud Drive). Hermes launches hooks from a long-lived background daemon, and
+/// when that daemon `exec`s a binary from one of those folders dyld stalls in
+/// `open()` on the executable until Hermes' hook timeout fires. A symlink is no
+/// help: dyld resolves it and hits the same protected path. Stage a real copy in
+/// memdusa's own (unprotected) home instead and point the hooks at that.
+fn tcc_protected(path: &Path, home: &Path) -> bool {
+    ["Desktop", "Documents", "Downloads"]
+        .iter()
+        .map(|name| home.join(name))
+        .chain(std::iter::once(home.join("Library/Mobile Documents")))
+        .any(|dir| path.starts_with(&dir))
+}
+
+fn hermes_hook_bin(opts: &InstallOptions, bin: &str) -> anyhow::Result<String> {
+    if !cfg!(target_os = "macos") || opts.uninstall {
+        return Ok(bin.to_owned());
+    }
+    let Ok(source) = Path::new(bin).canonicalize() else {
+        return Ok(bin.to_owned()); // a bare command (e.g. `memdusa`) has nothing to copy
+    };
+    if !source.is_file() || !tcc_protected(&source, &home_dir()?) {
+        return Ok(bin.to_owned());
+    }
+    let staged = crate::config::dir()?.join("bin").join("memdusa");
+    if !opts.dry_run {
+        if let Some(parent) = staged.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let fresh = match (std::fs::metadata(&staged).ok(), std::fs::metadata(&source).ok()) {
+            (Some(dst), Some(src)) => {
+                dst.len() != src.len()
+                    || match (dst.modified().ok(), src.modified().ok()) {
+                        (Some(dm), Some(sm)) => dm < sm,
+                        _ => true,
+                    }
+            }
+            _ => true,
+        };
+        if fresh {
+            // Copy to a temp file and rename it into place: overwriting a signed binary in place makes
+            // macOS kill the next process started from it (SIGKILL, exit 137).
+            let tmp = staged.with_extension(format!("tmp.{}", std::process::id()));
+            std::fs::copy(&source, &tmp)
+                .with_context(|| format!("staging the Hermes hook binary at {}", tmp.display()))?;
+            make_executable(&tmp)?;
+            std::fs::rename(&tmp, &staged)
+                .with_context(|| format!("staging the Hermes hook binary at {}", staged.display()))?;
+        }
+    }
+    println!(
+        "note: Hermes hooks use {} — macOS TCC can stall a background daemon that launches a binary from a protected folder (Desktop/Documents/Downloads)",
+        staged.display()
+    );
+    Ok(staged.display().to_string())
+}
+
 fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     if opts.scope != Scope::User {
         bail!("Hermes only has a user config (~/.hermes/config.yaml); use --scope user");
     }
+    let bin = hermes_hook_bin(opts, bin)?;
     let path = match &opts.settings {
         Some(p) => p.clone(),
         None => std::env::var_os("HERMES_HOME")
@@ -927,7 +985,7 @@ fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     };
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
-    let text = crate::hermes_yaml::merge(&old, bin, db, opts.mcp, opts.uninstall).map_err(|why| {
+    let text = crate::hermes_yaml::merge(&old, &bin, db, opts.mcp, opts.uninstall).map_err(|why| {
         anyhow::anyhow!(
             "{}: {why}; memdusa won't edit it. Rewrite it as a block mapping (or remove it) and re-run",
             path.display()
@@ -1056,6 +1114,20 @@ mod tests {
     use super::*;
 
     const BIN: &str = "/usr/local/bin/memdusa";
+
+    #[test]
+    fn tcc_protected_folders_are_only_the_usual_suspects() {
+        let home = Path::new("/Users/someone");
+        for dir in ["Desktop", "Documents", "Downloads", "Library/Mobile Documents"] {
+            assert!(tcc_protected(&home.join(dir).join("memdusa"), home), "{dir}");
+        }
+        assert!(tcc_protected(home.join("Desktop").as_path(), home));
+        for dir in [".memdusa", ".local/bin", "src/project", "hermes/hermes-agent"] {
+            assert!(!tcc_protected(&home.join(dir).join("memdusa"), home), "{dir}");
+        }
+        // a sibling with a similar name is not inside a protected folder
+        assert!(!tcc_protected(Path::new("/Users/someone/Desktopish/memdusa"), home));
+    }
 
     #[test]
     fn claude_merge_is_idempotent_and_preserves_other_settings() {
