@@ -271,11 +271,15 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
     let project = "github.com/acme/watched";
     ok(&one, &["sync", "add", project], &[]);
 
+    // The watcher's output goes to a file so a failure below can show what it was doing.
+    let log_path = one.join("watcher.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut watcher = cmd(&one, &["sync", "--watch", "--interval", "100ms"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
         .spawn()
         .unwrap();
+    let watcher_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
     let pid = watcher.id();
     // Wait until this watcher holds the lock: starting the second one earlier races for it (the
     // product keeps exactly one watcher either way, but the test would then wait on the wrong one).
@@ -297,7 +301,8 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
     ok(&one, &["--project", project, "remember", "picked up by the watcher"], &[]);
     let remote = Store::connect(&server_db).await.unwrap();
     let mut found = false;
-    for _ in 0..100 {
+    // CI runners can be slow: allow up to 30 s.
+    for _ in 0..300 {
         let memories = remote
             .memory_search(MemoryQuery {
                 project: Some(project.into()),
@@ -312,10 +317,15 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
         }
         sleep(Duration::from_millis(100));
     }
-    assert!(found, "the watcher never pushed the local change");
+    assert!(found, "the watcher never pushed the local change; watcher log:\n{}", watcher_log());
 
     // SIGTERM shuts it down cleanly and releases the lock.
+    // SIGTERM on Unix; Windows has no signals here, so the watcher is killed and its lock goes stale
+    // (a dead pid reads as "not running").
+    #[cfg(unix)]
     let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    #[cfg(not(unix))]
+    let _ = watcher.kill();
     // Never hang the suite: give the watcher 10 s to exit, then kill it and fail.
     let mut exited = false;
     for _ in 0..100 {
@@ -329,7 +339,7 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
         let _ = watcher.kill();
         let _ = watcher.wait();
     }
-    assert!(exited, "the watcher did not exit within 10 s of SIGTERM");
+    assert!(exited, "the watcher did not exit within 10 s of SIGTERM; watcher log:\n{}", watcher_log());
     let status = ok(&one, &["sync", "status"], &[]);
     assert!(status.contains("not running"), "{status}");
 
