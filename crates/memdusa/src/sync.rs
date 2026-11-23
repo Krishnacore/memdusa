@@ -367,13 +367,15 @@ async fn watch_loop(local: &Store, remote: &Remote, origin: &str, interval: Dura
                 _ = tokio::signal::ctrl_c() => {}
             }
             stop.store(true, Ordering::Relaxed);
-            notify.notify_waiters();
+            // notify_one keeps a permit when the loop is mid-sync, not sleeping: no lost wakeup
+            notify.notify_one();
         });
         #[cfg(not(unix))]
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             stop.store(true, Ordering::Relaxed);
-            notify.notify_waiters();
+            // notify_one keeps a permit when the loop is mid-sync, not sleeping: no lost wakeup
+            notify.notify_one();
         });
     }
     println!("sync watcher on {} every {:?} (Ctrl-C or SIGTERM to stop)", remote.url, interval);

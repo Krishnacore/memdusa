@@ -591,9 +591,32 @@ pub fn sqlite_url(path: &std::path::Path) -> String {
     format!("sqlite:{}", path.display().to_string().replace('\\', "/"))
 }
 
+/// SQLite's transient lock errors (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+fn is_sqlite_busy(e: &Error) -> bool {
+    let text = format!("{e:?} {e}").to_lowercase();
+    text.contains("database is locked") || text.contains("database table is locked") || text.contains("sqlite_busy")
+}
+
 impl Store {
     /// Connect to `sqlite://path/to.db` or `postgres://...` and apply the schema.
     pub async fn connect(url: &str) -> Result<Self> {
+        // Two processes opening a brand-new SQLite file at once (a hook and the sync watcher on a fresh
+        // install) can get "database is locked" from the WAL switch or the first migration: SQLite
+        // doesn't always honour the busy timeout for those. Retry briefly; any other error is returned.
+        let mut delay = std::time::Duration::from_millis(50);
+        for attempt in 0..6 {
+            match Self::connect_once(url).await {
+                Err(e) if attempt < 5 && is_sqlite_busy(&e) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last attempt returns")
+    }
+
+    async fn connect_once(url: &str) -> Result<Self> {
         sqlx::any::install_default_drivers();
         let backend = if url.starts_with("sqlite:") {
             Backend::Sqlite

@@ -119,11 +119,17 @@ pub async fn run_loop<R: Runner, C: Clock>(runner: &R, clock: &C, interval: Dura
                     println!("{label}: pushed {pushed}, pulled {pulled}");
                 }
                 let delay = backoff.on_success(interval);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 clock.sleep(delay).await;
             }
             Err(e) => {
                 eprintln!("{label}: sync failed: {e:#}");
                 let delay = backoff.on_error();
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 clock.sleep(delay).await;
             }
         }
@@ -312,7 +318,7 @@ mod tests {
                 Duration::from_secs(15),
                 Duration::from_secs(15),
                 Duration::from_secs(15),
-                Duration::from_secs(15),
+                // no sleep after the 6th pass: stop was requested during it, so the loop exits at once
             ],
             "{delays:?}"
         );

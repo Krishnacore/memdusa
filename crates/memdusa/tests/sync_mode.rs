@@ -277,6 +277,17 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
         .spawn()
         .unwrap();
     let pid = watcher.id();
+    // Wait until this watcher holds the lock: starting the second one earlier races for it (the
+    // product keeps exactly one watcher either way, but the test would then wait on the wrong one).
+    let mut locked = false;
+    for _ in 0..100 {
+        if ok(&one, &["sync", "status"], &[]).contains(&format!("running (pid {pid})")) {
+            locked = true;
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    assert!(locked, "the watcher never took the lock");
     // A second watcher refuses to start while the lock is held.
     let second = ok(&one, &["sync", "--watch", "--interval", "100ms"], &[]);
     assert!(second.contains("already running"), "{second}");
@@ -305,7 +316,20 @@ async fn watcher_is_single_instance_picks_up_changes_and_exits_on_sigterm() {
 
     // SIGTERM shuts it down cleanly and releases the lock.
     let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
-    let _ = watcher.wait();
+    // Never hang the suite: give the watcher 10 s to exit, then kill it and fail.
+    let mut exited = false;
+    for _ in 0..100 {
+        if watcher.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    if !exited {
+        let _ = watcher.kill();
+        let _ = watcher.wait();
+    }
+    assert!(exited, "the watcher did not exit within 10 s of SIGTERM");
     let status = ok(&one, &["sync", "status"], &[]);
     assert!(status.contains("not running"), "{status}");
 
