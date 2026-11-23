@@ -261,6 +261,66 @@ pub fn merge_hooks(
     Ok(settings)
 }
 
+/// Cursor CLI reads permissions from `<project>/.cursor/cli.json` (project scope) or
+/// `~/.cursor/cli-config.json` (user scope); only permissions are valid in the project file. In print mode an MCP
+/// tool that isn't allowed is rejected, because there is no interactive approver (`--approve-mcps` only approves the
+/// *server*). `Mcp(server:tool)` gates tools by server, so this one narrow entry auto-approves memdusa's own tools
+/// without widening shell, file, web or any other server's MCP permissions.
+const CURSOR_MCP_PERMISSION: &str = "Mcp(memdusa:*)";
+
+/// Cursor CLI's permission file for the given scope (the global one holds all settings, the project one only
+/// permissions).
+fn cursor_permissions_path(scope: Scope) -> anyhow::Result<PathBuf> {
+    Ok(match scope {
+        Scope::User => home_dir()?.join(".cursor/cli-config.json"),
+        _ => ".cursor/cli.json".into(),
+    })
+}
+
+/// Add (or remove) memdusa's narrow MCP-tool permission in Cursor's CLI config. Every other key — including the
+/// user's other `permissions.allow` / `deny` entries — is preserved verbatim, and re-installing doesn't duplicate the
+/// entry. Uninstall removes exactly this entry (and the containers only if they'd otherwise be empty).
+pub fn merge_cursor_permissions(mut config: Value, uninstall: bool) -> anyhow::Result<Value> {
+    let root = config.as_object_mut().context("config file is not a JSON object")?;
+    let permissions = root.entry("permissions").or_insert_with(|| json!({}));
+    let perms = permissions.as_object_mut().context("`permissions` is not a JSON object")?;
+    // Cursor validates both arrays even in the project-scoped file (`permissions.deny` is required), so create
+    // them together on install and take them back together on uninstall.
+    perms.entry("deny").or_insert_with(|| json!([]));
+    let allow = perms.entry("allow").or_insert_with(|| json!([]));
+    let allow = allow.as_array_mut().context("`permissions.allow` is not an array")?;
+    // Keep the first copy in place (so a user's ordering never changes), drop any stale duplicates, drop all copies
+    // on uninstall, and only add ours when installing and it isn't there yet.
+    let mut seen = false;
+    allow.retain(|v| {
+        if v.as_str() == Some(CURSOR_MCP_PERMISSION) {
+            if uninstall || seen {
+                false
+            } else {
+                seen = true;
+                true
+            }
+        } else {
+            true
+        }
+    });
+    if !uninstall && !seen {
+        allow.push(json!(CURSOR_MCP_PERMISSION));
+    }
+    let allow_removed = allow.is_empty();
+    if allow_removed {
+        perms.remove("allow");
+    }
+    // Only take back the empty `deny` we created alongside an empty `allow`; never touch a user's own entries.
+    if uninstall && allow_removed && perms.get("deny").and_then(Value::as_array).is_some_and(|d| d.is_empty()) {
+        perms.remove("deny");
+    }
+    if perms.is_empty() {
+        root.remove("permissions");
+    }
+    Ok(config)
+}
+
 /// Add (or remove) `mcpServers.memdusa` in a JSON config.
 pub fn merge_mcp_json(
     mut config: Value,
@@ -660,6 +720,19 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
         }
     }
 
+    // Cursor CLI's print mode rejects MCP tool calls it would have to ask about. Allow only memdusa's tools there;
+    // shell/file/web policy and every other MCP server are left to the user's own configuration.
+    if h == Harness::Cursor && opts.mcp {
+        let p = cursor_permissions_path(opts.scope)?;
+        if !p.exists() && opts.uninstall {
+            // Nothing was ever added here; don't leave an empty file behind.
+        } else {
+            let old = if p.exists() { std::fs::read_to_string(&p)? } else { String::new() };
+            let merged = merge_cursor_permissions(read_json(&p)?, opts.uninstall)?;
+            apply(&p, &old, &json_text(&merged)?, "MCP tool permission", &opts)?;
+        }
+    }
+
     if !opts.uninstall && !opts.dry_run {
         let cursor_note = (h == Harness::Cursor).then(|| cursor_db_note(db)).flatten();
         for note in notes(h)?.into_iter().chain(cursor_note) {
@@ -684,6 +757,12 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
             n.push(
                 "`cursor-agent -p` (headless) only fires the sessionStart, shell/edit and sessionEnd hooks; memdusa \
                  reads the prompt and the agent's last message from Cursor's transcript at session end."
+                    .into(),
+            );
+            n.push(
+                "Headless `cursor-agent -p` rejects MCP calls it would have to ask about; memdusa adds \
+                 `Mcp(memdusa:*)` to Cursor's CLI permissions so only its own tools run without approval. Shell \
+                 commands still follow Cursor's own policy (`--force` or an allowlist for automation)."
                     .into(),
             );
             let claude = [
@@ -1168,6 +1247,51 @@ mod tests {
             "[profile]\nx = 1\n",
             "removes nested tables, keeps later ones"
         );
+    }
+
+    #[test]
+    fn cursor_cli_permissions_are_narrow_idempotent_and_reversible() {
+        // A fresh project file gets exactly one narrow entry.
+        let fresh = merge_cursor_permissions(json!({}), false).unwrap();
+        // Cursor rejects a project cli.json without `permissions.deny`, so both arrays are created together.
+        assert_eq!(fresh, json!({"permissions": {"allow": [CURSOR_MCP_PERMISSION], "deny": []}}));
+        assert_eq!(merge_cursor_permissions(fresh.clone(), false).unwrap(), fresh, "idempotent");
+        assert_eq!(
+            merge_cursor_permissions(fresh, true).unwrap(),
+            json!({}),
+            "uninstall removes exactly what we added"
+        );
+
+        // Existing user config: only our entry is added; every other key and array element survives verbatim.
+        let existing = json!({
+            "version": 1,
+            "editor": {"vimMode": false},
+            "permissions": {
+                "allow": ["Shell(ls)", "WebFetch(docs.github.com)", "Mcp(other:*)", "Mcp(memdusa:*)", "Mcp(memdusa:*)"],
+                "deny": ["Shell(rm)"]
+            }
+        });
+        let once = merge_cursor_permissions(existing.clone(), false).unwrap();
+        assert_eq!(
+            once["permissions"]["allow"],
+            json!(["Shell(ls)", "WebFetch(docs.github.com)", "Mcp(other:*)", CURSOR_MCP_PERMISSION]),
+            "duplicates collapsed in place, other servers untouched"
+        );
+        assert_eq!(once["permissions"]["deny"], json!(["Shell(rm)"]));
+        assert_eq!(once["version"], 1);
+        assert_eq!(once["editor"], json!({"vimMode": false}));
+        assert_eq!(merge_cursor_permissions(once.clone(), false).unwrap(), once, "idempotent with user keys");
+        let removed = merge_cursor_permissions(once, true).unwrap();
+        assert_eq!(removed["permissions"]["allow"], json!(["Shell(ls)", "WebFetch(docs.github.com)", "Mcp(other:*)"]));
+        assert_eq!(removed["permissions"]["deny"], json!(["Shell(rm)"]));
+        assert_eq!(removed["version"], 1);
+
+        // A config with no permissions at all is restored exactly.
+        let plain = json!({"version": 1, "editor": {"vimMode": true}});
+        let added = merge_cursor_permissions(plain.clone(), false).unwrap();
+        assert_eq!(added["permissions"]["allow"], json!([CURSOR_MCP_PERMISSION]));
+        assert_eq!(added["permissions"]["deny"], json!([]));
+        assert_eq!(merge_cursor_permissions(added, true).unwrap(), plain);
     }
 
     #[test]
