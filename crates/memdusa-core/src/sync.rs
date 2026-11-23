@@ -33,6 +33,9 @@ pub const SYNC_GLOBALS: &str = "memdusa:globals";
 
 /// Maximum changes accepted in one push / returned in one pull page.
 pub const SYNC_BATCH: i64 = 500;
+/// `changes.origin` for rows written while applying pulled changes locally. Push skips them, so the
+/// push cursor never has to jump past them (jumping skipped edits other processes made meanwhile).
+pub const PULLED_ORIGIN: &str = "pulled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -370,8 +373,9 @@ impl Store {
             SyncActor::Server(_) => (c.origin.as_deref().or(log_origin), true),
             // Pulled deletes must leave tombstones in the local log, otherwise
             // an older edit later in the same page could resurrect the row.
-            // The client advances its push cursor past them after the page.
-            SyncActor::Local => (None, true),
+            // The client tags them PULLED_ORIGIN so push skips them (moving the
+            // push cursor past them instead lost other processes' edits).
+            SyncActor::Local => (log_origin, true),
         };
         match c.op {
             SyncOp::Delete => self.apply_delete(tx, project, c, actor, origin, at, log_changes).await,
@@ -740,6 +744,9 @@ impl Store {
             let id: String = r.try_get("record_id")?;
             let at: Millis = r.try_get("at")?;
             let origin: Option<String> = r.try_get("origin")?;
+            if origin.as_deref() == Some(PULLED_ORIGIN) {
+                continue; // applied from a pull: never echo it back (the cursor still advances)
+            }
             let record = if op == SyncOp::Delete {
                 None
             } else {
@@ -962,6 +969,9 @@ impl Store {
         let mut q = Q::new("SELECT COUNT(*) AS n FROM changes WHERE seq > ");
         let a = q.int(after);
         q.push(&a);
+        // changes applied from a pull are never pushed, so they aren't pending either
+        let pulled = q.text(PULLED_ORIGIN);
+        q.push(&format!(" AND (origin IS NULL OR origin <> {pulled})"));
         match project {
             Some(SYNC_GLOBALS) => {
                 q.push(" AND project IS NULL");

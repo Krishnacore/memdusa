@@ -329,3 +329,34 @@ async fn attribution_and_project_mismatch_are_rejected() {
         assert!(content(&s, &p).await.is_empty(), "{name}: no partial writes on rejection");
     }
 }
+
+/// Regression: a pull used to move the push cursor to the newest local change, so an edit another
+/// process made between the push and the pull of a pass was never pushed. Pulled changes are now
+/// tagged PULLED_ORIGIN and skipped by push instead; every other local change is still pushed.
+#[tokio::test]
+async fn pulled_changes_are_skipped_but_concurrent_local_edits_still_push() {
+    use memdusa_core::sync::PULLED_ORIGIN;
+    for (name, s, _) in stores().await {
+        let p = project();
+        let before = s.sync_last_seq().await.unwrap();
+        // a pulled memory, applied locally
+        let pulled = mem("01a20000-0000-7000-8000-00000000aaaa", &p, "pulled from the server", 1_700_000_000_000);
+        s.sync_apply(Some(&p), &[pulled], &SyncActor::Local, Some(PULLED_ORIGIN)).await.unwrap();
+        // meanwhile another process saves a memory locally
+        let local = s
+            .memory_save(NewMemory {
+                project: Some(p.clone()),
+                kind: MemoryKind::Fact,
+                content: "written by a hook during the sync pass".into(),
+                tags: vec![],
+                source: Some("hook".into()),
+                user: None,
+            })
+            .await
+            .unwrap();
+        let (changes, last) = s.sync_local_changes(Some(&p), before, 500).await.unwrap();
+        let ids: Vec<&str> = changes.iter().map(|c| c.record_id.as_str()).collect();
+        assert_eq!(ids, vec![local.id.as_str()], "{name}: only the local edit is pushed");
+        assert!(last > before, "{name}: the cursor still moves past the pulled change");
+    }
+}
