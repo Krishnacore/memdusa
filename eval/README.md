@@ -101,14 +101,52 @@ uv run eval/multiagent/run.py --self-test    # unit checks for the grading funct
 uv run eval/multiagent/run.py                # 1 real trial
 uv run eval/multiagent/run.py --trials 3 --lease-secs 45
 uv run eval/multiagent/run.py --harnesses worker1=opencode,worker2=codex,replacement=claude
+
+# Matrix: rotate every harness through every role (one trial per harness)
+uv run eval/multiagent/run.py --matrix --dry-run            # 7 stub trials, incl. a fake hermes in a temp HOME
+uv run eval/multiagent/run.py --matrix                       # 6 real trials: opencode, codex, claude, cursor, pi, agy
+uv run eval/multiagent/run.py --matrix --allow-user-config   # also includes hermes (7 trials)
+uv run eval/multiagent/run.py --matrix --harnesses-only opencode,cursor,pi
 ```
 
-Requirements: `cargo`, `uv`, plus **logged-in `claude`, `codex` and `opencode` CLIs**. The real run uses Claude Code
-on Haiku, Codex and OpenCode's free `opencode/hy4-flash-free` model, so one trial costs well under $1. Nothing is
-installed at user scope: memdusa is installed with `--scope project --database-url …` into a fresh scratch repo per
-trial, and every worker environment is stripped of `MEMDUSA_*` except `MEMDUSA_RUN`, `MEMDUSA_TASK`,
-`MEMDUSA_PARENT` and `MEMDUSA_STEP_LEASE_SECS`. OpenCode workers launch with `--standalone` because its shared
-background service does not inherit the worker's environment.
+Requirements: `cargo`, `uv`, plus **logged-in CLIs for whichever harnesses you select**. All seven headless
+launchers are verified live on this machine:
+
+| Harness | Headless command | Install scope |
+|---|---|---|
+| OpenCode | `opencode run --standalone --auto --model opencode/hy4-flash-free` | project (`--standalone` so the private server inherits the worker env) |
+| Codex | `codex exec --trust --dangerously-bypass-hook-trust … < /dev/null` | project |
+| Claude Code | `claude -p … --model haiku --strict-mcp-config` | project |
+| Cursor | `cursor-agent -p --trust --approve-mcps --output-format text` | project |
+| pi | `pi -p --approve --model anthropic/claude-haiku-4-5` | project (logged in with an Anthropic account) |
+| Antigravity | `agy -p` (`~/.local/bin/agy`) | project (`.agents/` hooks run without a trust prompt) |
+| Hermes | `hermes --accept-hooks -z` (`~/.local/bin/hermes`) | **user** — see below |
+
+Nothing except Hermes is installed at user scope: memdusa is installed with `--scope project --database-url …`
+into a fresh scratch repo per trial, and every worker environment is stripped of `MEMDUSA_*` except `MEMDUSA_RUN`,
+`MEMDUSA_TASK`, `MEMDUSA_PARENT` and `MEMDUSA_STEP_LEASE_SECS`. All workers run with stdin from `/dev/null`, output
+captured to the trial log, a timeout and their own process group (so a crashing worker can be killed the instant its
+first `file_change` reaches the database).
+
+**Rough cost:** most runners use a subscription or a free model (OpenCode's `hy4-flash-free`; pi's Haiku on the
+operator's Anthropic account; Cursor, Codex, Antigravity and Hermes on their subscriptions), so a trial is usually
+well under $1 and often effectively free. Claude Code's replacement on Haiku is the only metered line (a few cents
+per trial). `--dry-run` is completely free: every harness is replaced by a stub that drives the real hooks and
+database but makes no model calls.
+
+**Hermes is opt-in.** It has only one config (`~/.hermes/config.yaml`), so it is skipped in `--matrix` unless you
+pass `--allow-user-config` (a clear note is printed in the report). When enabled, its runner copies the original
+bytes aside, runs `memdusa install hermes --scope user --database-url …`, launches Hermes with `TERMINAL_CWD` and
+cwd set to the scratch repo, then restores the original byte for byte (hash-verified) from a `try/finally` **and**
+a SIGINT/SIGTERM handler, and removes `config.yaml.memdusa-backup` if it is identical. Dry runs always use a
+synthetic config in the trial directory (`--hermes-config` overrides the path), never the real file. Hash evidence
+is written to `hermes-config-hashes.json` in the trial directory.
+
+**Cursor double-recording.** Cursor runs Claude Code hooks by default ("Third-Party Imports"). When a trial installs
+both Cursor and Claude Code hooks, Cursor's edits can be journaled twice — once with source `cursor`, once with
+`claude-code`. The eval installs only the harnesses used in that trial, and the `attributed` metric only requires
+the sources that actually played a role, so an extra `claude-code` line in "Who did what" is tolerated and
+documented here rather than counted as a failure.
 
 ### How a trial works
 
@@ -116,14 +154,24 @@ The `shop-team` scenario starts from a tiny repo with `ORDERS = {1: 5000, 2: 125
 
 1. The coordinator (the eval script itself) runs `memdusa delegate "release refunds invoices" refunds invoices` and
    parses the `MEMDUSA_RUN` / `MEMDUSA_TASK` launch lines.
-2. **Worker 1** (OpenCode) gets the full `refunds` assignment in its prompt. The orchestrator polls `memdusa export`
-   and kills the process group as soon as its first `file_change` event appears. Its step goes stale when the 45 s
-   lease expires.
-3. **Worker 2** (Codex) gets the `invoices` assignment in a different harness, runs to completion and calls
+2. **Worker 1** (default OpenCode) gets the full `refunds` assignment in its prompt. The orchestrator polls
+   `memdusa export` and kills the process group as soon as its first `file_change` event appears. Its step goes stale
+   when the 45 s lease expires.
+3. **Worker 2** (default Codex) gets the `invoices` assignment in a different harness, runs to completion and calls
    `task_complete` itself.
 4. After the stale lease is observed, the replacement's brief is captured with `memdusa resume` and its env, then
-   **Claude Code** is launched with only "Continue your delegated task." It sees the full assignment through the
-   worker-scoped brief ("## Your assignment") and claims the stale step.
+   the replacement (default Claude Code) is launched with only "Continue your delegated task." It sees the full
+   assignment through the worker-scoped brief ("## Your assignment") and claims the stale step.
+
+### Matrix mode
+
+`--matrix` rotates the selected harnesses H so trial *i* uses `worker1=H[i]`, `worker2=H[i+1]`,
+`replacement=H[i+2]` (modulo the set size). That is `len(H)` trials, with every harness appearing once in every
+role — e.g. the default six produce `(opencode, codex, claude)`, `(codex, claude, cursor)`, `(claude, cursor, pi)`,
+`(cursor, pi, antigravity)`, `(pi, antigravity, opencode)`, `(antigravity, opencode, codex)`. `--harnesses-only`
+restricts H; `--allow-user-config` adds hermes as a seventh. The report has one row per trial with the three roles
+and every metric above, plus a per-harness summary table with pass/fail and the failing metric(s) for each harness
+in each role. `--trials` is ignored in matrix mode.
 
 ### Metrics
 
@@ -136,8 +184,8 @@ of the coordinator brief, the replacement's brief, the final `memdusa export` an
 | steps done | Both `refunds` and `invoices` steps are `completed` in the run |
 | assignment | The replacement's brief contains "## Your assignment" and the assignment's distinctive tail: proof the handoff carried the full task, not just "continue" |
 | lines kept | Share of worker 1's `shop/refunds.py` lines the replacement preserved (1 = built on its work, 0 = started over) |
-| attributed | "Who did what" names all three sources (`opencode`, `codex`, `claude-code`) |
-| turns, cost | What Codex/Claude Code report about their own effort |
+| attributed | "Who did what" names the three sources of the harnesses used (`opencode`, `codex`, `claude-code` by default). An extra `claude-code` source in a Cursor session is tolerated (see above) |
+| turns, cost | What the harness reports about its own effort (Codex/Claude Code JSON; best-effort from the new harnesses' output) |
 
 Use `--keep` to retain each trial's scratch repo, venv and database for inspection. One trial is an anecdote; use
-`--trials 3` or more before drawing conclusions.
+`--trials 3` or more (or `--matrix`) before drawing conclusions.
