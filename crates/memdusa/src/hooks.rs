@@ -15,6 +15,8 @@
 //! the process exits 0 with no output.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use memdusa_core::brief::{
     self, AGENT_MESSAGE, CHECKPOINT_FALLBACK, COMMAND, COMPACT_SUMMARY, FILE_CHANGE, MEMORY_RECALL, STOP_GUARD,
@@ -204,6 +206,10 @@ impl HookEvent {
 pub struct HookResponse {
     /// What the hook should print on stdout, if anything.
     pub output: Option<String>,
+    /// Set for Stop when the session changed files; sync mode uses it to
+    /// decide whether to spawn an opportunistic sync.
+    #[serde(default, skip_serializing)]
+    pub files_changed: bool,
 }
 
 impl std::str::FromStr for HookEvent {
@@ -218,13 +224,27 @@ impl std::str::FromStr for HookEvent {
 pub async fn handle_request(
     store: &Store,
     event: HookEvent,
+    req: HookRequest,
+    identity: &Identity,
+) -> Result<HookResponse> {
+    handle_request_with(store, event, req, identity, None).await
+}
+
+/// [`handle_request`] with an optional server client for delegated work. Sync
+/// mode uses it: memories and events go to `store`, while step claims and
+/// heartbeats go to the server.
+pub async fn handle_request_with(
+    store: &Store,
+    event: HookEvent,
     mut req: HookRequest,
     identity: &Identity,
+    remote: Option<Arc<crate::remote::Client>>,
 ) -> Result<HookResponse> {
     // On a multi-user server records are attributed to `user/agent`.
     req.config.agent = identity.qualify(&req.config.agent);
     let input: HookInput =
         serde_json::from_value(req.input).map_err(|e| memdusa_core::Error::Invalid(format!("hook input: {e}")))?;
+    let files_changed = Arc::new(AtomicBool::new(false));
     let ctx = Ctx {
         store,
         project: req.project,
@@ -237,8 +257,11 @@ pub async fn handle_request(
         parent: req.parent.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()),
         run: req.run.map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()),
         cfg: &req.config,
+        remote,
+        files_changed: files_changed.clone(),
     };
-    Ok(HookResponse { output: handle(event, input, ctx).await? })
+    let output = handle(event, input, ctx).await?;
+    Ok(HookResponse { output, files_changed: files_changed.load(Ordering::Relaxed) })
 }
 
 /// How much of a user's request is kept verbatim.
@@ -270,6 +293,10 @@ pub struct Ctx<'a> {
     /// The delegated run the task belongs to (`MEMDUSA_RUN`); with `task`, the worker holds that step's lease.
     pub run: Option<String>,
     pub cfg: &'a HookConfig,
+    /// Sync mode: delegated leases live on the server, not in the local database.
+    pub remote: Option<Arc<crate::remote::Client>>,
+    /// Set by Stop when the session changed files (for opportunistic sync).
+    pub files_changed: Arc<AtomicBool>,
 }
 
 /// Who holds a worker's step lease: the agent and its session, so a replacement session (or harness) is told apart.
@@ -284,8 +311,18 @@ fn step_owner(ctx: &Ctx<'_>) -> String {
 async fn heartbeat(ctx: &Ctx<'_>) {
     let (Some(run), Some(task)) = (&ctx.run, &ctx.task) else { return };
     let lease = memdusa_core::store::step_lease_secs();
-    if let Err(e) = ctx.store.step_heartbeat(run, task, &step_owner(ctx), lease).await {
-        eprintln!("memdusa: could not renew the lease on task {task}: {e}");
+    let owner = step_owner(ctx);
+    match &ctx.remote {
+        Some(client) => {
+            // Sync mode: the lease is server-side. An unreachable server is
+            // silent here; the next successful claim/heartbeat renews it.
+            let _ = client.step_heartbeat(run, task, &owner, lease).await;
+        }
+        None => {
+            if let Err(e) = ctx.store.step_heartbeat(run, task, &owner, lease).await {
+                eprintln!("memdusa: could not renew the lease on task {task}: {e}");
+            }
+        }
     }
 }
 
@@ -295,13 +332,19 @@ async fn claim_step(ctx: &Ctx<'_>, source: &str) -> Option<String> {
     // /clear and compaction restart the same worker in the same terminal, not a rival: its own lease is not a conflict
     let force = matches!(source, "clear" | "compact");
     let lease = memdusa_core::store::step_lease_secs();
-    Some(match ctx.store.step_claim(run, task, &step_owner(ctx), lease, force).await {
+    let owner = step_owner(ctx);
+    let claimed = match &ctx.remote {
+        Some(client) => client.step_claim(run, task, &owner, lease, force).await.map_err(|e| e.to_string()),
+        None => ctx.store.step_claim(run, task, &owner, lease, force).await.map_err(|e| e.to_string()),
+    };
+    Some(match claimed {
         Ok(claim) => brief::claim_notice(task, &claim),
         Err(e) => {
             eprintln!("memdusa: could not claim task {task} of run {run}: {e}");
+            let where_ = if ctx.remote.is_some() { "the team server" } else { "the local database" };
             format!(
-                "**memdusa could not claim the delegated task `{task}` of run `{run}`: {e}.** Check MEMDUSA_RUN and \
-                 MEMDUSA_TASK; until then nothing stops another worker from taking the same task."
+                "**memdusa could not claim the delegated task `{task}` of run `{run}` on {where_}: {e}.** Check \
+                 MEMDUSA_RUN and MEMDUSA_TASK; until then nothing stops another worker from taking the same task."
             )
         }
     })
@@ -703,6 +746,7 @@ async fn stop(ctx: &Ctx<'_>, already_continuing: bool) -> Result<Option<String>>
         return Ok(None);
     }
     let changed = ctx.store.count_events_since(&ctx.project, session, FILE_CHANGE, last.unwrap_or(0)).await?;
+    ctx.files_changed.store(changed > 0, Ordering::Relaxed);
     if changed == 0 {
         return Ok(None);
     }
@@ -856,6 +900,8 @@ mod tests {
             parent: None,
             run: None,
             cfg,
+            remote: None,
+            files_changed: Arc::new(AtomicBool::new(false)),
         }
     }
 

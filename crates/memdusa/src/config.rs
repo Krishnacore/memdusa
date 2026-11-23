@@ -41,6 +41,10 @@ pub struct Remote {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthTokens>,
+    /// H3b: hooks/MCP/CLI use the local database; only delegated work and
+    /// background sync talk to the server. Set by `login --sync` / `sync mode`.
+    #[serde(default)]
+    pub sync: bool,
 }
 
 impl Remote {
@@ -50,7 +54,7 @@ impl Remote {
             anyhow::bail!("server URL must start with http:// or https://");
         }
         let url = url.strip_suffix("/mcp").unwrap_or(url);
-        Ok(Self { url: url.to_owned(), token: token.filter(|t| !t.is_empty()), oauth: None })
+        Ok(Self { url: url.to_owned(), token: token.filter(|t| !t.is_empty()), oauth: None, sync: false })
     }
 }
 
@@ -97,17 +101,34 @@ fn load_file() -> anyhow::Result<ConfigFile> {
 /// The configured remote server, if any. `MEMDUSA_URL` beats the config file.
 pub fn remote() -> anyhow::Result<Option<Remote>> {
     let env_token = std::env::var("MEMDUSA_TOKEN").ok();
+    let file = load_file()?;
     if let Ok(url) = std::env::var("MEMDUSA_URL")
         && !url.trim().is_empty()
     {
-        return Remote::new(&url, env_token).map(Some);
+        return Remote::new(&url, env_token).map(|mut r| {
+            // The sync flag lives in the config file; keep it even when the
+            // server URL/token come from the environment.
+            r.sync = file.remote.as_ref().is_some_and(|f| f.url == r.url && f.sync);
+            Some(r)
+        });
     }
-    Ok(load_file()?.remote.map(|mut r| {
+    Ok(file.remote.map(|mut r| {
         if env_token.is_some() {
             r.token = env_token;
         }
         r
     }))
+}
+
+/// Turn sync mode on or off for the existing login. Returns the server URL.
+pub fn set_sync_mode(on: bool) -> anyhow::Result<String> {
+    let p = path()?;
+    let mut cfg = load_file()?;
+    let remote = cfg.remote.as_mut().context("not logged in; run `memdusa login <url>` first")?;
+    remote.sync = on;
+    let url = remote.url.clone();
+    write_private(&p, &(serde_json::to_string_pretty(&cfg)? + "\n"))?;
+    Ok(url)
 }
 
 /// Write a secret-bearing file atomically, readable only by its owner.
@@ -192,7 +213,7 @@ mod tests {
     #[test]
     fn normalizes_server_url() {
         let r = Remote::new(" https://d.example.com/mcp/ ", Some(String::new())).unwrap();
-        assert_eq!(r, Remote { url: "https://d.example.com".into(), token: None, oauth: None });
+        assert_eq!(r, Remote { url: "https://d.example.com".into(), token: None, oauth: None, sync: false });
         assert!(Remote::new("d.example.com", None).is_err());
     }
 

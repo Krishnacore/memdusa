@@ -19,12 +19,15 @@ mod project;
 mod proxy;
 mod remote;
 mod self_update;
+mod service;
 mod spool;
 mod sync;
 mod transcripts;
+mod watch;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -156,6 +159,9 @@ enum Cmd {
         /// Sign in without a browser (SSH/headless) using a short user code.
         #[arg(long, conflicts_with = "browser")]
         device: bool,
+        /// Sync mode: hooks, MCP and CLI use the local database; only delegated work and background sync use the server.
+        #[arg(long)]
+        sync: bool,
     },
     /// Forget the remote server and go back to the local database.
     Logout,
@@ -166,6 +172,15 @@ enum Cmd {
     Sync {
         #[command(subcommand)]
         cmd: Option<sync::SyncCmd>,
+        /// Keep looping push+pull for all opted-in projects.
+        #[arg(long)]
+        watch: bool,
+        /// How often to sync in watch mode (e.g. 15s, 1m).
+        #[arg(long, default_value = "15s")]
+        interval: String,
+        /// One sync pass with no per-project output (used by hooks and service helpers).
+        #[arg(long)]
+        quiet: bool,
     },
     /// Inspect memories (superseded versions kept by sync conflicts).
     Memories {
@@ -583,7 +598,7 @@ async fn run() -> anyhow::Result<()> {
         Cmd::SelfUpdate { version, check } => {
             return self_update::run(version, check).await;
         }
-        Cmd::Login { url, token, browser, device } => {
+        Cmd::Login { url, token, browser, device, sync } => {
             if browser || device {
                 let timeout = std::env::var("MEMDUSA_LOGIN_TIMEOUT_SECS")
                     .ok()
@@ -600,21 +615,27 @@ async fn run() -> anyhow::Result<()> {
                 } else {
                     cli_auth::device_login(&url, &cli_auth::DeviceOptions { timeout, on_code: None }).await?
                 };
-                print_login(&config::Remote::new(&url, None)?.url, &tokens);
+                let saved_url = config::Remote::new(&url, None)?.url;
+                if sync {
+                    config::set_sync_mode(true).context("could not enable sync mode")?;
+                }
+                print_login(&saved_url, &tokens);
                 return Ok(());
             }
-            let r = config::Remote::new(&url, token)?;
+            let mut r = config::Remote::new(&url, token)?;
+            r.sync = sync;
             let info = remote::Client::new(r.clone(), Duration::from_secs(10))?
                 .whoami()
                 .await
                 .context("could not log in (check the URL and token)")?;
             let path = config::save_remote(Some(r.clone()))?;
             println!(
-                "logged in to {} as {} (server v{}, {})",
+                "logged in to {} as {} (server v{}, {}){}",
                 r.url,
                 describe_identity(&info),
                 info["version"].as_str().unwrap_or("?"),
-                info["backend"].as_str().unwrap_or("?")
+                info["backend"].as_str().unwrap_or("?"),
+                if sync { " [sync mode]" } else { "" }
             );
             println!("saved to {}", path.display());
             return Ok(());
@@ -634,12 +655,35 @@ async fn run() -> anyhow::Result<()> {
 
     // Sync needs both sides at once: the local database (the queue) and the
     // logged-in server. Handle it before mode selection picks just one.
-    if let Cmd::Sync { cmd } = &cli.cmd {
+    if let Cmd::Sync { cmd, .. } = &cli.cmd {
+        // These don't need either database; handle them before mode selection.
+        match cmd {
+            Some(sync::SyncCmd::Service { cmd }) => return service::run(cmd.clone()),
+            Some(sync::SyncCmd::Mode { value }) => {
+                let on = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => anyhow::bail!("sync mode expects `on` or `off`, got {other:?}"),
+                };
+                let url = config::set_sync_mode(on)?;
+                println!("sync mode {value} for {url}");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if let Cmd::Sync { cmd, watch, quiet, interval } = &cli.cmd {
         let url = cli.database_url.clone().map_or_else(default_db_url, Ok)?;
         let local = open_store(&url, false).await.with_context(|| format!("connecting to {url}"))?;
         let remote = config::remote()?.context("sync needs a remote server; run `memdusa login <url>`")?;
         let origin = config::sync_id(&remote.url)?;
-        return sync::run(cmd.clone(), &local, &remote, &origin).await;
+        return sync::run(
+            sync::Options { cmd: cmd.clone(), watch: *watch, quiet: *quiet, interval: interval.clone() },
+            &local,
+            &remote,
+            &origin,
+        )
+        .await;
     }
 
     let project = cli.project.clone().or_else(project::detect_cwd);
@@ -662,8 +706,22 @@ async fn run() -> anyhow::Result<()> {
             }
             return run_remote(cli.cmd, r, project, cli.project).await;
         }
-        Mode::Local(url) => open_store(url, allow_download).await.with_context(|| format!("connecting to {url}"))?,
+        Mode::Local(url) | Mode::Sync { url, .. } => {
+            open_store(url, allow_download).await.with_context(|| format!("connecting to {url}"))?
+        }
     };
+
+    // Sync mode keeps the hot path local but not everything is local: status
+    // reports both sides, and delegated work stays server-authoritative.
+    if let Mode::Sync { remote, .. } = &mode {
+        if matches!(cli.cmd, Cmd::Status) {
+            let Mode::Sync { url, .. } = &mode else { unreachable!() };
+            return sync::status_report(&store, url, remote).await;
+        }
+        if matches!(cli.cmd, Cmd::Delegate { .. } | Cmd::Task { .. }) {
+            return run_delegated_remote(cli.cmd, remote, project).await;
+        }
+    }
 
     match cli.cmd {
         Cmd::Status => {
@@ -785,7 +843,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
-            let server = mcp::MemdusaMcp::new(
+            let mut server = mcp::MemdusaMcp::new(
                 store,
                 mcp::Defaults {
                     project,
@@ -795,6 +853,11 @@ async fn run() -> anyhow::Result<()> {
                     run: env_nonempty("MEMDUSA_RUN"),
                 },
             );
+            // In sync mode memory tools use the local store, but runs/steps and
+            // delegated tasks are server-authoritative.
+            if let Mode::Sync { remote, .. } = &mode {
+                server = server.with_remote(remote::Client::new(remote.clone(), Duration::from_secs(15))?);
+            }
             let running = server.serve(rmcp::transport::stdio()).await?;
             running.waiting().await?;
         }
@@ -891,18 +954,31 @@ async fn run() -> anyhow::Result<()> {
 enum Mode {
     Local(String),
     Remote(config::Remote),
+    /// Sync mode: memories/events/MCP use the local database; delegated work
+    /// and background sync use the server.
+    Sync {
+        url: String,
+        remote: config::Remote,
+    },
 }
 
 impl Mode {
-    /// An explicit database URL wins; then a logged-in server; then the local default.
+    /// An explicit database URL wins for the local side; a logged-in server in
+    /// sync mode still leaves the hot path local, while plain remote mode uses
+    /// the server for everything.
     fn detect(database_url: Option<String>) -> anyhow::Result<Self> {
+        let remote = config::remote()?;
         if let Some(url) = database_url {
-            return Ok(Self::Local(url));
+            return Ok(match remote {
+                Some(r) if r.sync => Self::Sync { url, remote: r },
+                _ => Self::Local(url),
+            });
         }
-        if let Some(r) = config::remote()? {
-            return Ok(Self::Remote(r));
+        match remote {
+            Some(r) if r.sync => Ok(Self::Sync { url: default_db_url()?, remote: r }),
+            Some(r) => Ok(Self::Remote(r)),
+            None => Ok(Self::Local(default_db_url()?)),
         }
-        Ok(Self::Local(default_db_url()?))
     }
 }
 
@@ -1067,6 +1143,26 @@ async fn run_remote(
         }
         Cmd::SelfUpdate { .. } => unreachable!("handled before mode selection"),
         _ => unreachable!("handled before mode selection"),
+    }
+    Ok(())
+}
+
+/// Delegated work in sync mode: runs and steps are server-authoritative, so
+/// these few commands go straight to the server instead of the local database.
+async fn run_delegated_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> anyhow::Result<()> {
+    let client = remote::Client::new(r.clone(), Duration::from_secs(15))?;
+    match cmd {
+        Cmd::Delegate { name, tasks, key } => {
+            let project = project.context("could not detect project; pass --project")?;
+            let run = client.delegate(&project, &name, &tasks, key.as_deref()).await?;
+            print!("{}", brief::delegate_report(&run));
+        }
+        Cmd::Task { cmd } => {
+            let (run, task, outcome) = cmd.outcome()?;
+            client.task_finish(&run, &task, outcome).await?;
+            println!("task {task}: recorded");
+        }
+        _ => unreachable!("only delegated commands reach run_delegated_remote"),
     }
     Ok(())
 }
@@ -1263,11 +1359,11 @@ async fn run_hook_input(
         run: env_nonempty("MEMDUSA_RUN"),
     };
 
-    let resp = match Mode::detect(database_url)? {
+    let (resp, in_sync) = match Mode::detect(database_url)? {
         Mode::Remote(r) => {
             // Redact on this machine too, so secrets never leave it (the server redacts again).
             req.input = redactor_from_env()?.json(req.input);
-            remote_hook(event, req, &r, deadline).await?
+            (remote_hook(event, req, &r, deadline).await?, false)
         }
         Mode::Local(url) => {
             let store = open_store(&url, false).await?;
@@ -1278,9 +1374,31 @@ async fn run_hook_input(
             {
                 eprintln!("memdusa: pruning failed: {e}");
             }
-            resp
+            (resp, false)
+        }
+        Mode::Sync { url, remote } => {
+            // Sync mode: memories and events are written to the local database
+            // with no network in the hot path. Only delegated leases use the
+            // server. The first hook in a project opts it into sync.
+            let store = open_store(&url, false).await?;
+            let origin = config::sync_id(&remote.url)?;
+            if let Err(e) = sync::auto_add(&store, &remote.url, &req.project, &origin).await {
+                eprintln!("memdusa: could not auto-add {} to sync: {e:#}", req.project);
+            }
+            let client = remote::Client::new(remote, deadline)?;
+            let resp = hooks::handle_request_with(&store, event, req, &model::Identity::root(), Some(Arc::new(client)))
+                .await?;
+            if let hooks::HookEvent::SessionEnd = event
+                && let Err(e) = store.maybe_prune(&retention_from_env(), 86_400_000).await
+            {
+                eprintln!("memdusa: pruning failed: {e}");
+            }
+            (resp, true)
         }
     };
+    if in_sync {
+        sync::maybe_opportunistic(event, resp.files_changed);
+    }
     Ok(harness.render(event, resp.output))
 }
 
