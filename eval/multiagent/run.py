@@ -368,6 +368,34 @@ def _restore_hermes(base: dict) -> str:
     return f"hermes state at {config.parent}: {'restored to the run baseline' if ok else 'NOT fully restored, check it'}"
 
 
+def wait_for_hermes_mcp(marks: dict, server: str, timeout: float = 150.0) -> bool:
+    """Wait until Hermes' gateway has started MCP server `server`.
+
+    The gateway applies `mcp_servers` changes on its housekeeping tick (about two minutes), not reliably when
+    a `hermes -z` session attaches: a session started right after the install can run without memdusa's
+    tools. `marks` are the log sizes before the config changed, so only new lines count. Without
+    gateway logs (no gateway yet, or a dry run) there is nothing to wait for: a gateway started by
+    the session reads the config at startup.
+    """
+    if not marks:
+        return False
+    started = re.compile(rf"starting MCP server '{re.escape(server)}'|added=\[[^\]]*'{re.escape(server)}'")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for f, size in marks.items():
+            try:
+                with f.open("rb") as fh:
+                    fh.seek(size)
+                    new = fh.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if started.search(new):
+                return True
+        time.sleep(1)
+    print(f"  note: Hermes' gateway did not start MCP server {server} within {timeout:.0f}s", file=sys.stderr)
+    return False
+
+
 @contextlib.contextmanager
 def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, env: dict):
     """Back up, install into, and byte-for-byte restore Hermes' only config.
@@ -413,7 +441,11 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
         # `memdusa` a trial reused an earlier trial's server, connected to that trial's database
         # (task_complete failed with "not found: run …"). A unique name per trial makes Hermes start a
         # fresh one; restarting the gateway instead made Hermes rewrite the user's config.
-        rename_hermes_mcp_server(config, f"memdusa_{backup.parent.name.replace('-', '_')}")
+        server = f"memdusa_{backup.parent.name.replace('-', '_')}"
+        logs = config.parent / "logs"
+        marks = {f: f.stat().st_size for f in (logs / "gateway.log", logs / "mcp-stderr.log") if f.exists()}
+        rename_hermes_mcp_server(config, server)
+        wait_for_hermes_mcp(marks, server)
         yield before
     finally:
         for sig, handler in previous.items():
@@ -608,6 +640,14 @@ def run_headless(harness: str, binary: str, prompt: str, repo: Path, env: dict, 
     config (install + restore) and TERMINAL_CWD pinned to the scratch repo.
     """
     cmd = HEADLESS_CMD[harness](binary) + [prompt]
+    if harness == "antigravity":
+        # agy >= 1.5.14 soft-denies tools that need confirmation in headless mode unless an allow-rule covers
+        # them. Session-only settings (never saved): writes inside the scratch repo, and commands (pytest),
+        # the same auto-approval the other harnesses get from --auto / --approve / --trust.
+        # agy matches the resolved path: on macOS the temp dir /var/folders/… is really /private/var/folders/….
+        roots = dict.fromkeys([str(repo), str(Path(repo).resolve())])
+        allow = {"permissions": {"allow": [f"write_file({r})" for r in roots] + ["command(*)"]}}
+        cmd = [binary, "--settings", json.dumps(allow)] + cmd[1:]
     run_env = dict(env)
     cfg = None
     if harness == "hermes":
