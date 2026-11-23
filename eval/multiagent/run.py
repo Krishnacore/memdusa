@@ -47,6 +47,7 @@ import atexit
 import contextlib
 import datetime as dt
 import difflib
+import functools
 import hashlib
 import json
 import os
@@ -480,11 +481,25 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
 
 # ---------------------------------------------------------------- harness runners
 
+@functools.cache
+def opencode_major(binary: str) -> int:
+    """OpenCode's major version from `--version` (`1.19.6`, `opencode v2.2.6`); 1 when it can't be read."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+    m = re.search(r"\bv?(\d+)\.\d+", out)
+    return int(m.group(1)) if m else 1
+
+
 def run_opencode(binary: str, prompt: str, repo: Path, env: dict, log: Path, timeout: float, *,
                  memdusa: Path | None = None, db_url: str | None = None, seen: set[str] | None = None,
                  kill_on_source: str = "opencode") -> dict:
     """OpenCode worker: crash the process group on its first file_change event."""
-    cmd = [binary, "run", "--standalone", "--auto", "--model", "opencode/hy4-flash-free", prompt]
+    # OpenCode 2.x runs plugins and MCP servers in a shared background service that doesn't inherit this env:
+    # --standalone gives the worker a private one. OpenCode 1.x (the stable line) has no service or flag.
+    standalone = ["--standalone"] if opencode_major(binary) >= 2 else []
+    cmd = [binary, "run", *standalone, "--auto", "--model", "opencode/hy4-flash-free", prompt]
     start = time.monotonic()
     proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -938,6 +953,10 @@ def who_did_what(coordinator_brief: str, sources: list[str]) -> dict[str, bool]:
     match = re.search(r"\*\*Who did what:\*\*\n(.*?)(?:\n\n|\Z)", coordinator_brief, re.S)
     section = match.group(1) if match else ""
     named = set(re.findall(r"^- \*\*([^*]+)\*\*:", section, re.M))
+    if len(set(sources)) == 1 and not section:
+        # One harness in every role (e.g. OpenCode 1.x alone in a VM): the brief lists who did what only when
+        # several agents worked on the run, so there is nothing to attribute.
+        return {sources[0]: True}
     # Cursor runs Claude Code hooks by default ("Third-Party Imports"), so a
     # Cursor session can name an extra `claude-code` source. Only the sources
     # that actually played a role are required; extras are tolerated (and
@@ -1300,6 +1319,8 @@ def main() -> int:
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--harnesses", default="", help="override, e.g. worker1=opencode,worker2=codex,replacement=claude")
     p.add_argument("--keep", action="store_true", help="keep scratch repos/venvs")
+    p.add_argument("--memdusa-bin", type=Path,
+                   help="use this memdusa binary instead of building one (e.g. a Linux build in a VM)")
     p.add_argument("--lease-secs", type=int, default=45)
     p.add_argument("--worker-timeout", type=float, default=600, help="safety limit per harness")
     p.add_argument("--stale-timeout", type=float, default=180, help="how long to wait for the stale lease")
@@ -1356,7 +1377,7 @@ def main() -> int:
     if note:
         print(note, file=sys.stderr)
     print("building memdusa…", file=sys.stderr)
-    memdusa = build_memdusa()
+    memdusa = args.memdusa_bin.resolve() if args.memdusa_bin else build_memdusa()
 
     trials = []
     total = len(schedule)
