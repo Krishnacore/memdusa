@@ -43,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import datetime as dt
 import difflib
@@ -53,6 +54,7 @@ import re
 import shutil
 import signal
 import statistics
+import tempfile
 import subprocess
 import sys
 import threading
@@ -303,6 +305,69 @@ def read_log(proc: subprocess.Popen, log: Path) -> None:
 
 # ---------------------------------------------------------------- hermes user config
 
+_HERMES_BASELINES: dict[str, dict] = {}
+
+
+def hermes_baseline(config: Path) -> dict:
+    """Hermes' files as they were before this eval run first touched them (per config path: dry runs
+    use a synthetic config per trial, real runs the one ~/.hermes/config.yaml)."""
+    key = str(config.resolve())
+    if key not in _HERMES_BASELINES:
+        allowlist = config.parent / "shell-hooks-allowlist.json"
+        backup_dir = config.parent / "backups" / "config"
+        _HERMES_BASELINES[key] = {
+            "path": config,
+            "config": config.read_bytes() if config.exists() else b"",
+            "allowlist": allowlist.read_bytes() if allowlist.exists() else None,
+            "backups": ({p.name: p.read_bytes() for p in backup_dir.glob("config.yaml.*")}
+                        if backup_dir.exists() else {}),
+        }
+    return _HERMES_BASELINES[key]
+
+
+def rename_hermes_mcp_server(config: Path, name: str) -> None:
+    """Rename memdusa's MCP server entry in the (trial-installed) Hermes config."""
+    text = config.read_text()
+    new, n = re.subn(r"^(\s+)memdusa:\s*$", lambda m: f"{m.group(1)}{name}:", text, count=1, flags=re.M)
+    if n:
+        config.write_text(new)
+
+
+def finalize_hermes() -> str | None:
+    """After the whole run: wait for Hermes' asynchronous writes, then put every global file back to the
+    run's baseline (config, hook allowlist, backups folder). Returns a one-line verification."""
+    live = [b for b in _HERMES_BASELINES.values() if b["path"].parent.exists()]
+    if not live:
+        return None
+    time.sleep(5)
+    notes = [_restore_hermes(b) for b in live]
+    _HERMES_BASELINES.clear()  # idempotent: the atexit call after a normal finish does nothing
+    return "; ".join(notes)
+
+
+def _restore_hermes(base: dict) -> str:
+    config: Path = base["path"]
+    allowlist = config.parent / "shell-hooks-allowlist.json"
+    backup_dir = config.parent / "backups" / "config"
+    if not config.exists() or config.read_bytes() != base["config"]:
+        config.write_bytes(base["config"])
+    if base["allowlist"] is None:
+        allowlist.unlink(missing_ok=True)
+    elif not allowlist.exists() or allowlist.read_bytes() != base["allowlist"]:
+        allowlist.write_bytes(base["allowlist"])
+    if backup_dir.exists():
+        for f in backup_dir.glob("config.yaml.*"):
+            if f.name not in base["backups"]:
+                f.unlink()
+        for name, data in base["backups"].items():
+            if not (backup_dir / name).exists():
+                (backup_dir / name).write_bytes(data)
+    ok = (config.read_bytes() == base["config"]
+          and (allowlist.read_bytes() if allowlist.exists() else None) == base["allowlist"]
+          and {f.name for f in backup_dir.glob("config.yaml.*")} == set(base["backups"]))
+    return f"hermes state at {config.parent}: {'restored to the run baseline' if ok else 'NOT fully restored, check it'}"
+
+
 @contextlib.contextmanager
 def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, env: dict):
     """Back up, install into, and byte-for-byte restore Hermes' only config.
@@ -314,7 +379,11 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
     hash is verified. The backup file is removed when it is identical to the
     restored original, so no global config is left modified.
     """
-    original = config.read_bytes() if config.exists() else b""
+    # Restore to the state before the FIRST Hermes trial of this run, not the state before this one:
+    # Hermes writes some files asynchronously after a trial ends, and a per-trial snapshot would carry
+    # those changes into the next trial (and leave them at the end).
+    base = hermes_baseline(config)
+    original = base["config"]
     before = hashlib.sha256(original).hexdigest()
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_bytes(original)
@@ -323,10 +392,9 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
     # global allowlist, and Hermes snapshots config.yaml into backups/config/.
     # Both are global state created by this run: restore them as well.
     allowlist = config.parent / "shell-hooks-allowlist.json"
-    allow_original = allowlist.read_bytes() if allowlist.exists() else None
+    allow_original = base["allowlist"]
     backup_dir = config.parent / "backups" / "config"
-    pre_backups = ({p.name: p.read_bytes() for p in backup_dir.glob("config.yaml.*")}
-                   if backup_dir.exists() else {})
+    pre_backups = base["backups"]
 
     previous = {}
 
@@ -341,6 +409,11 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
     try:
         sh(memcli(memdusa, db_url, "install", "hermes", "--scope", "user"),
            cwd=backup.parent, env=install_env)
+        # Hermes' gateway keeps MCP servers alive and reconciles them by NAME: with the fixed name
+        # `memdusa` a trial reused an earlier trial's server, connected to that trial's database
+        # (task_complete failed with "not found: run …"). A unique name per trial makes Hermes start a
+        # fresh one; restarting the gateway instead made Hermes rewrite the user's config.
+        rename_hermes_mcp_server(config, f"memdusa_{backup.parent.name.replace('-', '_')}")
         yield before
     finally:
         for sig, handler in previous.items():
@@ -870,11 +943,29 @@ def grade(trial: Path, repo: Path, scenario_dir: Path, scenario: dict, task_by_k
     return result
 
 
+def scratch_root(out: Path) -> Path:
+    """Where trials run: the system temp dir, linked from `<out>/scratch`.
+
+    macOS privacy protection (TCC) guards ~/Desktop, ~/Documents and ~/Downloads. Hermes runs hooks
+    and MCP servers from a background daemon that may not read those folders, so a trial database or
+    memdusa home under a repo checked out there makes every Hermes hook stall until it times out.
+    The temp dir is never protected; the symlink keeps trials easy to inspect next to the report.
+    """
+    root = Path(tempfile.gettempdir()) / "memdusa-eval" / out.name / "scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    link = out / "scratch"
+    if not link.exists() and not link.is_symlink():
+        out.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            link.symlink_to(root, target_is_directory=True)
+    return root
+
+
 # ---------------------------------------------------------------- one trial
 
 def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, out: Path,
               harnesses: dict | None = None) -> dict:
-    trial = out / "scratch" / f"trial-{i}"
+    trial = scratch_root(out) / f"trial-{i}"
     trial.mkdir(parents=True)
     prepare(scenario_dir, trial)
     repo = trial / "repo"
@@ -921,6 +1012,10 @@ def trial_run(i: int, args, scenario_dir: Path, scenario: dict, memdusa: Path, o
     def launch(role: str, harness: str, prompt: str, env: dict, log: Path, *,
                kill_on_source: str | None = None) -> dict:
         common = dict(memdusa=memdusa, db_url=db_url, seen=seen, kill_on_source=kill_on_source)
+        if harness == "hermes":
+            # Hermes runs every session's hooks and MCP servers in its one shared gateway, so a worker's own
+            # MEMDUSA_RUN / MEMDUSA_TASK never reach them: the worker's prompt carries `delegate`'s line.
+            prompt = f"{prompt}\n\nmemdusa: MEMDUSA_RUN={env['MEMDUSA_RUN']} MEMDUSA_TASK={env['MEMDUSA_TASK']}"
         if harness in HEADLESS_CMD:
             common.update(hermes_config=hermes_config, trial=trial)
             return run_headless(harness, binary(role, harness), prompt, repo, env, log,
@@ -1159,6 +1254,7 @@ def self_test() -> int:
 
 
 def main() -> int:
+    atexit.register(finalize_hermes)  # no-op unless a Hermes trial touched ~/.hermes
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scenario", default="shop-team")
     p.add_argument("--trials", type=int, default=1)
@@ -1231,6 +1327,9 @@ def main() -> int:
               f"{' (stub harnesses)' if args.dry_run else ''}", file=sys.stderr)
         trials.append(trial_run(i, args, scenario_dir, scenario, memdusa, out,
                                 harnesses=trial_harnesses or None))
+    note = finalize_hermes()  # also registered with atexit for crashes and interrupts
+    if note:
+        print(note, file=sys.stderr)
     report = summarize_matrix(trials) if args.matrix else summarize(trials)
     header = (
         f"# Multi-agent eval: {scenario['name']}\n\n"

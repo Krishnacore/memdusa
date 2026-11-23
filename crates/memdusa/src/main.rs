@@ -872,14 +872,17 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Mcp { agent } => {
             tracing::info!(?project, agent, "memdusa MCP server on stdio");
+            let shared_env = agent == "hermes";
             let mut server = mcp::MemdusaMcp::new(
                 store,
                 mcp::Defaults {
                     project,
                     agent,
                     cwd: std::env::current_dir().ok(),
-                    task: env_nonempty("MEMDUSA_TASK"),
-                    run: env_nonempty("MEMDUSA_RUN"),
+                    // Hermes' gateway starts this server with whichever shell's environment started the
+                    // gateway: its MEMDUSA_RUN / MEMDUSA_TASK belong to no particular session.
+                    task: (!shared_env).then(|| env_nonempty("MEMDUSA_TASK")).flatten(),
+                    run: (!shared_env).then(|| env_nonempty("MEMDUSA_RUN")).flatten(),
                 },
             );
             // In sync mode memory tools use the local store, but runs/steps and
@@ -1381,16 +1384,20 @@ async fn run_hook_input(
         .map(std::path::Path::new)
         .filter(|d| event.needs_git() && project::detect(d) == project)
         .and_then(project::git_state);
-    let mut req = hooks::HookRequest {
-        project,
-        config,
-        input,
-        git,
-        at: Some(model::now_ms()),
-        task: env_nonempty("MEMDUSA_TASK"),
-        parent: env_nonempty("MEMDUSA_PARENT"),
-        run: env_nonempty("MEMDUSA_RUN"),
+    // Hermes runs every session's hooks in its one long-lived gateway, whose environment is whichever shell
+    // started it, never this worker's: its MEMDUSA_RUN / MEMDUSA_TASK would claim another worker's task. A
+    // Hermes worker's prompt carries `delegate`'s line instead; later events keep the claimed step's lease.
+    let (task, parent, run, session_coord) = if harness == adapters::Harness::Hermes {
+        let first_prompt = (event == hooks::HookEvent::SessionStart)
+            .then(|| input.pointer("/extra/user_message").and_then(|v| v.as_str()))
+            .flatten();
+        let (run, task) = first_prompt.and_then(memdusa_core::brief::coord_line).unzip();
+        (task, None, run, true)
+    } else {
+        (env_nonempty("MEMDUSA_TASK"), env_nonempty("MEMDUSA_PARENT"), env_nonempty("MEMDUSA_RUN"), false)
     };
+    let mut req =
+        hooks::HookRequest { project, config, input, git, at: Some(model::now_ms()), task, parent, run, session_coord };
 
     let (resp, in_sync) = match Mode::detect(database_url)? {
         Mode::Remote(r) => {

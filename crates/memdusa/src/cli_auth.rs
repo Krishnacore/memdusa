@@ -806,6 +806,7 @@ pub(crate) mod tests {
             task: None,
             parent: None,
             run: None,
+            session_coord: false,
         };
         let resp = crate::remote_hook(HookEvent::PostToolUse, req, &r, Duration::from_secs(3)).await.unwrap();
         assert!(resp.output.is_none(), "hooks must not fail the harness");

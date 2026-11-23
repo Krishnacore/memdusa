@@ -807,7 +807,11 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
         ),
         Harness::Hermes => n.push(
             "Hermes only runs shell hooks that are allowlisted: run Hermes once with `--accept-hooks` (or approve \
-             them at its prompt). `hermes hooks doctor` shows their status. Headless runs never ask."
+             them at its prompt). `hermes hooks doctor` shows their status. Headless runs never ask. Hermes' \
+             gateway keeps MCP servers running across sessions: after installing or reinstalling, run \
+             `hermes gateway restart` so it starts memdusa's MCP server with the new settings. The gateway also \
+             runs every session's hooks, so a delegated Hermes worker can't take MEMDUSA_RUN / MEMDUSA_TASK from \
+             its shell: put `delegate`'s `MEMDUSA_RUN=<id> MEMDUSA_TASK=<task>` line in the worker's prompt."
                 .into(),
         ),
         Harness::Git | Harness::ClaudeCode => {}
@@ -928,6 +932,23 @@ fn tcc_protected(path: &Path, home: &Path) -> bool {
         .any(|dir| path.starts_with(&dir))
 }
 
+/// Hermes runs hooks and MCP servers from a background daemon that macOS may not let into
+/// Desktop/Documents/Downloads/iCloud Drive: a SQLite database there makes every hook stall.
+fn hermes_db_note(db: Option<&str>, home: &Path) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let path = db?.strip_prefix("sqlite:")?.trim_start_matches("//");
+    let path = path.split('?').next().unwrap_or(path);
+    tcc_protected(Path::new(path), home).then(|| {
+        format!(
+            "the database {path} is in a folder macOS protects (Desktop, Documents, Downloads or iCloud Drive). \
+             Hermes runs hooks from a background service that may not be allowed to open it, so hooks would \
+             time out: keep the database elsewhere (the default ~/.memdusa/memdusa.db is fine)."
+        )
+    })
+}
+
 fn hermes_hook_bin(opts: &InstallOptions, bin: &str) -> anyhow::Result<String> {
     if !cfg!(target_os = "macos") || opts.uninstall {
         return Ok(bin.to_owned());
@@ -938,7 +959,13 @@ fn hermes_hook_bin(opts: &InstallOptions, bin: &str) -> anyhow::Result<String> {
     if !source.is_file() || !tcc_protected(&source, &home_dir()?) {
         return Ok(bin.to_owned());
     }
-    let staged = crate::config::dir()?.join("bin").join("memdusa");
+    // Stage next to memdusa's own data, unless that is itself in a protected folder (e.g. a
+    // MEMDUSA_HOME under ~/Desktop, as the eval uses): then the copy would stall just the same, so use
+    // ~/.memdusa/bin, which macOS doesn't guard.
+    let home = home_dir()?;
+    let data_dir = crate::config::dir()?;
+    let staged_dir = if tcc_protected(&data_dir, &home) { home.join(".memdusa") } else { data_dir };
+    let staged = staged_dir.join("bin").join("memdusa");
     if !opts.dry_run {
         if let Some(parent) = staged.parent() {
             std::fs::create_dir_all(parent)?;
@@ -994,6 +1021,9 @@ fn install_hermes(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     apply(&path, &old, &text, "hooks", opts)?;
     if !opts.uninstall && !opts.dry_run {
         for note in notes(Harness::Hermes)? {
+            println!("\nnote: {note}");
+        }
+        if let Some(note) = hermes_db_note(db, &home_dir()?) {
             println!("\nnote: {note}");
         }
         println!("\nDone. Start a new session: it will load the resume brief automatically.");
@@ -1114,6 +1144,20 @@ mod tests {
     use super::*;
 
     const BIN: &str = "/usr/local/bin/memdusa";
+
+    #[test]
+    fn hermes_db_note_flags_only_protected_sqlite_paths() {
+        let home = Path::new("/Users/me");
+        let protected = hermes_db_note(Some("sqlite:/Users/me/Desktop/proj/m.db"), home);
+        let fine = hermes_db_note(Some("sqlite:/Users/me/.memdusa/memdusa.db"), home);
+        let pg = hermes_db_note(Some("postgres://u@h/db"), home);
+        if cfg!(target_os = "macos") {
+            assert!(protected.is_some_and(|n| n.contains("protects")));
+        } else {
+            assert!(protected.is_none());
+        }
+        assert!(fine.is_none() && pg.is_none() && hermes_db_note(None, home).is_none());
+    }
 
     #[test]
     fn tcc_protected_folders_are_only_the_usual_suspects() {

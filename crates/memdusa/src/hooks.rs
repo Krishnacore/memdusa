@@ -167,6 +167,10 @@ pub struct HookRequest {
     /// `MEMDUSA_RUN`: the delegated run `task` is a step of; the worker claims that step and keeps its lease alive.
     #[serde(default)]
     pub run: Option<String>,
+    /// The client's environment isn't this session's (Hermes runs every session's hooks in one shared gateway):
+    /// without `run`/`task`, keep the lease of the step this session claimed instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_coord: bool,
 }
 
 /// One queued hook, replayed through `POST /v1/hooks/batch`.
@@ -245,7 +249,7 @@ pub async fn handle_request_with(
     let input: HookInput =
         serde_json::from_value(req.input).map_err(|e| memdusa_core::Error::Invalid(format!("hook input: {e}")))?;
     let files_changed = Arc::new(AtomicBool::new(false));
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         store,
         project: req.project,
         session: input.session_id.clone(),
@@ -260,6 +264,12 @@ pub async fn handle_request_with(
         remote,
         files_changed: files_changed.clone(),
     };
+    if req.session_coord && ctx.run.is_none() && ctx.task.is_none() && ctx.remote.is_none() && ctx.session.is_some() {
+        // Best effort: a lookup failure only means no heartbeat for this event.
+        if let Ok(Some((run, task))) = ctx.store.step_owned_by(&step_owner(&ctx)).await {
+            (ctx.run, ctx.task) = (Some(run), Some(task));
+        }
+    }
     let output = handle(event, input, ctx).await?;
     Ok(HookResponse { output, files_changed: files_changed.load(Ordering::Relaxed) })
 }
@@ -338,7 +348,7 @@ async fn claim_step(ctx: &Ctx<'_>, source: &str) -> Option<String> {
         None => ctx.store.step_claim(run, task, &owner, lease, force).await.map_err(|e| e.to_string()),
     };
     Some(match claimed {
-        Ok(claim) => brief::claim_notice(task, &claim),
+        Ok(claim) => brief::claim_notice(run, task, &claim),
         Err(e) => {
             eprintln!("memdusa: could not claim task {task} of run {run}: {e}");
             let where_ = if ctx.remote.is_some() { "the team server" } else { "the local database" };
