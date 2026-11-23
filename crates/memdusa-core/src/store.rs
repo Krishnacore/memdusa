@@ -1592,11 +1592,39 @@ impl Store {
         tasks: Vec<String>,
         idempotency_key: Option<String>,
     ) -> Result<RunWithSteps> {
-        let mut keys: Vec<String> = vec![];
+        let tasks = tasks.into_iter().map(DelegateTask::new).collect();
+        Ok(self.run_delegate_assigned(project, name, tasks, idempotency_key).await?.run)
+    }
+
+    /// Like [`Self::run_delegate`], also storing each task's assignment in its step's `input` as
+    /// `{"assignment": "…"}` (redacted, capped at [`ASSIGNMENT_MAX_CHARS`]). An assignment on a
+    /// *pending* step is (re)written when the run is reused; a running or finished step keeps the
+    /// original and the task is reported in [`DelegateOutcome::kept`].
+    pub async fn run_delegate_assigned(
+        &self,
+        project: &str,
+        name: &str,
+        tasks: Vec<DelegateTask>,
+        idempotency_key: Option<String>,
+    ) -> Result<DelegateOutcome> {
+        let mut keys: Vec<DelegateTask> = vec![];
         for t in tasks {
-            let t = self.redactor.string(t.trim().to_owned());
-            if !t.is_empty() && !keys.contains(&t) {
-                keys.push(t);
+            let key = self.redactor.string(t.task.trim().to_owned());
+            if key.is_empty() {
+                continue;
+            }
+            let assignment = t.assignment.map(|a| {
+                let a = self.redactor.string(a.trim().to_owned());
+                a.chars().take(ASSIGNMENT_MAX_CHARS).collect::<String>()
+            });
+            let assignment = assignment.filter(|a| !a.is_empty());
+            if let Some(existing) = keys.iter_mut().find(|x| x.task == key) {
+                // a duplicate task name only gains an assignment, never loses one
+                if existing.assignment.is_none() {
+                    existing.assignment = assignment;
+                }
+            } else {
+                keys.push(DelegateTask { task: key, assignment });
             }
         }
         if keys.is_empty() {
@@ -1651,7 +1679,7 @@ impl Store {
                     Ok(_) => id,
                     // lost a race on the idempotency key: the winner's run is the one
                     Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                        return Box::pin(self.run_delegate(project, &name, keys, idempotency_key)).await;
+                        return Box::pin(self.run_delegate_assigned(project, &name, keys, idempotency_key)).await;
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1659,24 +1687,58 @@ impl Store {
         };
 
         let run = self.run_find(&id).await?;
-        if run.status == RunStatus::Running {
-            for key in &keys {
-                let mut q = Q::new("INSERT INTO steps (run_id, step_key, seq, status, attempts, started_at) VALUES (");
+        let running = run.status == RunStatus::Running;
+        let mut assigned = 0;
+        let mut kept = vec![];
+        for t in &keys {
+            let input = t.assignment.as_deref().map(assignment_input);
+            if running {
+                let mut q =
+                    Q::new("INSERT INTO steps (run_id, step_key, seq, status, input, attempts, started_at) VALUES (");
                 let r = q.text(&id);
                 let vals = [
                     r.clone(),
-                    q.text(key),
+                    q.text(&t.task),
                     format!("(SELECT COUNT(*) + 1 FROM steps WHERE run_id = {r})"),
                     q.text(StepStatus::Pending.as_str()),
+                    q.opt_text(to_json(&input)),
                     q.int(0),
                     q.int(now_ms()),
                 ];
                 q.push(&vals.join(", ")).push(") ON CONFLICT (run_id, step_key) DO NOTHING");
-                q.build().execute(&self.pool).await?;
+                if q.build().execute(&self.pool).await?.rows_affected() > 0 {
+                    if input.is_some() {
+                        assigned += 1;
+                    }
+                    continue;
+                }
             }
+            // An existing step: only a pending one may have its assignment replaced. A task that is
+            // already running or done keeps the original text the worker started with.
+            if input.is_none() {
+                continue;
+            }
+            if running {
+                let mut q = Q::new("UPDATE steps SET input = ");
+                let iv = q.text(input.unwrap().to_string());
+                let (r, k, pending) = (q.text(&id), q.text(&t.task), q.text(StepStatus::Pending.as_str()));
+                q.push(&format!("{iv} WHERE run_id = {r} AND step_key = {k} AND status = {pending}"));
+                if q.build().execute(&self.pool).await?.rows_affected() > 0 {
+                    assigned += 1;
+                    continue;
+                }
+            }
+            let mut q = Q::new("SELECT status FROM steps WHERE run_id = ");
+            let (r, k) = (q.text(&id), q.text(&t.task));
+            q.push(&format!("{r} AND step_key = {k}"));
+            if q.build().fetch_optional(&self.pool).await?.is_some() {
+                kept.push(t.task.clone());
+            }
+        }
+        if running {
             self.touch_run(&id).await?;
         }
-        self.run_get(&id).await
+        Ok(DelegateOutcome { run: self.run_get(&id).await?, assigned, kept })
     }
 
     /// A worker claims its step of a delegated run: `Claimed` (pending, failed, stale, or already the caller's),
@@ -1764,6 +1826,27 @@ impl Store {
             .await?
             .ok_or_else(|| Error::NotFound(format!("step '{key}' in run {run_id} (call step_begin first)")))?;
         Self::row_to_step(&row)
+    }
+
+    /// The coordinator's stored assignment for a delegated task, newest run first. Only steps of
+    /// delegated runs count: a plain durable run's step keys are not task names.
+    pub async fn delegated_assignment(&self, project: &str, task: &str) -> Result<Option<String>> {
+        let mut q = Q::new(
+            "SELECT r.input AS run_input, s.input AS step_input FROM steps s JOIN runs r ON r.id = s.run_id WHERE r.project = ",
+        );
+        let (p, k) = (q.text(project), q.text(task));
+        q.push(&format!("{p} AND s.step_key = {k} ORDER BY r.updated_at DESC, s.started_at DESC"));
+        for row in q.build().fetch_all(&self.pool).await? {
+            let run_input: Option<String> = row.try_get("run_input")?;
+            if !is_delegated_input(from_json(run_input).as_ref()) {
+                continue;
+            }
+            let step_input: Option<String> = row.try_get("step_input")?;
+            if let Some(a) = assignment_from_input(from_json(step_input).as_ref()) {
+                return Ok(Some(a.to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn run_finish(

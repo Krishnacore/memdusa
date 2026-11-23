@@ -90,6 +90,8 @@ pub struct DelegatedWork {
     /// The task's step: its status (`pending`, running by someone, stale, done, failed) replaces the
     /// session-based `active` guess.
     pub step: Option<Step>,
+    /// First line of the coordinator's stored assignment, when one was recorded for the task.
+    pub assignment: Option<String>,
 }
 
 /// Most delegated runs, and steps per run, the coordinator's brief lists.
@@ -97,6 +99,8 @@ const DELEGATED_MAX_RUNS: usize = 5;
 const DELEGATED_MAX_STEPS: usize = 20;
 /// How much of a finished task's result the coordinator's brief quotes.
 const DELEGATED_OUTPUT_CHARS: usize = 300;
+/// How much of a task's stored assignment the coordinator's brief shows (first line only).
+const DELEGATED_ASSIGNMENT_CHARS: usize = 120;
 
 fn event_str<'a>(e: &'a Event, key: &str) -> Option<&'a str> {
     e.data.as_ref()?.get(key)?.as_str()
@@ -288,6 +292,11 @@ async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Resul
     for rw in runs {
         for step in rw.steps.into_iter().take(DELEGATED_MAX_STEPS) {
             let latest = starts.iter().find(|e| event_str(e, "task") == Some(step.key.as_str()));
+            let assignment = step
+                .input
+                .as_ref()
+                .and_then(|i| assignment_from_input(Some(i)))
+                .map(|a| truncate(a.lines().next().unwrap_or_default(), DELEGATED_ASSIGNMENT_CHARS));
             out.push(DelegatedWork {
                 task: step.key.clone(),
                 parent: latest.and_then(|e| event_str(e, "parent")).map(String::from),
@@ -299,6 +308,7 @@ async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Resul
                 run_id: Some(rw.run.id.clone()),
                 run_name: Some(rw.run.name.clone()),
                 step: Some(step),
+                assignment,
             });
         }
     }
@@ -322,6 +332,7 @@ async fn delegated_work(store: &Store, project: &str, starts: &[Event]) -> Resul
             run_id: None,
             run_name: None,
             step: None,
+            assignment: None,
         });
     }
     Ok(out)
@@ -394,9 +405,13 @@ pub async fn build_with_budget(
     memory_budget: usize,
 ) -> Result<Brief> {
     let starts = delegated_starts(store, project).await?;
-    // A worker gets its task's original assignment up front, no matter how much activity came after it.
+    // A worker gets its task's assignment up front, no matter how much activity came after it. The
+    // coordinator's stored text wins: a replacement may start with no prompt of its own at all.
     let assignment = match task {
-        Some(t) => assignment_lines(store, project, &starts, t).await?,
+        Some(t) => {
+            let stored = store.delegated_assignment(project, t).await?;
+            assignment_lines(store, project, &starts, t, stored).await?
+        }
         None => None,
     };
     let delegated = if task.is_none() { delegated_work(store, project, &starts).await? } else { vec![] };
@@ -578,7 +593,9 @@ fn ago(ts: Millis) -> String {
 }
 
 /// What `delegate` tells the coordinator: the run and, per task, the environment to launch its worker with.
-pub fn delegate_report(rw: &RunWithSteps) -> String {
+/// Assignment counts and kept originals are reported separately, never on the env lines (they get parsed).
+pub fn delegate_report(outcome: &DelegateOutcome) -> String {
+    let rw = &outcome.run;
     let mut o = format!("Delegated run `{}` ({}): {} task(s).\n", rw.run.id, rw.run.name, rw.steps.len());
     let _ = writeln!(
         o,
@@ -590,6 +607,12 @@ pub fn delegate_report(rw: &RunWithSteps) -> String {
             _ => format!("   # {}", step_status(s)),
         };
         let _ = writeln!(o, "- {}{state}", worker_env_line(&rw.run.id, &s.key));
+    }
+    if outcome.assigned > 0 {
+        let _ = writeln!(o, "\n{} assignment{} stored", outcome.assigned, if outcome.assigned == 1 { "" } else { "s" });
+    }
+    for task in &outcome.kept {
+        let _ = writeln!(o, "Task `{task}` is running or done: kept its earlier assignment.");
     }
     let _ = writeln!(
         o,
@@ -711,12 +734,23 @@ pub fn memories_markdown(project: &str, memories: &[Memory]) -> String {
     o
 }
 
-/// One prompt shown in a worker's "Your assignment" section: the full text as stored (quoted in the
-/// brief), plus who gave it and when for the italic attribution line.
+/// One text shown in a worker's "Your assignment" section: the full text as stored (quoted in the
+/// brief), plus who gave it and when for the italic attribution line. `stored` marks the
+/// coordinator's authoritative text rather than a worker prompt.
 struct AssignmentLine {
     source: Option<String>,
     created_at: Millis,
     text: String,
+    stored: bool,
+}
+
+/// The texts a worker's "Your assignment" section shows: the authoritative text (the stored
+/// assignment when there is one, otherwise the earliest prompt), the earliest worker prompt when it
+/// differs from that text, and any later instruction that differs.
+struct Assignment {
+    text: AssignmentLine,
+    first_worker: Option<AssignmentLine>,
+    latest: Option<AssignmentLine>,
 }
 
 /// A prompt event's full text (`data.text`, the 4k version hooks store) with the truncated `content` as fallback.
@@ -730,40 +764,69 @@ fn trivial_instruction(s: &str) -> bool {
     s.is_empty() || s.chars().count() < 3
 }
 
-/// The worker's original assignment and, when it differs, the latest instruction. Both come from
-/// prompt events of the task's own sessions, fetched directly (not via the recent-events window) so
-/// an old assignment survives a long, busy task. Only worker briefs have one.
+/// A worker's assignment from the coordinator's stored text or, when there is none, from the prompt
+/// events of the task's own sessions. Those are fetched directly (not via the recent-events window)
+/// so an old assignment survives a long, busy task. Only worker briefs have one.
 async fn assignment_lines(
     store: &Store,
     project: &str,
     starts: &[Event],
     task: &str,
-) -> Result<Option<(AssignmentLine, Option<AssignmentLine>)>> {
+    stored: Option<String>,
+) -> Result<Option<Assignment>> {
     let sessions: Vec<&str> = task_sessions(starts, Some(task)).into_iter().collect();
-    if sessions.is_empty() {
-        return Ok(None);
-    }
-    // Oldest first: the first prompt is the assignment, the last any later worker's instruction.
-    let prompts = store.events_for_sessions_kind(project, &sessions, "prompt", 500).await?;
-    let Some(first) = prompts.first() else { return Ok(None) };
-    let assignment_text = prompt_text(first);
-    let assignment = AssignmentLine {
-        source: first.source.clone(),
-        created_at: first.created_at,
-        text: truncate(&assignment_text, ASSIGNMENT_CHARS),
+    // Oldest first: the first prompt is what the first worker was told, the last is the newest instruction.
+    let prompts = if sessions.is_empty() {
+        vec![]
+    } else {
+        store.events_for_sessions_kind(project, &sessions, "prompt", 500).await?
     };
-    let latest = prompts.last().filter(|last| last.id != first.id).and_then(|last| {
+    let first = prompts.first();
+    let has_stored = stored.is_some();
+
+    let (primary, authoritative) = match stored {
+        Some(s) => {
+            (AssignmentLine { source: None, created_at: 0, text: truncate(&s, ASSIGNMENT_CHARS), stored: true }, s)
+        }
+        None => {
+            let Some(first) = first else { return Ok(None) };
+            let text = prompt_text(first);
+            (
+                AssignmentLine {
+                    source: first.source.clone(),
+                    created_at: first.created_at,
+                    text: truncate(&text, ASSIGNMENT_CHARS),
+                    stored: false,
+                },
+                text,
+            )
+        }
+    };
+    let first_worker = first.filter(|_| has_stored).and_then(|e| {
+        let text = prompt_text(e);
+        if text.trim() == authoritative.trim() || trivial_instruction(&text) {
+            return None;
+        }
+        Some(AssignmentLine {
+            source: e.source.clone(),
+            created_at: e.created_at,
+            text: truncate(&text, ASSIGNMENT_CHARS),
+            stored: false,
+        })
+    });
+    let latest = prompts.last().filter(|last| first.is_none_or(|f| f.id != last.id)).and_then(|last| {
         let text = prompt_text(last);
-        if text.trim() == assignment_text.trim() || trivial_instruction(&text) {
+        if text.trim() == authoritative.trim() || trivial_instruction(&text) {
             return None;
         }
         Some(AssignmentLine {
             source: last.source.clone(),
             created_at: last.created_at,
             text: truncate(&text, LATEST_INSTRUCTION_CHARS),
+            stored: false,
         })
     });
-    Ok(Some((assignment, latest)))
+    Ok(Some(Assignment { text: primary, first_worker, latest }))
 }
 
 /// Everything [`render`] shows.
@@ -784,8 +847,9 @@ struct Parts<'a> {
     delegated: &'a [DelegatedWork],
     message: Option<&'a Event>,
     summary: Option<&'a Event>,
-    /// A worker's original assignment and optional later instruction; `None` for coordinator briefs.
-    assignment: Option<&'a (AssignmentLine, Option<AssignmentLine>)>,
+    /// A worker's assignment (stored text or earliest prompt) and its other relevant texts;
+    /// `None` for coordinator briefs.
+    assignment: Option<&'a Assignment>,
 }
 
 fn render(parts: &Parts) -> String {
@@ -815,13 +879,22 @@ fn render(parts: &Parts) -> String {
              the last words of its previous workers)._\n"
         );
     }
-    if let Some((first, latest)) = assignment {
+    if let Some(a) = assignment {
         let quote = |t: &str| t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
         let _ = writeln!(o, "## Your assignment");
-        let by = first.source.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
-        let _ = writeln!(o, "_first given to{by} {}_\n", ago(first.created_at));
-        let _ = writeln!(o, "{}\n", quote(&first.text));
-        if let Some(l) = latest {
+        if a.text.stored {
+            let _ = writeln!(o, "_stored by the coordinator_\n");
+        } else {
+            let by = a.text.source.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
+            let _ = writeln!(o, "_first given to{by} {}_\n", ago(a.text.created_at));
+        }
+        let _ = writeln!(o, "{}\n", quote(&a.text.text));
+        if let Some(f) = &a.first_worker {
+            let by = f.source.as_deref().map(|s| format!("{s}, ")).unwrap_or_default();
+            let _ = writeln!(o, "_first worker was told ({by}{}):_\n", ago(f.created_at));
+            let _ = writeln!(o, "{}\n", quote(&f.text));
+        }
+        if let Some(l) = &a.latest {
             let by = l.source.as_deref().map(|s| format!("{s}, ")).unwrap_or_default();
             let _ = writeln!(o, "_latest instruction ({by}{}):_\n", ago(l.created_at));
             let _ = writeln!(o, "{}\n", quote(&l.text));
@@ -921,6 +994,9 @@ fn render(parts: &Parts) -> String {
                 let status = if d.active { "active" } else { "ended" };
                 let who = d.harness.as_deref().map(|h| format!(" by {h}")).unwrap_or_default();
                 let _ = writeln!(o, "- **{}**{who}{parent}: {status}, started {}", d.task, ago(d.started_at));
+            }
+            if let Some(a) = &d.assignment {
+                let _ = writeln!(o, "  - assignment: {a}");
             }
             if let Some(c) = &d.checkpoint {
                 let _ = writeln!(o, "  - goal: {} (checkpoint {})", c.goal, ago(c.created_at));

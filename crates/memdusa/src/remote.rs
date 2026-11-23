@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use memdusa_core::model::{
-    ApiKey, AuditEvent, AuditQuery, ClaimResult, CreatedKey, Event, GitState, Memory, MemoryQuery, NewMemory, NewRun,
-    ProjectGrant, Role, Run, RunOutcome, RunStatus, RunWithSteps, Step, StepDecision, User,
+    ApiKey, AuditEvent, AuditQuery, ClaimResult, CreatedKey, DelegateOutcome, DelegateTask, Event, GitState, Memory,
+    MemoryQuery, NewMemory, NewRun, ProjectGrant, Role, Run, RunOutcome, RunStatus, RunWithSteps, Step, StepDecision,
+    User,
 };
 use memdusa_core::sync::{PullResponse, PushBody, PushResponse, SyncRecord};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -224,14 +225,14 @@ impl Client {
         Ok(self.send(self.request(Method::GET, "/v1/resume").query(&q)).await?)
     }
 
-    /// Delegate `tasks` as one durable run (a pending step per task).
+    /// Delegate `tasks` as one durable run (a pending step per task), with their assignments.
     pub async fn delegate(
         &self,
         project: &str,
         name: &str,
-        tasks: &[String],
+        tasks: &[DelegateTask],
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<RunWithSteps> {
+    ) -> anyhow::Result<DelegateOutcome> {
         let body = json!({ "project": project, "name": name, "tasks": tasks, "idempotency_key": idempotency_key });
         Ok(self.send(self.request(Method::POST, "/v1/delegate").json(&body)).await?)
     }

@@ -679,6 +679,82 @@ pub fn worker_env_line(run_id: &str, task: &str) -> String {
     format!("MEMDUSA_RUN={} MEMDUSA_TASK={}", quote(run_id), quote(task))
 }
 
+/// One task a coordinator delegates, with its authoritative assignment text.
+/// `assignment: None` keeps the old "plain task name" behaviour (the worker's first prompt was the assignment).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DelegateTask {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+}
+
+impl DelegateTask {
+    pub fn new(task: impl Into<String>) -> Self {
+        Self { task: task.into(), assignment: None }
+    }
+}
+
+/// Serde helper shared by the MCP tool and REST endpoint: a task is either a plain name or a
+/// `{ "task": "…", "assignment": "…" }` object. A single string is split on newlines, like the
+/// MCP server's other lenient list parameters.
+pub fn delegate_tasks<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<DelegateTask>, D::Error> {
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        Name(String),
+        Task(DelegateTask),
+    }
+
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<DelegateTask>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of task names or {task, assignment} objects")
+        }
+        fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Self::Value, E> {
+            Ok(s.lines().map(str::trim).filter(|s| !s.is_empty()).map(DelegateTask::new).collect())
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(one) = seq.next_element::<One>()? {
+                out.push(match one {
+                    One::Name(t) => DelegateTask::new(t),
+                    One::Task(t) => t,
+                });
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// Longest assignment stored in a step's `input` (in characters, not bytes).
+pub const ASSIGNMENT_MAX_CHARS: usize = 8_000;
+
+/// The JSON stored in a delegated step's `input`.
+pub fn assignment_input(assignment: &str) -> Value {
+    serde_json::json!({ "assignment": assignment })
+}
+
+/// Read a stored assignment back from a step's `input`.
+pub fn assignment_from_input(input: Option<&Value>) -> Option<&str> {
+    input?.get("assignment")?.as_str()
+}
+
+/// What a `delegate` call reports besides the run: how many assignments it stored and which
+/// tasks kept an earlier one because their step had already started or finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateOutcome {
+    pub run: RunWithSteps,
+    /// Assignments persisted by this call (new steps, or updates to pending steps).
+    pub assigned: usize,
+    /// Tasks whose running/done step kept its earlier assignment.
+    pub kept: Vec<String>,
+}
+
 /// A durable, resumable unit of multi-step work. Steps are journaled so that
 /// after a crash (or a switch to another harness) completed steps are replayed
 /// from the journal instead of being executed again.

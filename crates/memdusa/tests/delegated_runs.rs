@@ -147,3 +147,54 @@ fn task_commands_need_a_delegated_worker_env() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("MEMDUSA_RUN is not set"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn delegate_stores_assignments_from_file_and_inline() {
+    let dir = std::env::temp_dir().join(format!("memdusa-runs-assign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lead = Env { dir: &dir, run: None, task: None, agent: "lead", lease: None };
+
+    let file = dir.join("tasks.json");
+    std::fs::write(&file, json!([{"task": "refunds", "assignment": "Build refunds. TailFromFileXYZ."}]).to_string())
+        .unwrap();
+    let out = memdusa(&lead, &["delegate", "release", "--from-file", file.to_str().unwrap()], None);
+    assert!(out.contains("1 assignment stored"), "{out}");
+    assert!(!out.contains("TailFromFileXYZ"), "{out}: env lines stay clean");
+    let run = out
+        .lines()
+        .find(|l| l.starts_with("- MEMDUSA_RUN="))
+        .unwrap()
+        .trim_start_matches("- MEMDUSA_RUN=")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // the worker's brief carries the stored text even with no prompt recorded
+    let worker = Env { dir: &dir, run: Some(&run), task: Some("refunds"), agent: "opencode", lease: None };
+    let brief = resume(&worker);
+    assert!(brief.contains("## Your assignment"), "{brief}");
+    assert!(brief.contains("_stored by the coordinator_"), "{brief}");
+    assert!(brief.contains("TailFromFileXYZ."), "{brief}");
+    // the coordinator sees the first line too
+    assert!(resume(&lead).contains("  - assignment: Build refunds."), "{out}");
+
+    // inline `task=assignment` form on a second run
+    let out2 = memdusa(&lead, &["delegate", "docs run", "docs=Write the docs. TailInlineXYZ."], None);
+    assert!(out2.contains("1 assignment stored"), "{out2}");
+    let run2 = out2
+        .lines()
+        .find(|l| l.starts_with("- MEMDUSA_RUN="))
+        .unwrap()
+        .trim_start_matches("- MEMDUSA_RUN=")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let worker2 = Env { dir: &dir, run: Some(&run2), task: Some("docs"), agent: "opencode", lease: None };
+    assert!(resume(&worker2).contains("TailInlineXYZ."), "{}", resume(&worker2));
+    assert!(!resume(&worker2).contains("TailFromFileXYZ"), "assignments are per task");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

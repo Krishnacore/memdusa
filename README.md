@@ -230,6 +230,30 @@ memdusa delegate "windows release" install-scripts docs     # or the `delegate` 
 The coordinator launches each worker (any harness) with its env line. Delegating again with the same name (or
 `--key`) while the run is running reuses it and adds the missing tasks.
 
+**Store the assignment at delegation time.** Append `=<assignment>` to a task name, or pass a JSON file with
+`--from-file` (`-` reads stdin). The `delegate` MCP tool and `POST /v1/delegate` accept the same tasks as plain names
+or `{"task": "…", "assignment": "…"}` objects; plain names keep the old behaviour.
+
+```sh
+memdusa delegate "windows release" 'docs=Write the installer guide' install-scripts
+memdusa delegate "release refunds" --from-file tasks.json   # [{"task": "refunds", "assignment": "…"}]
+```
+
+```json
+{"name": "release refunds", "tasks": [{"task": "refunds", "assignment": "Build refunds in shop/refunds.py…"}, "docs"]}
+```
+
+Assignments are redacted and capped at 8000 characters, stored in the task's step input, and reported as
+`N assignments stored` (the launch env lines stay clean). Reusing a run updates the assignment of a **pending** task;
+a running or done task keeps its original and is named in the output instead.
+
+- **A worker's brief opens with "## Your assignment"** using the stored text — marked `_stored by the coordinator_` —
+  even if no prompt was ever recorded for the task (e.g. the first worker hit its usage limit before its first
+  prompt). If that worker was in fact told something different, its earliest prompt is quoted below as
+  `_first worker was told…_`, followed by any later instruction that differs. With no stored assignment the brief
+  falls back to the earliest prompt as before. The coordinator's "Delegated work" shows the first line (up to 120
+  chars) of each stored assignment.
+
 - **Claim at session start.** With `MEMDUSA_RUN` and `MEMDUSA_TASK` set, the worker's SessionStart hook claims its step
   (owner: agent name and session id) with a 15 minute lease, and the brief opens with a notice: *claimed* (and, when it
   took over, *the previous attempt by X went stale*), *already done* (with the recorded result: stop, or confirm with

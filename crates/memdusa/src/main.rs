@@ -33,8 +33,8 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memdusa_core::model::{
-    self, ApiKey, AuditEvent, AuditQuery, CreatedKey, DefaultPolicy, MemoryKind, MemoryQuery, NewMemory, ProjectGrant,
-    Role, User,
+    self, ApiKey, AuditEvent, AuditQuery, CreatedKey, DefaultPolicy, DelegateTask, MemoryKind, MemoryQuery, NewMemory,
+    ProjectGrant, Role, User,
 };
 use memdusa_core::redact::Redactor;
 use memdusa_core::retention::RetentionPolicy;
@@ -107,9 +107,12 @@ enum Cmd {
     Delegate {
         /// Name of the piece of work, e.g. "windows release".
         name: String,
-        /// One short, stable name per task (becomes the worker's MEMDUSA_TASK).
-        #[arg(required = true)]
+        /// One short, stable name per task (becomes the worker's MEMDUSA_TASK). Append `=<assignment>`
+        /// to store the coordinator's assignment for that task, e.g. `refunds="build refunds"`.
         tasks: Vec<String>,
+        /// Read the tasks from a JSON file: `[{"task": "refunds", "assignment": "…"}]` (`-` for stdin).
+        #[arg(long)]
+        from_file: Option<String>,
         /// Reuse the run with this idempotency key (default: the running run with the same name).
         #[arg(long)]
         key: Option<String>,
@@ -367,6 +370,32 @@ fn read_input(file: &str) -> anyhow::Result<String> {
     } else {
         std::fs::read_to_string(file).with_context(|| format!("reading {file}"))
     }
+}
+
+/// Parse `delegate` tasks from `task[=assignment]` args or a JSON file of `{task, assignment}` objects.
+fn delegate_tasks_from_args(tasks: Vec<String>, from_file: Option<&str>) -> anyhow::Result<Vec<DelegateTask>> {
+    if let Some(file) = from_file {
+        let text = read_input(file)?;
+        let raw: Vec<serde_json::Value> =
+            serde_json::from_str(&text).with_context(|| format!("parsing tasks from {file}"))?;
+        return raw
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(t) => Ok(DelegateTask::new(t)),
+                serde_json::Value::Object(_) => {
+                    serde_json::from_value(v).with_context(|| format!("parsing a task from {file}"))
+                }
+                other => anyhow::bail!("expected a task name or object in {file}, got {other}"),
+            })
+            .collect();
+    }
+    Ok(tasks
+        .into_iter()
+        .map(|t| match t.split_once('=') {
+            Some((task, assignment)) => DelegateTask { task: task.to_owned(), assignment: Some(assignment.to_owned()) },
+            None => DelegateTask::new(t),
+        })
+        .collect())
 }
 
 fn write_export(text: &str, output: Option<PathBuf>) -> anyhow::Result<()> {
@@ -896,9 +925,11 @@ async fn run() -> anyhow::Result<()> {
                 print!("{}", b.markdown);
             }
         }
-        Cmd::Delegate { name, tasks, key } => {
+        Cmd::Delegate { name, tasks, from_file, key } => {
             let project = project.context("could not detect project; pass --project")?;
-            print!("{}", brief::delegate_report(&store.run_delegate(&project, &name, tasks, key).await?));
+            let tasks = delegate_tasks_from_args(tasks, from_file.as_deref())?;
+            let outcome = store.run_delegate_assigned(&project, &name, tasks, key).await?;
+            print!("{}", brief::delegate_report(&outcome));
         }
         Cmd::Task { cmd } => {
             let (run, task, outcome) = cmd.outcome()?;
@@ -1104,10 +1135,11 @@ async fn run_remote(
                 print!("{}", b["markdown"].as_str().unwrap_or_default());
             }
         }
-        Cmd::Delegate { name, tasks, key } => {
+        Cmd::Delegate { name, tasks, from_file, key } => {
             let project = project.context("could not detect project; pass --project")?;
-            let run = client()?.delegate(&project, &name, &tasks, key.as_deref()).await?;
-            print!("{}", brief::delegate_report(&run));
+            let tasks = delegate_tasks_from_args(tasks, from_file.as_deref())?;
+            let outcome = client()?.delegate(&project, &name, &tasks, key.as_deref()).await?;
+            print!("{}", brief::delegate_report(&outcome));
         }
         Cmd::Task { cmd } => {
             let (run, task, outcome) = cmd.outcome()?;
@@ -1152,10 +1184,11 @@ async fn run_remote(
 async fn run_delegated_remote(cmd: Cmd, r: &config::Remote, project: Option<String>) -> anyhow::Result<()> {
     let client = remote::Client::new(r.clone(), Duration::from_secs(15))?;
     match cmd {
-        Cmd::Delegate { name, tasks, key } => {
+        Cmd::Delegate { name, tasks, from_file, key } => {
             let project = project.context("could not detect project; pass --project")?;
-            let run = client.delegate(&project, &name, &tasks, key.as_deref()).await?;
-            print!("{}", brief::delegate_report(&run));
+            let tasks = delegate_tasks_from_args(tasks, from_file.as_deref())?;
+            let outcome = client.delegate(&project, &name, &tasks, key.as_deref()).await?;
+            print!("{}", brief::delegate_report(&outcome));
         }
         Cmd::Task { cmd } => {
             let (run, task, outcome) = cmd.outcome()?;

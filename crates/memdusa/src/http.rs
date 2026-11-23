@@ -953,7 +953,9 @@ async fn run_start(
 struct DelegateBody {
     project: String,
     name: String,
-    tasks: Vec<String>,
+    /// Plain task names still work; `{task, assignment}` objects store the coordinator's text.
+    #[serde(deserialize_with = "delegate_tasks")]
+    tasks: Vec<DelegateTask>,
     #[serde(default)]
     idempotency_key: Option<String>,
 }
@@ -964,9 +966,9 @@ async fn delegate(
     Extension(id): Extension<Identity>,
     Extension(access): Extension<AccessCache>,
     Json(b): Json<DelegateBody>,
-) -> ApiResult<RunWithSteps> {
+) -> ApiResult<DelegateOutcome> {
     check(&access, &id, &b.project, Access::Write, "delegate").await?;
-    Ok(Json(s.store.run_delegate(&b.project, &b.name, b.tasks, b.idempotency_key).await?))
+    Ok(Json(s.store.run_delegate_assigned(&b.project, &b.name, b.tasks, b.idempotency_key).await?))
 }
 
 #[derive(Deserialize)]
@@ -1736,6 +1738,57 @@ mod tests {
         assert_eq!(call(M::GET, &u("/v1/whoami"), Some(&bob), None).await.0, 200);
         let (_, audit) = call(M::GET, &u("/v1/admin/audit?actor=bob&limit=50"), Some(&admin), None).await;
         assert_eq!(audit.as_array().unwrap().len(), 7, "one denial per request");
+    }
+
+    #[tokio::test]
+    async fn delegate_accepts_plain_names_and_assignment_objects() {
+        use reqwest::Method as M;
+        let (url, store) = spawn(None).await;
+        let u = |p: &str| format!("{url}{p}");
+
+        // backward compatible: a plain array of task names still works
+        let (st, res) = call(
+            M::POST,
+            &u("/v1/delegate"),
+            None,
+            Some(json!({"project": "p", "name": "release", "tasks": ["docs"]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{res}");
+        assert_eq!(res["assigned"], 0, "{res}");
+        assert!(res["run"]["steps"][0]["input"].is_null(), "{res}");
+
+        // an object with an assignment, mixed with a plain name
+        let (st, res) = call(
+            M::POST,
+            &u("/v1/delegate"),
+            None,
+            Some(json!({
+                "project": "p", "name": "release",
+                "tasks": [{"task": "refunds", "assignment": "Build refunds. TailRestXYZ."}, "docs"]
+            })),
+        )
+        .await;
+        assert_eq!(st, 200, "{res}");
+        assert_eq!(res["assigned"], 1, "{res}");
+        let stored = res["run"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "refunds")
+            .unwrap()["input"]["assignment"]
+            .as_str()
+            .unwrap();
+        assert_eq!(stored, "Build refunds. TailRestXYZ.");
+        let step = store
+            .run_get(res["run"]["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|s| s.key == "refunds")
+            .unwrap();
+        assert_eq!(assignment_from_input(step.input.as_ref()), Some("Build refunds. TailRestXYZ."));
     }
 
     #[tokio::test]
