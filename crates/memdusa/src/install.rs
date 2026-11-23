@@ -875,9 +875,14 @@ fn hermes_hook_bin(opts: &InstallOptions, bin: &str) -> anyhow::Result<String> {
             _ => true,
         };
         if fresh {
-            std::fs::copy(&source, &staged)
+            // Copy to a temp file and rename it into place: overwriting a signed binary in place makes
+            // macOS kill the next process started from it (SIGKILL, exit 137).
+            let tmp = staged.with_extension(format!("tmp.{}", std::process::id()));
+            std::fs::copy(&source, &tmp)
+                .with_context(|| format!("staging the Hermes hook binary at {}", tmp.display()))?;
+            make_executable(&tmp)?;
+            std::fs::rename(&tmp, &staged)
                 .with_context(|| format!("staging the Hermes hook binary at {}", staged.display()))?;
-            make_executable(&staged)?;
         }
     }
     println!(
