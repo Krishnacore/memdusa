@@ -599,10 +599,11 @@ fn git_hook_line(bin: &str, hook: &str) -> String {
 
 /// `git rev-parse --git-path hooks`: respects `core.hooksPath` (e.g. Husky).
 fn git_hooks_dir() -> anyhow::Result<PathBuf> {
-    let out = Command::new("git")
+    let out = crate::project::git_command()
+        .context("git is not installed (on macOS: `xcode-select --install`)")?
         .args(["rev-parse", "--git-path", "hooks"])
         .output()
-        .context("running git (is git installed?)")?;
+        .context("running git")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!("not in a git repository: {}", err.trim());

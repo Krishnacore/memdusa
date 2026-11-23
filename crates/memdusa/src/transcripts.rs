@@ -8,7 +8,6 @@
 //! apply. Parsers are defensive: lines they don't understand are skipped.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context;
 use memdusa_core::Store;
@@ -453,7 +452,8 @@ fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The directory itself and its git root: sessions started anywhere in the repo count.
 fn repo_roots(cwd: &Path) -> Vec<String> {
     let mut roots = vec![cwd.display().to_string()];
-    let top = Command::new("git").arg("-C").arg(cwd).args(["rev-parse", "--show-toplevel"]).output().ok();
+    let top = crate::project::git_command()
+        .and_then(|mut git| git.arg("-C").arg(cwd).args(["rev-parse", "--show-toplevel"]).output().ok());
     if let Some(top) = top.filter(|o| o.status.success()) {
         let top = String::from_utf8_lossy(&top.stdout).trim().to_owned();
         if !top.is_empty() && !roots.contains(&top) {
