@@ -318,6 +318,15 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_bytes(original)
 
+    # --accept-hooks can also append the trial's hook commands to Hermes'
+    # global allowlist, and Hermes snapshots config.yaml into backups/config/.
+    # Both are global state created by this run: restore them as well.
+    allowlist = config.parent / "shell-hooks-allowlist.json"
+    allow_original = allowlist.read_bytes() if allowlist.exists() else None
+    backup_dir = config.parent / "backups" / "config"
+    pre_backups = ({p.name: p.read_bytes() for p in backup_dir.glob("config.yaml.*")}
+                   if backup_dir.exists() else {})
+
     previous = {}
 
     def on_signal(signum, _frame):
@@ -343,9 +352,24 @@ def hermes_config_guard(config: Path, backup: Path, memdusa: Path, db_url: str, 
         identical = memdusa_backup.exists() and memdusa_backup.read_bytes() == original
         if identical:
             memdusa_backup.unlink()
+        if allow_original is None:
+            allowlist.unlink(missing_ok=True)
+        else:
+            allowlist.write_bytes(allow_original)
+        if backup_dir.exists():
+            for new_backup in set(backup_dir.glob("config.yaml.*")) - {backup_dir / n for n in pre_backups}:
+                new_backup.unlink()
+            # Hermes prunes old backups when it writes new ones; put back any
+            # pre-existing file it removed so the global state is unchanged.
+            for name, data in pre_backups.items():
+                if not (backup_dir / name).exists():
+                    (backup_dir / name).write_bytes(data)
         backup.parent.joinpath("hermes-config-hashes.json").write_text(json.dumps(
             {"config": str(config), "before": before, "after": after,
-             "backup_removed": identical}, indent=2))
+             "backup_removed": identical,
+             "allowlist_before": hashlib.sha256(allow_original).hexdigest() if allow_original else None,
+             "allowlist_after": hashlib.sha256(allowlist.read_bytes()).hexdigest() if allowlist.exists() else None},
+            indent=2))
 
 
 # ---------------------------------------------------------------- harness runners

@@ -138,9 +138,12 @@ database but makes no model calls.
 pass `--allow-user-config` (a clear note is printed in the report). When enabled, its runner copies the original
 bytes aside, runs `memdusa install hermes --scope user --database-url …`, launches Hermes with `TERMINAL_CWD` and
 cwd set to the scratch repo, then restores the original byte for byte (hash-verified) from a `try/finally` **and**
-a SIGINT/SIGTERM handler, and removes `config.yaml.memdusa-backup` if it is identical. Dry runs always use a
-synthetic config in the trial directory (`--hermes-config` overrides the path), never the real file. Hash evidence
-is written to `hermes-config-hashes.json` in the trial directory.
+a SIGINT/SIGTERM handler, and removes `config.yaml.memdusa-backup` if it is identical. It also restores
+`~/.hermes/shell-hooks-allowlist.json` (Hermes auto-approves the trial's hooks there) and removes any backups
+Hermes creates under `~/.hermes/backups/config/` during the run, so no global Hermes state is left modified. Dry
+runs always use a synthetic config in the trial directory (`--hermes-config` overrides the path), never the real
+file. Hash evidence (config and allowlist, before and after) is written to `hermes-config-hashes.json` in the trial
+directory.
 
 **Cursor double-recording.** Cursor runs Claude Code hooks by default ("Third-Party Imports"). When a trial installs
 both Cursor and Claude Code hooks, Cursor's edits can be journaled twice — once with source `cursor`, once with
