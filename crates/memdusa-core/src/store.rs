@@ -1816,6 +1816,16 @@ impl Store {
         Ok(q.build().execute(&self.pool).await?.rows_affected() > 0)
     }
 
+    /// The delegated step `owner` is working on: `(run_id, step_key)` of its most recently started running step.
+    /// For harnesses whose hooks can't see the worker's own `MEMDUSA_RUN` / `MEMDUSA_TASK` after the claim.
+    pub async fn step_owned_by(&self, owner: &str) -> Result<Option<(String, String)>> {
+        let mut q = Q::new("SELECT run_id, step_key FROM steps WHERE owner = ");
+        let (o, running) = (q.text(owner), q.text(StepStatus::Running.as_str()));
+        q.push(&format!("{o} AND status = {running} ORDER BY started_at DESC LIMIT 1"));
+        let Some(row) = q.build().fetch_optional(&self.pool).await? else { return Ok(None) };
+        Ok(Some((row.try_get("run_id")?, row.try_get("step_key")?)))
+    }
+
     async fn step_get(&self, run_id: &str, key: &str) -> Result<Step> {
         let mut q = Q::new("SELECT * FROM steps WHERE run_id = ");
         let (r, k) = (q.text(run_id), q.text(key));

@@ -191,9 +191,12 @@ MEMDUSA_RUN=… MEMDUSA_TASK=docs      opencode run --standalone "Continue your 
 launch env to its stdio MCP servers, and `memdusa install codex` writes `env_vars` (plus
 `default_tools_approval_mode = "approve"`, so headless tool calls don't need an interactive approver) into
 `~/.codex/config.toml`. OpenCode v2 runs plugins and MCP servers in a shared background service that does not inherit
-the launcher's env, so a delegated worker must use `opencode run --standalone`. For pi, Cursor, Antigravity and Hermes
-we have not verified env forwarding to MCP servers; configure memdusa at install time (`--database-url` / `memdusa
-login`) instead of relying on shell env vars.
+the launcher's env, so a delegated worker must use `opencode run --standalone`. Hermes runs every session (`hermes -z`
+included) in one long-lived gateway, so its hooks and MCP servers never see a worker's shell env: memdusa ignores
+`MEMDUSA_RUN` / `MEMDUSA_TASK` there, and a Hermes worker gets `delegate`'s `MEMDUSA_RUN=<id> MEMDUSA_TASK=<task>`
+line in its prompt instead (the claim notice then gives it the `run` / `task` to pass to `task_complete`). For pi,
+Cursor and Antigravity, configure the database at install time (`--database-url` / `memdusa login`) rather than
+relying on shell env vars.
 
 `MEMDUSA_TASK` marks the worker (required); `MEMDUSA_PARENT` is free text naming the coordinator (optional). Then:
 

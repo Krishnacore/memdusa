@@ -1278,6 +1278,7 @@ mod tests {
             task: task.map(String::from),
             parent: task.map(|_| "lead".into()),
             run: None,
+            session_coord: false,
         };
         c.hook(HookEvent::SessionStart, &req(Some("docs"), json!({"session_id": "W", "source": "startup"})))
             .await
@@ -1303,6 +1304,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_env_sessions_keep_the_lease_of_the_step_they_claimed() {
+        // Hermes: the worker's run/task arrive only with the first prompt; later events carry neither.
+        let (url, store) = spawn(None).await;
+        let c = client(&url, None);
+        let run = store.run_delegate("shop", "release", vec!["refunds".into(), "invoices".into()], None).await.unwrap();
+        let req = |run: Option<&str>, task: Option<&str>, input| HookRequest {
+            project: "shop".into(),
+            config: HookConfig { agent: "hermes".into(), journal_prompts: true, stop_guard_mins: 15, recall: true },
+            input,
+            git: None,
+            at: None,
+            task: task.map(String::from),
+            parent: None,
+            run: run.map(String::from),
+            session_coord: true,
+        };
+        let id = run.run.id.as_str();
+        c.hook(
+            HookEvent::SessionStart,
+            &req(Some(id), Some("invoices"), json!({"session_id": "H", "source": "startup"})),
+        )
+        .await
+        .unwrap();
+        let lease = |s: &RunWithSteps| s.steps.iter().find(|s| s.key == "invoices").unwrap().lease_until.unwrap();
+        let claimed = store.run_get(id).await.unwrap();
+        let first = lease(&claimed);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let edit =
+            json!({"session_id": "H", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
+        c.hook(HookEvent::PostToolUse, &req(None, None, edit.clone())).await.unwrap();
+        let after = store.run_get(id).await.unwrap();
+        assert!(lease(&after) > first, "renewed from the step this session owns");
+        assert_eq!(after.steps.iter().find(|s| s.key == "refunds").unwrap().owner, None, "no other step touched");
+
+        // another session owns nothing: its events change nothing
+        let other =
+            json!({"session_id": "X", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/b.rs"}});
+        c.hook(HookEvent::PostToolUse, &req(None, None, other)).await.unwrap();
+        assert_eq!(store.run_get(id).await.unwrap().steps.iter().filter(|s| s.owner.is_some()).count(), 1);
+    }
+
+    #[tokio::test]
     async fn remote_hooks_round_trip_with_auth() {
         let (url, store) = spawn(Some("s3cret")).await;
         assert!(client(&url, Some("wrong")).whoami().await.is_err(), "bad token rejected");
@@ -1323,6 +1366,7 @@ mod tests {
             task: None,
             parent: None,
             run: None,
+            session_coord: false,
         };
         let edit =
             json!({"session_id": "A", "cwd": "/r", "tool_name": "Write", "tool_input": {"file_path": "/r/a.rs"}});
@@ -1571,6 +1615,7 @@ mod tests {
             task: None,
             parent: None,
             run: None,
+            session_coord: false,
         };
         let item = |event: &str, input: Value, at: i64| HookBatchItem { event: event.into(), request: req(input, at) };
         let t0 = now_ms() - 60_000;

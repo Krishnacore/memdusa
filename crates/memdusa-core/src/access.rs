@@ -299,8 +299,9 @@ impl Store {
     /// stored value, never a caller-supplied one.
     pub async fn run_project(&self, id: &str) -> Result<String> {
         let mut q = Q::new("SELECT project FROM runs WHERE id = ");
-        let id = q.text(id);
-        q.push(&id);
+        let p = q.text(id);
+        q.push(&p);
+        // report the run id, not the SQL placeholder (`$1`) the shadowed binding used to print
         let row = q.build().fetch_optional(&self.pool).await?.ok_or_else(|| Error::NotFound(format!("run {id}")))?;
         Ok(row.try_get("project")?)
     }
@@ -308,8 +309,9 @@ impl Store {
     /// Owner of a run, for auditing finishes by someone other than the owner.
     pub async fn run_owner(&self, id: &str) -> Result<Option<String>> {
         let mut q = Q::new("SELECT owner FROM runs WHERE id = ");
-        let id = q.text(id);
-        q.push(&id);
+        let p = q.text(id);
+        q.push(&p);
+        // report the run id, not the SQL placeholder (`$1`) the shadowed binding used to print
         let row = q.build().fetch_optional(&self.pool).await?.ok_or_else(|| Error::NotFound(format!("run {id}")))?;
         Ok(row.try_get("owner")?)
     }

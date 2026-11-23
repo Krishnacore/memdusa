@@ -623,8 +623,22 @@ pub fn delegate_report(outcome: &DelegateOutcome) -> String {
     o
 }
 
+/// The `MEMDUSA_RUN=<id> MEMDUSA_TASK=<task>` line `delegate` prints for each worker, read from a prompt.
+/// For harnesses whose hooks don't run in the worker's own environment (Hermes runs every session's hooks
+/// in one shared gateway), the worker's prompt carries this line instead. `None` unless exactly one
+/// distinct pair is present: a coordinator pasting the whole delegate output is not a worker.
+pub fn coord_line(text: &str) -> Option<(String, String)> {
+    static LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"MEMDUSA_RUN=`?(\w(?:[\w.:-]*\w)?)`?\s+MEMDUSA_TASK=`?(\w(?:[\w.:-]*\w)?)")
+            .expect("coordination line pattern")
+    });
+    let mut pairs = LINE.captures_iter(text).map(|c| (c[1].to_owned(), c[2].to_owned()));
+    let first = pairs.next()?;
+    pairs.all(|p| p == first).then_some(first)
+}
+
 /// The notice at the top of a worker's SessionStart brief about its claim on its step of a delegated run.
-pub fn claim_notice(task: &str, claim: &ClaimResult) -> String {
+pub fn claim_notice(run: &str, task: &str, claim: &ClaimResult) -> String {
     match claim {
         ClaimResult::Claimed { previous_owner, stale, previous_error, .. } => {
             let mut s = format!("**You claimed the delegated task `{task}`.** ");
@@ -641,10 +655,13 @@ pub fn claim_notice(task: &str, claim: &ClaimResult) -> String {
             if let Some(e) = previous_error {
                 s.push_str(&format!("An earlier attempt failed: {e}. "));
             }
-            s.push_str(
+            // Spell out run and task: some harnesses start MCP servers from a long-lived daemon (Hermes' gateway,
+            // OpenCode's service) that never sees this worker's MEMDUSA_RUN / MEMDUSA_TASK.
+            s.push_str(&format!(
                 "Your lease renews while you work. When the task is finished call the memdusa `task_complete` tool \
-                 (or `memdusa task done`) with a short summary; if you can't finish it, call `task_fail` with the reason.",
-            );
+                 with `run: \"{run}\"`, `task: \"{task}\"` and a short `summary` (or `memdusa task done`); if you \
+                 can't finish it, call `task_fail` with the same `run`/`task` and the reason."
+            ));
             s
         }
         ClaimResult::AlreadyDone { output } => {
@@ -1161,6 +1178,19 @@ fn team_lines(events: &[Event]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coord_line_takes_exactly_one_worker_pair() {
+        let one = "Build invoices.\nYour memdusa task: MEMDUSA_RUN=01a2-7b MEMDUSA_TASK=invoices\n";
+        assert_eq!(coord_line(one), Some(("01a2-7b".into(), "invoices".into())));
+        let ticked = "- `MEMDUSA_RUN=r1` `MEMDUSA_TASK=refunds`";
+        assert_eq!(coord_line(ticked), None, "backticks around each pair split the line, not a match");
+        let quoted = "MEMDUSA_RUN=r1 MEMDUSA_TASK=refunds. Again: MEMDUSA_RUN=r1 MEMDUSA_TASK=refunds";
+        assert_eq!(coord_line(quoted), Some(("r1".into(), "refunds".into())), "the same pair twice is still one");
+        let delegate = "- MEMDUSA_RUN=r1 MEMDUSA_TASK=refunds\n- MEMDUSA_RUN=r1 MEMDUSA_TASK=invoices\n";
+        assert_eq!(coord_line(delegate), None, "a coordinator's paste of every worker line");
+        assert_eq!(coord_line("set MEMDUSA_TASK yourself"), None);
+    }
 
     fn cp(worktree: Option<&str>, branch: &str, host: &str, at: Millis) -> Checkpoint {
         Checkpoint {

@@ -555,6 +555,7 @@ impl Backend<'_> {
             task: None,
             parent: None,
             run: None,
+            session_coord: false,
         };
         match self {
             Self::Local(store) => {
