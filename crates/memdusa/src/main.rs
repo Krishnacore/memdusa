@@ -1540,7 +1540,7 @@ fn semantic_line(model: Option<&str>, embedded: i64, total: i64) -> String {
 
 fn default_db_url() -> anyhow::Result<String> {
     let dir = config::dir()?;
-    std::fs::create_dir_all(&dir)?;
+    memdusa_core::store::create_private_dir(&dir)?;
     Ok(memdusa_core::store::sqlite_url(&dir.join("memdusa.db")))
 }
 

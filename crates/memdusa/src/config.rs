@@ -133,7 +133,7 @@ pub fn set_sync_mode(on: bool) -> anyhow::Result<String> {
 
 /// Write a secret-bearing file atomically, readable only by its owner.
 fn write_private(path: &Path, text: &str) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path.parent().expect("file path has a parent"))?;
+    memdusa_core::store::create_private_dir(path.parent().expect("file path has a parent"))?;
     // A unique temp name per write: with a fixed `config.tmp`, two processes saving at once (a sync
     // watcher starting while `sync status` runs, concurrent hooks) shared the temp file, and the second
     // rename failed with "No such file or directory".

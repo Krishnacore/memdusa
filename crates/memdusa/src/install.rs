@@ -698,9 +698,12 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     apply(&path, &old, &json_text(&updated)?, if mcp_same_file { "hooks and MCP server" } else { "hooks" }, &opts)?;
 
     // MCP server
+    let mut claude_missing = false;
     if opts.mcp && !mcp_same_file {
         match h {
-            Harness::ClaudeCode => mcp_register_claude(&bin, db, opts.scope, opts.dry_run, opts.uninstall)?,
+            Harness::ClaudeCode => {
+                claude_missing = !mcp_register_claude(&bin, db, opts.scope, opts.dry_run, opts.uninstall)?
+            }
             Harness::Codex => {
                 let p = if opts.scope == Scope::User {
                     home_dir()?.join(".codex/config.toml")
@@ -738,7 +741,14 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
         for note in notes(h)?.into_iter().chain(cursor_note) {
             println!("\nnote: {note}");
         }
-        println!("\nDone. Start a new session: it will load the resume brief automatically.");
+        if claude_missing {
+            println!(
+                "\nDone. Hooks are installed; install {} and register the MCP server (command above), then start a new session.",
+                h.agent()
+            );
+        } else {
+            println!("\nDone. Start a new session: it will load the resume brief automatically.");
+        }
     }
     Ok(())
 }
@@ -1088,13 +1098,15 @@ fn write_with_backup(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns `false` when the `claude` CLI is missing (the caller then adjusts
+/// the final "Done" message), `true` otherwise.
 fn mcp_register_claude(
     bin: &str,
     db: Option<&str>,
     scope: Scope,
     dry_run: bool,
     uninstall: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let scope = match scope {
         Scope::User => "user",
         Scope::Project => "project",
@@ -1112,7 +1124,7 @@ fn mcp_register_claude(
     let shown = format!("claude {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
     if dry_run {
         println!("# would run: {shown}");
-        return Ok(());
+        return Ok(true);
     }
     let exists = Command::new("claude")
         .args(["mcp", "get", "memdusa"])
@@ -1122,19 +1134,19 @@ fn mcp_register_claude(
     match (exists, uninstall) {
         (Err(e), _) => {
             println!("{e}");
-            Ok(())
+            Ok(false)
         }
         (Ok(true), false) => {
             println!("MCP server `memdusa` already registered (check with `claude mcp get memdusa`)");
-            Ok(())
+            Ok(true)
         }
-        (Ok(false), true) => Ok(()),
+        (Ok(false), true) => Ok(true),
         _ => {
             let status = Command::new("claude").args(&args).status()?;
             if !status.success() {
                 bail!("`{shown}` failed");
             }
-            Ok(())
+            Ok(true)
         }
     }
 }
