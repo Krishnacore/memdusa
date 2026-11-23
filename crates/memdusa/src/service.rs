@@ -5,8 +5,13 @@
 //! Tests point `MEMDUSA_SERVICE_DIR` at a temp directory, so no real service
 //! directory is ever touched by the test suite.
 
+// The launchd/systemd renderers are only called on macOS/Linux (and in tests); Windows builds print
+// instructions instead, so they would be dead code there.
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 use anyhow::Context;
 use clap::Subcommand;
 
