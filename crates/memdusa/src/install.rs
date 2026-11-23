@@ -674,7 +674,7 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
     }
     let bin = match &opts.bin {
         Some(b) => b.clone(),
-        None => std::env::current_exe()?.canonicalize()?.display().to_string(),
+        None => crate::config::stable_exe()?,
     };
     let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
     match h {
