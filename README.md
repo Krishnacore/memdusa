@@ -112,7 +112,7 @@ in that tool's dialect. Remote mode, the offline queue, redaction and code state
 | Cursor | `~/.cursor/hooks.json` + `mcp.json` | ✓ | ✓ | ✓ | stop (`followup_message`) | preCompact, sessionEnd |
 | Antigravity CLI | `~/.gemini/config/hooks.json` + `mcp_config.json` | ✓ | ✓ (first `PreInvocation`) | ✓ | Stop (`continue`) | Stop when fully idle (once per session; last words from the transcript) |
 | Gemini CLI | `~/.gemini/settings.json` | ✓ | ✓ (`BeforeAgent`) | ✓ | AfterAgent (`deny`) | PreCompress, SessionEnd |
-| OpenCode | TypeScript plugin in `.opencode/plugins/` | ✓ (first prompt) | ✓ | ✓ | `experimental.idle` | compaction hook |
+| OpenCode | TypeScript plugin in `.opencode/plugins/` (1.x: `memdusa.ts`, MCP in `opencode.json(c)`; 2.x: `memdusa/index.ts`) | ✓ (first prompt) | ✓ | ✓ | idle (`session.idle` / `experimental.idle`) | compaction hook |
 | pi | TypeScript extension in `~/.pi/agent/extensions/` | ✓ (first run) | ✓ | ✓ | `agent_before_settle` | session_before_compact, session_shutdown |
 | Hermes Agent | shell hooks in `~/.hermes/config.yaml` | ✓ (first turn) | ✓ | ✓ | `pre_verify` (after edits only) | on_session_finalize |
 
@@ -131,6 +131,7 @@ Most harnesses refuse to run a project's hooks or MCP servers until you approve 
 | Cursor CLI (`cursor-agent`) | Untrusted folders won't start in print mode: trust the folder interactively or pass `--trust`; `--approve-mcps` auto-approves the MCP **server**. `memdusa install cursor` also adds `Mcp(memdusa:*)` to `.cursor/cli.json` (project) or `~/.cursor/cli-config.json` (user), so print mode can call memdusa's own MCP tools without an interactive approver — no other server, shell, file or web permission is widened. Shell commands still follow Cursor's own policy: use `--force` (or an allowlist) for automation that runs them. Cursor runs memdusa through its Claude Code hooks import. |
 | pi | Project extensions (`.pi/`) load only for trusted projects: answer the trust prompt, or pass `--approve` / `-a` for one run. |
 | Hermes | Shell hooks must be allowlisted: run Hermes once with `--accept-hooks` (or approve at its prompt). `hermes hooks doctor` shows their status. |
+| OpenCode | `memdusa install opencode` checks `opencode --version`: the stable 1.x and the 2.x line have different plugin APIs and MCP setup, so it writes the matching plugin (and removes one written for the other line). Re-run it after switching OpenCode versions. `MEMDUSA_OPENCODE_API=1` or `2` overrides the detection. |
 | OpenCode v2 | Plugins and MCP servers run in a shared background service that does not inherit the environment of the shell you start `opencode` from. Configure memdusa at install time (`memdusa install opencode --database-url …`, or `memdusa login`, which is saved in `~/.memdusa` and read by every hook), not with shell env vars. A delegated worker must launch with `opencode run --standalone` (a private server that does inherit env), or its MCP tools won't see `MEMDUSA_RUN` / `MEMDUSA_TASK`. |
 | Gemini CLI | Google stopped serving individual accounts in Gemini CLI (June 2026): use Antigravity (`agy`, `memdusa install antigravity`). |
 

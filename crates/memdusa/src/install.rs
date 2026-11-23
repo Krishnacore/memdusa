@@ -830,11 +830,52 @@ fn notes(h: Harness) -> anyhow::Result<Vec<String>> {
 }
 
 const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.ts");
+const OPENCODE_PLUGIN_V1: &str = include_str!("../assets/opencode-plugin-v1.ts");
 const PI_EXTENSION: &str = include_str!("../assets/pi-extension.ts");
 
-/// The plugin source with the memdusa binary baked in.
+/// OpenCode's stable 1.x and its 2.x line differ in plugin API, plugin location and MCP registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeApi {
+    V1,
+    V2,
+}
+
+/// The major version in `opencode --version` output (`1.19.6`, `opencode v2.2.6`).
+fn parse_opencode_version(out: &str) -> Option<OpenCodeApi> {
+    let token = out.split_whitespace().find(|t| t.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit()))?;
+    let major: u32 = token.trim_start_matches('v').split('.').next()?.parse().ok()?;
+    Some(if major >= 2 { OpenCodeApi::V2 } else { OpenCodeApi::V1 })
+}
+
+/// Which OpenCode is installed. `MEMDUSA_OPENCODE_API=1|2` overrides; without `opencode` on PATH, the stable 1.x.
+fn opencode_api() -> OpenCodeApi {
+    match std::env::var("MEMDUSA_OPENCODE_API").as_deref().map(str::trim) {
+        Ok("1") => return OpenCodeApi::V1,
+        Ok("2") => return OpenCodeApi::V2,
+        _ => {}
+    }
+    Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| parse_opencode_version(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(OpenCodeApi::V1)
+}
+
+/// The plugin source with the memdusa binary baked in (OpenCode: the 2.x plugin; see [`opencode_plugin_source`]).
 pub fn plugin_source(h: Harness, bin: &str, db: Option<&str>) -> String {
-    let template = if h == Harness::OpenCode { OPENCODE_PLUGIN } else { PI_EXTENSION };
+    if h == Harness::OpenCode {
+        return opencode_plugin_source(OpenCodeApi::V2, bin, db);
+    }
+    fill_template(PI_EXTENSION, bin, db)
+}
+
+/// OpenCode's plugin for its 1.x or 2.x plugin API.
+pub fn opencode_plugin_source(api: OpenCodeApi, bin: &str, db: Option<&str>) -> String {
+    fill_template(if api == OpenCodeApi::V1 { OPENCODE_PLUGIN_V1 } else { OPENCODE_PLUGIN }, bin, db)
+}
+
+fn fill_template(template: &str, bin: &str, db: Option<&str>) -> String {
     // extra `spawn` args (after the fixed ones): empty unless a database URL was given
     let extra: String =
         db_args(db).iter().map(|a| format!(", {}", serde_json::to_string(a).expect("string serializes"))).collect();
@@ -848,15 +889,35 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
     let h = opts.harness;
     let db = opts.database_url.as_deref().filter(|u| !u.is_empty());
     let user = opts.scope == Scope::User;
+    let api = (h == Harness::OpenCode).then(opencode_api);
+    // OpenCode 1.x loads only top-level files in plugins/; 2.x loads plugins/<name>/index.ts.
+    let opencode_dir = || -> anyhow::Result<PathBuf> {
+        Ok(if user { home_dir()?.join(".config/opencode/plugins") } else { ".opencode/plugins".into() })
+    };
     let path: PathBuf = match &opts.settings {
         Some(p) => p.clone(),
-        None => match (h, user) {
-            (Harness::OpenCode, true) => home_dir()?.join(".config/opencode/plugins/memdusa/index.ts"),
-            (Harness::OpenCode, false) => ".opencode/plugins/memdusa/index.ts".into(),
-            (_, true) => home_dir()?.join(".pi/agent/extensions/memdusa.ts"),
-            (_, false) => ".pi/extensions/memdusa.ts".into(),
+        None => match (h, user, api) {
+            (Harness::OpenCode, _, Some(OpenCodeApi::V1)) => opencode_dir()?.join("memdusa.ts"),
+            (Harness::OpenCode, ..) => opencode_dir()?.join("memdusa/index.ts"),
+            (_, true, _) => home_dir()?.join(".pi/agent/extensions/memdusa.ts"),
+            (_, false, _) => ".pi/extensions/memdusa.ts".into(),
         },
     };
+    if h == Harness::OpenCode && opts.settings.is_none() && !opts.dry_run {
+        // A plugin for the other OpenCode line (left from before an OpenCode upgrade or downgrade) would fail to load.
+        let other = if api == Some(OpenCodeApi::V1) {
+            opencode_dir()?.join("memdusa/index.ts")
+        } else {
+            opencode_dir()?.join("memdusa.ts")
+        };
+        if other.exists() {
+            std::fs::remove_file(&other)?;
+            if let Some(dir) = other.parent().filter(|d| d.ends_with("memdusa")) {
+                let _ = std::fs::remove_dir(dir);
+            }
+            println!("removed {} (plugin for the other OpenCode version)", other.display());
+        }
+    }
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     if opts.uninstall {
         if opts.dry_run {
@@ -864,7 +925,7 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
         } else if path.exists() {
             std::fs::remove_file(&path)?;
             if h == Harness::OpenCode
-                && let Some(dir) = path.parent()
+                && let Some(dir) = path.parent().filter(|d| d.ends_with("memdusa"))
             {
                 let _ = std::fs::remove_dir(dir); // only if empty
             }
@@ -872,11 +933,16 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
         }
     } else {
         let what = if h == Harness::OpenCode { "plugin" } else { "extension" };
-        apply(&path, &old, &plugin_source(h, bin, db), what, opts)?;
+        let src = match api {
+            Some(api) => opencode_plugin_source(api, bin, db),
+            None => plugin_source(h, bin, db),
+        };
+        apply(&path, &old, &src, what, opts)?;
     }
 
     if opts.mcp {
         match h {
+            Harness::OpenCode if api == Some(OpenCodeApi::V1) => opencode_v1_mcp(bin, db, opts)?,
             Harness::OpenCode => opencode_mcp(bin, db, user, opts.dry_run, opts.uninstall)?,
             _ => {
                 if let Some(p) = mcp_json_path(h, opts.scope)? {
@@ -895,6 +961,57 @@ fn install_plugin(opts: &InstallOptions, bin: &str) -> anyhow::Result<()> {
         println!("\nDone. Start a new session: it will load the resume brief automatically.");
     }
     Ok(())
+}
+
+/// OpenCode 1.x: `mcp.memdusa` in its config file. Its `opencode mcp add` only runs an interactive wizard.
+fn opencode_v1_mcp(bin: &str, db: Option<&str>, opts: &InstallOptions) -> anyhow::Result<()> {
+    let dir = if opts.scope == Scope::User { home_dir()?.join(".config/opencode") } else { PathBuf::new() };
+    // OpenCode reads opencode.json and opencode.jsonc: edit whichever exists (.jsonc first, as OpenCode creates it).
+    let path = ["opencode.jsonc", "opencode.json"].iter().map(|n| dir.join(n)).find(|p| p.exists());
+    let path = path.unwrap_or_else(|| dir.join("opencode.json"));
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut cfg = match read_json(&path) {
+        Ok(v) => v,
+        Err(_) => {
+            // JSONC with comments: don't rewrite (and lose) the user's comments; show what to add instead.
+            let entry = json!({ "memdusa": opencode_v1_entry(bin, db) });
+            if opts.uninstall {
+                println!("{} has comments; remove `memdusa` from its `mcp` section by hand.", path.display());
+            } else {
+                println!(
+                    "{} has comments, so memdusa didn't edit it. Add this to its `mcp` section:\n{}",
+                    path.display(),
+                    serde_json::to_string_pretty(&entry)?
+                );
+            }
+            return Ok(());
+        }
+    };
+    let obj = cfg.as_object_mut().context("OpenCode config is not a JSON object")?;
+    if opts.uninstall {
+        if let Some(mcp) = obj.get_mut("mcp").and_then(Value::as_object_mut) {
+            mcp.remove("memdusa");
+            if mcp.is_empty() {
+                obj.remove("mcp");
+            }
+        }
+    } else {
+        obj.entry("$schema").or_insert_with(|| json!("https://opencode.ai/config.json"));
+        let mcp = obj.entry("mcp").or_insert_with(|| json!({}));
+        mcp.as_object_mut()
+            .context("`mcp` in the OpenCode config is not an object")?
+            .insert("memdusa".into(), opencode_v1_entry(bin, db));
+    }
+    if opts.uninstall && old.is_empty() {
+        return Ok(());
+    }
+    apply(&path, &old, &json_text(&cfg)?, "MCP server", opts)
+}
+
+fn opencode_v1_entry(bin: &str, db: Option<&str>) -> Value {
+    let mut command = vec![bin.to_owned(), "mcp".into(), "--agent".into(), "opencode".into()];
+    command.extend(db_args(db));
+    json!({ "type": "local", "command": command, "enabled": true })
 }
 
 fn opencode_mcp(bin: &str, db: Option<&str>, user: bool, dry_run: bool, uninstall: bool) -> anyhow::Result<()> {
@@ -1489,6 +1606,36 @@ mod tests {
         let yaml = crate::hermes_yaml::merge("", BIN, Some(URL), true, false).unwrap();
         assert!(yaml.contains(&format!("hook stop --harness hermes{flag}\"")));
         assert!(yaml.contains(&format!("args: [\"mcp\", \"--agent\", \"hermes\", \"--database-url\", \"{URL}\"]")));
+    }
+
+    #[test]
+    fn opencode_version_picks_the_plugin_api() {
+        assert_eq!(parse_opencode_version("1.19.6\n"), Some(OpenCodeApi::V1));
+        assert_eq!(parse_opencode_version("opencode v2.2.6\n"), Some(OpenCodeApi::V2));
+        assert_eq!(parse_opencode_version("0.15.3"), Some(OpenCodeApi::V1));
+        assert_eq!(parse_opencode_version("command not found"), None);
+    }
+
+    /// OpenCode 1.x plugin: no OpenCode import (loads without its package) and the 1.x hook names (OpenCode 1.19.6).
+    #[test]
+    fn opencode_v1_plugin_uses_the_v1_hooks() {
+        let v1 = opencode_plugin_source(OpenCodeApi::V1, BIN, Some("postgres://h/db"));
+        for needle in [
+            "export const MemdusaPlugin",
+            "\"chat.message\"",
+            "\"experimental.chat.system.transform\"",
+            "\"tool.execute.after\"",
+            "\"experimental.session.compacting\"",
+            "\"session.idle\"",
+            r#"["hook", event, "--agent", AGENT, "--database-url", "postgres://h/db"]"#,
+        ] {
+            assert!(v1.contains(needle), "OpenCode 1.x plugin lacks {needle}");
+        }
+        assert!(!v1.contains("from \"@opencode"), "must not import OpenCode packages");
+        assert!(!v1.contains("__MEMDUSA_"), "template fully filled");
+        let entry = opencode_v1_entry(BIN, None);
+        assert_eq!(entry["command"], json!([BIN, "mcp", "--agent", "opencode"]));
+        assert_eq!(entry["type"], "local");
     }
 
     /// Event registrations verified against the real tools (OpenCode 2.2.6, pi 0.73.1; fixtures in tests/fixtures/harness).
