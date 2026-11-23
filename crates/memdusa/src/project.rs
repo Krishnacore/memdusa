@@ -16,7 +16,8 @@ pub fn git_command() -> Option<Command> {
 
 fn git_usable() -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
-    let Some(git) = std::env::split_paths(&path).map(|d| d.join("git")).find(|p| p.is_file()) else { return false };
+    let exe = format!("git{}", std::env::consts::EXE_SUFFIX); // git.exe on Windows
+    let Some(git) = std::env::split_paths(&path).map(|d| d.join(&exe)).find(|p| p.is_file()) else { return false };
     if cfg!(target_os = "macos") && git == Path::new("/usr/bin/git") {
         return Command::new("/usr/bin/xcode-select").arg("-p").output().is_ok_and(|o| o.status.success());
     }
