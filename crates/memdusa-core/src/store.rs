@@ -599,6 +599,17 @@ fn is_sqlite_busy(e: &Error) -> bool {
 
 impl Store {
     /// Connect to `sqlite://path/to.db` or `postgres://...` and apply the schema.
+    /// Start a transaction that will write. On SQLite this is `BEGIN IMMEDIATE`: a deferred
+    /// transaction that reads first and then writes gets SQLITE_BUSY *immediately* (the busy timeout
+    /// doesn't apply to that upgrade) whenever another connection is writing, e.g. a hook racing the
+    /// sync watcher ("database is locked"). IMMEDIATE takes the write lock up front and waits for it.
+    pub(crate) async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Any>> {
+        Ok(match self.backend {
+            Backend::Sqlite => self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            Backend::Postgres => self.pool.begin().await?,
+        })
+    }
+
     pub async fn connect(url: &str) -> Result<Self> {
         // Two processes opening a brand-new SQLite file at once (a hook and the sync watcher on a fresh
         // install) can get "database is locked" from the WAL switch or the first migration: SQLite
@@ -670,7 +681,7 @@ impl Store {
     /// Bring the schema up to date. Safe to call concurrently from many
     /// processes; returns the resulting schema version.
     pub async fn migrate(&self) -> Result<usize> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if self.backend == Backend::Postgres {
             // Concurrent DDL races in Postgres; serialize migrations across
             // all replicas starting at the same time.
@@ -765,7 +776,7 @@ impl Store {
                 }
             }
             existing.updated_at = now;
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             let mut q = Q::new("UPDATE memories SET ");
             let (t, u, id) = (q.text(list_to_json(&existing.tags)), q.int(now), q.text(&existing.id));
             q.push(&format!("tags = {t}, updated_at = {u} WHERE id = {id}"));
@@ -857,7 +868,7 @@ impl Store {
             q.int(now),
         ];
         q.push(&vals.join(", ")).push(")");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         q.build().execute(&mut *tx).await?;
         change_append(
             &mut *tx,
@@ -898,7 +909,7 @@ impl Store {
         }
         let id_p = q.text(id);
         q.push(&format!(" WHERE id = {id_p}"));
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if q.build().execute(&mut *tx).await?.rows_affected() == 0 {
             return Err(Error::NotFound(format!("memory {id}")));
         }
@@ -1052,7 +1063,7 @@ impl Store {
         let mut q = Q::new("DELETE FROM memories WHERE id = ");
         let id_p = q.text(id);
         q.push(&id_p);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if q.build().execute(&mut *tx).await?.rows_affected() == 0 {
             return Err(Error::NotFound(format!("memory {id}")));
         }
@@ -1098,7 +1109,7 @@ impl Store {
             q.int(ev.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         q.build().execute(&mut *tx).await?;
         change_append(&mut *tx, SyncKind::Event, SyncOp::Upsert, &ev.id, Some(&ev.project), None, None, None).await?;
         tx.commit().await?;
@@ -1237,7 +1248,7 @@ impl Store {
             q.int(cp.created_at),
         ];
         q.push(&vals.join(", ")).push(")");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         q.build().execute(&mut *tx).await?;
         change_append(&mut *tx, SyncKind::Checkpoint, SyncOp::Upsert, &cp.id, Some(&cp.project), None, None, None)
             .await?;
