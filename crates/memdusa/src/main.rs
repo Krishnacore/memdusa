@@ -1541,7 +1541,33 @@ fn semantic_line(model: Option<&str>, embedded: i64, total: i64) -> String {
 fn default_db_url() -> anyhow::Result<String> {
     let dir = config::dir()?;
     memdusa_core::store::create_private_dir(&dir)?;
-    Ok(memdusa_core::store::sqlite_url(&dir.join("memdusa.db")))
+    let db = dir.join("memdusa.db");
+    tighten_default_data(&dir, &db);
+    Ok(memdusa_core::store::sqlite_url(&db))
+}
+
+/// memdusa's own data directory and database are private to the user. Installs made before 0.1.11 created them
+/// world-readable; tighten them (only these default paths: a directory the user chose keeps its permissions).
+fn tighten_default_data(dir: &std::path::Path, db: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tighten = |p: &std::path::Path, mode: u32| {
+            if let Ok(m) = std::fs::metadata(p)
+                && m.permissions().mode() & 0o077 != 0
+            {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+            }
+        };
+        tighten(dir, 0o700);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            tighten(std::path::Path::new(&name), 0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, db);
 }
 
 fn describe_identity(whoami: &serde_json::Value) -> String {

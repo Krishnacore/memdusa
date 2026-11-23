@@ -743,8 +743,8 @@ pub fn run(opts: InstallOptions) -> anyhow::Result<()> {
         }
         if claude_missing {
             println!(
-                "\nDone. Hooks are installed; install {} and register the MCP server (command above), then start a new session.",
-                h.agent()
+                "\nDone. Hooks are installed; install Claude Code and register the MCP server (command above), then \
+                 start a new session."
             );
         } else {
             println!("\nDone. Start a new session: it will load the resume brief automatically.");
