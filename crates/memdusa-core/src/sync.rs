@@ -280,6 +280,25 @@ fn record_project(record: Option<&Value>) -> Result<Option<String>> {
     }
 }
 
+/// How far ahead of the server's clock a pushed timestamp may be (clients' clocks drift).
+const MAX_CLOCK_SKEW_MS: Millis = 5 * 60 * 1000;
+
+/// `c` with its operation time and record timestamps capped at `limit`.
+fn clamp_times(c: &SyncRecord, limit: Millis) -> SyncRecord {
+    let mut c = c.clone();
+    c.at = c.at.map(|t| t.min(limit));
+    if let Some(Value::Object(r)) = c.record.as_mut() {
+        for field in ["created_at", "updated_at"] {
+            if let Some(t) = r.get(field).and_then(Value::as_i64)
+                && t > limit
+            {
+                r.insert(field.into(), Value::from(limit));
+            }
+        }
+    }
+    c
+}
+
 fn record_ts(record: Option<&Value>, kind: SyncKind) -> Millis {
     let field = if kind == SyncKind::Memory { "updated_at" } else { "created_at" };
     record
@@ -309,10 +328,32 @@ impl Store {
                 if record_project(c.record.as_ref())?.as_deref() != expected {
                     return Err(Error::Invalid(format!("record {} belongs to a different project", c.record_id)));
                 }
+                // The record is applied by its own `id`: it must be the id that was checked.
+                if let Some(rid) = c.record.as_ref().and_then(|r| r.get("id")).and_then(Value::as_str)
+                    && rid != c.record_id
+                {
+                    return Err(Error::Invalid(format!("record id {rid} does not match record_id {}", c.record_id)));
+                }
                 if let SyncActor::Server(id) = actor
                     && let Some(record) = &c.record
                 {
                     check_attribution(record, id)?;
+                }
+                // An upsert of an existing id updates that row: it must live in the checked project
+                // (else a write grant to A could overwrite B), and a global memory must be the pusher's own.
+                if let SyncActor::Server(id) = actor
+                    && let Some((target, owner)) = self.sync_target(c.kind, &c.record_id).await?
+                {
+                    if target.as_deref() != expected {
+                        return Err(Error::Forbidden(format!("record {} belongs to another project", c.record_id)));
+                    }
+                    if target.is_none()
+                        && !id.admin
+                        && let Some(u) = owner.as_deref()
+                        && id.user.as_deref() != Some(u)
+                    {
+                        return Err(Error::Forbidden(format!("cannot change a global memory owned by '{u}'")));
+                    }
                 }
             } else {
                 // A tombstone has no inline record: check the row it targets so
@@ -344,6 +385,16 @@ impl Store {
             }
         }
 
+        // Last-writer-wins and delete suppression compare these times: a pusher must not be able to win
+        // every future conflict (or block a record forever) with a timestamp from the future.
+        let clamped: Vec<SyncRecord>;
+        let changes = if matches!(actor, SyncActor::Server(_)) {
+            let limit = now_ms() + MAX_CLOCK_SKEW_MS;
+            clamped = changes.iter().map(|c| clamp_times(c, limit)).collect();
+            &clamped[..]
+        } else {
+            changes
+        };
         let mut tx = self.begin_write().await?;
         let mut results = Vec::with_capacity(changes.len());
         for c in changes {
@@ -351,6 +402,20 @@ impl Store {
         }
         tx.commit().await?;
         Ok(results)
+    }
+
+    /// The stored project (and, for memories, owner) of the row a sync change targets; `None` if it doesn't exist.
+    async fn sync_target(&self, kind: SyncKind, record_id: &str) -> Result<Option<(Option<String>, Option<String>)>> {
+        let mut q = Q::new(&format!(
+            "SELECT project{} FROM {} WHERE id = ",
+            if kind == SyncKind::Memory { ", user_name" } else { "" },
+            kind.table()
+        ));
+        let id = q.text(record_id);
+        q.push(&id);
+        let Some(row) = q.build().fetch_optional(&self.pool).await? else { return Ok(None) };
+        let owner = if kind == SyncKind::Memory { row.try_get("user_name")? } else { None };
+        Ok(Some((row.try_get("project")?, owner)))
     }
 
     async fn apply_one(

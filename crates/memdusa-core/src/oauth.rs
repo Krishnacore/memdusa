@@ -25,6 +25,8 @@ pub mod device_status {
     pub const AUTHENTICATED: &str = "authenticated";
     pub const APPROVED: &str = "approved";
     pub const DENIED: &str = "denied";
+    /// Tokens were issued for it: a device code is single-use (RFC 8628).
+    pub const ISSUED: &str = "issued";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +661,24 @@ impl Store {
         let h = q.text(hash_secret(secret));
         q.push(&h);
         q.build().fetch_optional(&self.pool).await?.map(|r| row_to_token(&r)).transpose()
+    }
+
+    /// Revoke a refresh token for rotation, atomically: `false` when it was already revoked, i.e. a concurrent
+    /// request rotated it first (the caller treats that as reuse).
+    pub async fn oauth_token_claim_rotation(&self, id: &str, at: Millis) -> Result<bool> {
+        let mut q = Q::new("UPDATE oauth_tokens SET revoked_at = ");
+        let (t, i) = (q.int(at), q.text(id));
+        q.push(&format!("{t} WHERE id = {i} AND revoked_at IS NULL"));
+        Ok(q.build().execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    /// Mark an approved device code as used, atomically: `false` when it was not approved (already used,
+    /// denied, or still pending).
+    pub async fn oauth_device_claim_issue(&self, id: &str) -> Result<bool> {
+        let mut q = Q::new("UPDATE oauth_device_codes SET status = ");
+        let (issued, i, approved) = (q.text(device_status::ISSUED), q.text(id), q.text(device_status::APPROVED));
+        q.push(&format!("{issued} WHERE id = {i} AND status = {approved}"));
+        Ok(q.build().execute(&self.pool).await?.rows_affected() > 0)
     }
 
     pub async fn oauth_token_revoke(&self, id: &str, at: Millis) -> Result<()> {

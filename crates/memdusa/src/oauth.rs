@@ -7,12 +7,14 @@
 //! part of the server needs to change.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::extract::{ConnectInfo, Extension, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
@@ -44,6 +46,15 @@ const CLIENT_PREFIX: &str = "mdoc_";
 const CSRF_COOKIE: &str = "memdusa_oauth";
 const SIGNIN_FAIL_LIMIT: usize = 10;
 const SIGNIN_WINDOW: Duration = Duration::from_secs(300);
+
+/// IP-keyed back-pressure for all OAuth endpoints: 10 sustained requests/s
+/// per caller, with a burst of 100 (independent of the API rate limit).
+pub(crate) const OAUTH_RATE_PER_SEC: f64 = 10.0;
+pub(crate) const OAUTH_RATE_BURST: f64 = 100.0;
+/// Client registration and device authorization create rows without authentication: 10 at once, then one
+/// every 10 seconds per caller.
+pub(crate) const OAUTH_CREATE_PER_SEC: f64 = 0.1;
+pub(crate) const OAUTH_CREATE_BURST: f64 = 10.0;
 
 /// Server configuration, built from env when `MEMDUSA_PUBLIC_URL` is set.
 #[derive(Clone, Debug)]
@@ -228,6 +239,53 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth/revoke", post(revoke))
 }
 
+/// IP-keyed limiter for every `/oauth/*` route. These callers have no bearer
+/// identity to key on, so use the connecting IP with a fixed fallback.
+pub async fn rate_limit(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    let key = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(|| "unknown".to_owned(), |c| format!("ip:{}", c.0.ip()));
+    let creates = matches!(req.uri().path(), "/oauth/register" | "/oauth/device_authorization");
+    let checked =
+        s.oauth_limiter.check(&key).and_then(|()| if creates { s.oauth_create_limiter.check(&key) } else { Ok(()) });
+    match checked {
+        Ok(()) => next.run(req).await,
+        Err(wait) => {
+            s.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                Json(json!({
+                    "error": "rate_limited",
+                    "error_description": format!("rate limit exceeded; retry in {secs}s"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Clickjacking / privacy headers on every HTML response from the OAuth
+/// router. Applied as a layer so no individual handler return can forget them.
+pub async fn html_security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    if resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"))
+    {
+        let h = resp.headers_mut();
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+        h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
+}
+
 /// Session endpoints need the normal bearer-auth middleware (they produce the
 /// same `Identity` every other `/v1` handler sees).
 pub fn session_routes() -> Router<AppState> {
@@ -315,6 +373,14 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
     {
         return invalid("unsupported grant_type");
     }
+    // Bound unauthenticated dynamic registration: at most 10 redirects, each
+    // short enough to stop unbounded rows/audit details from a single caller.
+    if b.redirect_uris.len() > 10 {
+        return invalid("at most 10 redirect_uris are allowed");
+    }
+    if b.redirect_uris.iter().any(|u| u.chars().count() > 2000) {
+        return invalid("redirect_uri must be at most 2000 characters");
+    }
     // RFC 8628 clients have no redirect: only they may register without one.
     let device_only = grant_types.iter().all(|g| g == DEVICE_GRANT);
     if (b.redirect_uris.is_empty() && !device_only) || !b.redirect_uris.iter().all(|u| valid_redirect(u)) {
@@ -337,10 +403,12 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
     // clients (e.g. the MCP Python SDK) request `memdusa memdusa:read` when they only wanted `memdusa`.
     // The scope a token actually gets is decided (and shown on the consent page) at /oauth/authorize.
     let registered_scope = b.scope.clone().unwrap_or_else(|| "memdusa".into());
+    let name = b.client_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "MCP client".into());
+    let name = name.chars().take(200).collect::<String>();
     let client = OAuthClient {
         id: new_id(),
         client_id: generate_secret(CLIENT_PREFIX).unwrap_or_else(|_| format!("{CLIENT_PREFIX}{}", new_id())),
-        name: b.client_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "MCP client".into()),
+        name,
         redirect_uris: b.redirect_uris,
         grant_types,
         created_at: now_ms(),
@@ -1162,8 +1230,15 @@ async fn device_to_token(s: &AppState, b: &TokenRequest) -> Response {
             err(StatusCode::BAD_REQUEST, "authorization_pending", "waiting for the user to approve")
         }
         device_status::DENIED => err(StatusCode::BAD_REQUEST, "access_denied", "the user denied access"),
+        device_status::ISSUED => invalid_grant("device code already used"),
         device_status::APPROVED => {
             let Some(user) = d.user_name.clone() else { return invalid_grant("device code has no signed-in user") };
+            // Single use (RFC 8628): only the first exchange of an approved code gets tokens.
+            match s.store.oauth_device_claim_issue(&d.id).await {
+                Ok(true) => {}
+                Ok(false) => return invalid_grant("device code already used"),
+                Err(e) => return internal(&e),
+            }
             let grant = match s
                 .store
                 .oauth_grant_find_or_create(&user, &d.client_id, &d.scope, d.resource.as_deref(), "device")
@@ -1201,21 +1276,7 @@ async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
     let now = now_ms();
     if token.revoked_at.is_some() {
         // Theft detection: an old, already-rotated refresh token was replayed.
-        if let Err(e) = s.store.oauth_grant_revoke(&token.grant_id, now).await {
-            return internal(&e);
-        }
-        let who = s
-            .store
-            .oauth_grant_get(&token.grant_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|g| g.user_name)
-            .unwrap_or_else(|| "unknown".into());
-        if let Err(e) = s.store.audit(NewAuditEvent::denied(who, "oauth.refresh_reuse").target(&token.grant_id)).await {
-            tracing::warn!("could not audit refresh reuse: {e}");
-        }
-        return invalid_grant("refresh token reuse detected; grant revoked");
+        return refresh_reuse(s, &token.grant_id, now).await;
     }
     if token.expires_at <= now {
         return invalid_grant("refresh token expired");
@@ -1232,11 +1293,27 @@ async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
     if b.resource.as_deref().is_some() && b.resource != grant.resource {
         return invalid_grant("resource mismatch");
     }
-    // Rotate: the presented token dies, a fresh one takes its place.
-    if let Err(e) = s.store.oauth_token_revoke(&token.id, now).await {
-        return internal(&e);
+    // Rotate: the presented token dies, a fresh one takes its place. The claim is atomic: of two requests
+    // presenting the same token at once, one rotates and the other is reuse (a thief racing the client).
+    match s.store.oauth_token_claim_rotation(&token.id, now).await {
+        Ok(true) => {}
+        Ok(false) => return refresh_reuse(s, &token.grant_id, now).await,
+        Err(e) => return internal(&e),
     }
     issue_tokens(s, &grant, Some(token.id.clone())).await
+}
+
+/// A rotated refresh token was presented again: revoke the whole grant and audit it as theft.
+async fn refresh_reuse(s: &AppState, grant_id: &str, now: Millis) -> Response {
+    if let Err(e) = s.store.oauth_grant_revoke(grant_id, now).await {
+        return internal(&e);
+    }
+    let who =
+        s.store.oauth_grant_get(grant_id).await.ok().flatten().map(|g| g.user_name).unwrap_or_else(|| "unknown".into());
+    if let Err(e) = s.store.audit(NewAuditEvent::denied(who, "oauth.refresh_reuse").target(grant_id)).await {
+        tracing::warn!("could not audit refresh reuse: {e}");
+    }
+    invalid_grant("refresh token reuse detected; grant revoked")
 }
 
 async fn issue_tokens(s: &AppState, grant: &OAuthGrant, rotated_from: Option<String>) -> Response {
@@ -1796,6 +1873,36 @@ mod tests {
 
     // ------------------------------------------------------------------ tests
 
+    /// Security review: two refreshes racing with the same token can't both rotate; the loser is reuse.
+    #[tokio::test]
+    async fn concurrent_refreshes_with_one_token_trip_reuse_detection() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "alice", false).await;
+        let flow =
+            start_flow(&url, &key, "memdusa", Some("http://127.0.0.1:1/mcp"), "http://127.0.0.1:54321/callback").await;
+        let (st, tokens) = flow.token(&url).await;
+        assert_eq!(st, 200, "{tokens}");
+        let refresh = tokens["refresh_token"].as_str().unwrap().to_owned();
+        let one = || {
+            let (url, refresh) = (url.clone(), refresh.clone());
+            async move {
+                client()
+                    .post(format!("{url}/oauth/token"))
+                    .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        let results = futures::future::join_all((0..8).map(|_| tokio::spawn(one()))).await;
+        let ok = results.iter().filter(|r| *r.as_ref().unwrap() == 200).count();
+        assert!(ok <= 1, "at most one concurrent refresh may rotate, got {ok}");
+        let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
+        assert!(audit.iter().any(|e| e.action == "oauth.refresh_reuse"), "the race is reported as reuse");
+    }
+
     #[tokio::test]
     async fn full_flow_refresh_reuse_revoke_and_mcp() {
         let (url, store) = spawn(config(), DefaultPolicy::Write).await;
@@ -2001,6 +2108,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mismatch.status(), 400);
+    }
+
+    /// Call one MCP tool over HTTP with `token`; the JSON-RPC response (SSE `data:` or plain JSON).
+    async fn mcp_tool(url: &str, token: &str, tool: &str, args: Value) -> Value {
+        let post = |body: Value, session: Option<String>| {
+            let mut r = client()
+                .post(format!("{url}/mcp"))
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .json(&body);
+            if let Some(s) = session {
+                r = r.header("mcp-session-id", s);
+            }
+            r.send()
+        };
+        let init = post(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init.headers().get("mcp-session-id").map(|v| v.to_str().unwrap().to_owned());
+        let _ = init.text().await;
+        let _ = post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}), session.clone()).await.unwrap();
+        let r = post(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            session,
+        )
+        .await
+        .unwrap();
+        let text = r.text().await.unwrap();
+        let body = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|l| l.starts_with('{'))
+            .unwrap_or(text.trim())
+            .to_owned();
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("not JSON-RPC: {text}"))
+    }
+
+    /// Security review: a read-only token must not write global memories over MCP either.
+    #[tokio::test]
+    async fn read_only_token_cannot_write_global_memories_over_mcp() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "erin", false).await;
+        let flow = start_flow(&url, &key, "memdusa:read", None, "http://127.0.0.1:7779/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let read_only = tokens["access_token"].as_str().unwrap().to_owned();
+        let r = mcp_tool(&url, &read_only, "memory_save", json!({"content":"sneaky global","global":true})).await;
+        let failed = r.get("error").is_some() || r["result"]["isError"].as_bool() == Some(true);
+        assert!(failed, "read-only global save must fail: {r}");
+        assert!(r.to_string().contains("read-only"), "{r}");
+
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:7780/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let full = tokens["access_token"].as_str().unwrap().to_owned();
+        let r = mcp_tool(&url, &full, "memory_save", json!({"content":"allowed global","global":true})).await;
+        assert!(r.get("error").is_none() && r["result"]["isError"].as_bool() != Some(true), "{r}");
     }
 
     #[tokio::test]
@@ -2338,6 +2506,10 @@ mod tests {
             access.starts_with(ACCESS_PREFIX) && body["refresh_token"].as_str().unwrap().starts_with(REFRESH_PREFIX)
         );
         assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(access).send().await.unwrap().status(), 200);
+        // Single use: polling again after the tokens were issued gets nothing new.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (st, again) = poll_device(&url, &client_id, code).await;
+        assert_eq!((st, again["error"].as_str()), (400, Some("invalid_grant")), "{again}");
         let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
         for action in
             ["oauth.device_authorization", "oauth.device_signin", "oauth.device_approved", "oauth.device_token"]
@@ -2421,5 +2593,124 @@ mod tests {
         assert!(!pkce_ok(&v, "plain-challenge"));
         assert!(valid_scope("memdusa memdusa:read"));
         assert!(!valid_scope("memdusa:admin"));
+    }
+
+    #[tokio::test]
+    async fn registration_bounds() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let long_name = "x".repeat(250);
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"client_name": long_name, "redirect_uris": ["http://127.0.0.1:6010/cb"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["client_name"].as_str().unwrap().chars().count(), 200, "client_name is truncated");
+
+        let many: Vec<String> = (0..11).map(|i| format!("http://127.0.0.1:{}/cb", 6100 + i)).collect();
+        let r =
+            client().post(format!("{url}/oauth/register")).json(&json!({"redirect_uris": many})).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert_eq!(r.json::<Value>().await.unwrap()["error"], "invalid_request");
+
+        let too_long = format!("https://example.com/{}", "x".repeat(2000));
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"redirect_uris": [too_long]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "overlong redirect_uri is rejected");
+
+        // Exactly 2000 characters is still accepted.
+        let exact = format!("https://x.io/{}", "a".repeat(2000 - "https://x.io/".len()));
+        assert_eq!(exact.chars().count(), 2000);
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"redirect_uris": [exact]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn oauth_routes_are_rate_limited() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let mut limited = false;
+        for i in 0..(OAUTH_RATE_BURST as usize + 100) {
+            let r = client()
+                .post(format!("{url}/oauth/register"))
+                .json(&json!({"redirect_uris": ["http://127.0.0.1:6020/cb"]}))
+                .send()
+                .await
+                .unwrap();
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                assert!(r.headers().get(header::RETRY_AFTER).is_some(), "429 carries Retry-After");
+                let body: Value = r.json().await.unwrap();
+                assert_eq!(body["error"], "rate_limited");
+                assert!(body["error_description"].as_str().is_some_and(|d| d.contains("retry")));
+                limited = true;
+                break;
+            }
+            assert_eq!(r.status(), 200, "request {i} should still be allowed");
+        }
+        assert!(limited, "expected a 429 after exhausting the per-IP OAuth burst");
+    }
+
+    #[tokio::test]
+    async fn client_registration_has_a_tighter_limit() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let mut statuses = vec![];
+        for _ in 0..(OAUTH_CREATE_BURST as usize + 2) {
+            let r = client()
+                .post(format!("{url}/oauth/register"))
+                .json(&json!({"redirect_uris": ["http://127.0.0.1:6040/cb"]}))
+                .send()
+                .await
+                .unwrap();
+            statuses.push(r.status().as_u16());
+        }
+        assert!(statuses[..OAUTH_CREATE_BURST as usize].iter().all(|s| *s == 200), "{statuses:?}");
+        assert_eq!(*statuses.last().unwrap(), 429, "{statuses:?}");
+        // Other OAuth endpoints still answer.
+        let r = client().get(format!("{url}/oauth/device")).send().await.unwrap();
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn assert_security_headers(r: &reqwest::Response) {
+        let h = r.headers();
+        assert_eq!(h.get("content-security-policy").unwrap().to_str().unwrap(), "frame-ancestors 'none'");
+        assert_eq!(h.get("x-frame-options").unwrap().to_str().unwrap(), "DENY");
+        assert_eq!(h.get("referrer-policy").unwrap().to_str().unwrap(), "no-referrer");
+        assert_eq!(h.get("cache-control").unwrap().to_str().unwrap(), "no-store");
+    }
+
+    #[tokio::test]
+    async fn html_pages_carry_anti_framing_headers() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let client_id = register(&url, "http://127.0.0.1:6030/cb").await;
+        let (_, challenge) = pkce();
+        let r = client()
+            .get(format!("{url}/oauth/authorize"))
+            .query(&[
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", "http://127.0.0.1:6030/cb"),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("state", "s"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_security_headers(&r);
+
+        let r = client().get(format!("{url}/oauth/device")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_security_headers(&r);
     }
 }
