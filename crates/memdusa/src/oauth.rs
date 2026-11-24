@@ -7,12 +7,14 @@
 //! part of the server needs to change.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::extract::{ConnectInfo, Extension, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
@@ -44,6 +46,15 @@ const CLIENT_PREFIX: &str = "mdoc_";
 const CSRF_COOKIE: &str = "memdusa_oauth";
 const SIGNIN_FAIL_LIMIT: usize = 10;
 const SIGNIN_WINDOW: Duration = Duration::from_secs(300);
+
+/// IP-keyed back-pressure for all OAuth endpoints: 10 sustained requests/s
+/// per caller, with a burst of 100 (independent of the API rate limit).
+pub(crate) const OAUTH_RATE_PER_SEC: f64 = 10.0;
+pub(crate) const OAUTH_RATE_BURST: f64 = 100.0;
+/// Client registration and device authorization create rows without authentication: 10 at once, then one
+/// every 10 seconds per caller.
+pub(crate) const OAUTH_CREATE_PER_SEC: f64 = 0.1;
+pub(crate) const OAUTH_CREATE_BURST: f64 = 10.0;
 
 /// Server configuration, built from env when `MEMDUSA_PUBLIC_URL` is set.
 #[derive(Clone, Debug)]
@@ -228,6 +239,53 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth/revoke", post(revoke))
 }
 
+/// IP-keyed limiter for every `/oauth/*` route. These callers have no bearer
+/// identity to key on, so use the connecting IP with a fixed fallback.
+pub async fn rate_limit(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    let key = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(|| "unknown".to_owned(), |c| format!("ip:{}", c.0.ip()));
+    let creates = matches!(req.uri().path(), "/oauth/register" | "/oauth/device_authorization");
+    let checked =
+        s.oauth_limiter.check(&key).and_then(|()| if creates { s.oauth_create_limiter.check(&key) } else { Ok(()) });
+    match checked {
+        Ok(()) => next.run(req).await,
+        Err(wait) => {
+            s.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                Json(json!({
+                    "error": "rate_limited",
+                    "error_description": format!("rate limit exceeded; retry in {secs}s"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Clickjacking / privacy headers on every HTML response from the OAuth
+/// router. Applied as a layer so no individual handler return can forget them.
+pub async fn html_security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    if resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"))
+    {
+        let h = resp.headers_mut();
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+        h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
+}
+
 /// Session endpoints need the normal bearer-auth middleware (they produce the
 /// same `Identity` every other `/v1` handler sees).
 pub fn session_routes() -> Router<AppState> {
@@ -315,6 +373,14 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
     {
         return invalid("unsupported grant_type");
     }
+    // Bound unauthenticated dynamic registration: at most 10 redirects, each
+    // short enough to stop unbounded rows/audit details from a single caller.
+    if b.redirect_uris.len() > 10 {
+        return invalid("at most 10 redirect_uris are allowed");
+    }
+    if b.redirect_uris.iter().any(|u| u.chars().count() > 2000) {
+        return invalid("redirect_uri must be at most 2000 characters");
+    }
     // RFC 8628 clients have no redirect: only they may register without one.
     let device_only = grant_types.iter().all(|g| g == DEVICE_GRANT);
     if (b.redirect_uris.is_empty() && !device_only) || !b.redirect_uris.iter().all(|u| valid_redirect(u)) {
@@ -337,10 +403,12 @@ async fn register(State(s): State<AppState>, Json(b): Json<RegisterRequest>) -> 
     // clients (e.g. the MCP Python SDK) request `memdusa memdusa:read` when they only wanted `memdusa`.
     // The scope a token actually gets is decided (and shown on the consent page) at /oauth/authorize.
     let registered_scope = b.scope.clone().unwrap_or_else(|| "memdusa".into());
+    let name = b.client_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "MCP client".into());
+    let name = name.chars().take(200).collect::<String>();
     let client = OAuthClient {
         id: new_id(),
         client_id: generate_secret(CLIENT_PREFIX).unwrap_or_else(|_| format!("{CLIENT_PREFIX}{}", new_id())),
-        name: b.client_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "MCP client".into()),
+        name,
         redirect_uris: b.redirect_uris,
         grant_types,
         created_at: now_ms(),
@@ -2525,5 +2593,124 @@ mod tests {
         assert!(!pkce_ok(&v, "plain-challenge"));
         assert!(valid_scope("memdusa memdusa:read"));
         assert!(!valid_scope("memdusa:admin"));
+    }
+
+    #[tokio::test]
+    async fn registration_bounds() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let long_name = "x".repeat(250);
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"client_name": long_name, "redirect_uris": ["http://127.0.0.1:6010/cb"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["client_name"].as_str().unwrap().chars().count(), 200, "client_name is truncated");
+
+        let many: Vec<String> = (0..11).map(|i| format!("http://127.0.0.1:{}/cb", 6100 + i)).collect();
+        let r =
+            client().post(format!("{url}/oauth/register")).json(&json!({"redirect_uris": many})).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert_eq!(r.json::<Value>().await.unwrap()["error"], "invalid_request");
+
+        let too_long = format!("https://example.com/{}", "x".repeat(2000));
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"redirect_uris": [too_long]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "overlong redirect_uri is rejected");
+
+        // Exactly 2000 characters is still accepted.
+        let exact = format!("https://x.io/{}", "a".repeat(2000 - "https://x.io/".len()));
+        assert_eq!(exact.chars().count(), 2000);
+        let r = client()
+            .post(format!("{url}/oauth/register"))
+            .json(&json!({"redirect_uris": [exact]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn oauth_routes_are_rate_limited() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let mut limited = false;
+        for i in 0..(OAUTH_RATE_BURST as usize + 100) {
+            let r = client()
+                .post(format!("{url}/oauth/register"))
+                .json(&json!({"redirect_uris": ["http://127.0.0.1:6020/cb"]}))
+                .send()
+                .await
+                .unwrap();
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                assert!(r.headers().get(header::RETRY_AFTER).is_some(), "429 carries Retry-After");
+                let body: Value = r.json().await.unwrap();
+                assert_eq!(body["error"], "rate_limited");
+                assert!(body["error_description"].as_str().is_some_and(|d| d.contains("retry")));
+                limited = true;
+                break;
+            }
+            assert_eq!(r.status(), 200, "request {i} should still be allowed");
+        }
+        assert!(limited, "expected a 429 after exhausting the per-IP OAuth burst");
+    }
+
+    #[tokio::test]
+    async fn client_registration_has_a_tighter_limit() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let mut statuses = vec![];
+        for _ in 0..(OAUTH_CREATE_BURST as usize + 2) {
+            let r = client()
+                .post(format!("{url}/oauth/register"))
+                .json(&json!({"redirect_uris": ["http://127.0.0.1:6040/cb"]}))
+                .send()
+                .await
+                .unwrap();
+            statuses.push(r.status().as_u16());
+        }
+        assert!(statuses[..OAUTH_CREATE_BURST as usize].iter().all(|s| *s == 200), "{statuses:?}");
+        assert_eq!(*statuses.last().unwrap(), 429, "{statuses:?}");
+        // Other OAuth endpoints still answer.
+        let r = client().get(format!("{url}/oauth/device")).send().await.unwrap();
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn assert_security_headers(r: &reqwest::Response) {
+        let h = r.headers();
+        assert_eq!(h.get("content-security-policy").unwrap().to_str().unwrap(), "frame-ancestors 'none'");
+        assert_eq!(h.get("x-frame-options").unwrap().to_str().unwrap(), "DENY");
+        assert_eq!(h.get("referrer-policy").unwrap().to_str().unwrap(), "no-referrer");
+        assert_eq!(h.get("cache-control").unwrap().to_str().unwrap(), "no-store");
+    }
+
+    #[tokio::test]
+    async fn html_pages_carry_anti_framing_headers() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let client_id = register(&url, "http://127.0.0.1:6030/cb").await;
+        let (_, challenge) = pkce();
+        let r = client()
+            .get(format!("{url}/oauth/authorize"))
+            .query(&[
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", "http://127.0.0.1:6030/cb"),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("state", "s"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_security_headers(&r);
+
+        let r = client().get(format!("{url}/oauth/device")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_security_headers(&r);
     }
 }
