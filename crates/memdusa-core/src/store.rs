@@ -1005,6 +1005,13 @@ impl Store {
         }
     }
 
+    /// Apply the same owner-or-admin rule to a memory by id, for read paths
+    /// that expose a global memory's contents (e.g. `/revisions`).
+    pub async fn memory_check_as(&self, id: &str, actor: &Identity) -> Result<()> {
+        let mem = self.memory_get(id).await?;
+        Self::memory_check(&mem, actor)
+    }
+
     /// Correct or refine a memory in place, with full access (local use).
     pub async fn memory_update(&self, id: &str, patch: MemoryPatch) -> Result<Memory> {
         self.memory_update_as(id, patch, &Identity::root()).await

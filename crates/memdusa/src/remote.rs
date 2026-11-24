@@ -65,11 +65,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(remote: Remote, timeout: Duration) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(Duration::from_secs(3)))
-            .user_agent(concat!("memdusa/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+            .user_agent(concat!("memdusa/", env!("CARGO_PKG_VERSION")));
+        if remote.url.starts_with("https://") {
+            // A redirect to http:// must never carry the bearer token.
+            builder = builder.https_only(true);
+        }
+        let http = builder.build()?;
         let url = remote.url.clone();
         let auth = match remote.oauth {
             Some(tokens) => Auth::OAuth(tokens),

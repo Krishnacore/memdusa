@@ -53,9 +53,33 @@ impl Remote {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             anyhow::bail!("server URL must start with http:// or https://");
         }
+        check_transport_security(url)?;
         let url = url.strip_suffix("/mcp").unwrap_or(url);
         Ok(Self { url: url.to_owned(), token: token.filter(|t| !t.is_empty()), oauth: None, sync: false })
     }
+}
+
+/// A bearer token sent over plain HTTP is readable by anyone on the path. Only
+/// allow `http://` to loopback (the local dev/test server); a trusted private
+/// network can opt in explicitly with `MEMDUSA_ALLOW_INSECURE_HTTP=1`.
+fn check_transport_security(url: &str) -> anyhow::Result<()> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid server URL {url:?}"))?;
+    if std::env::var("MEMDUSA_ALLOW_INSECURE_HTTP").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let host = parsed.host_str().unwrap_or("").trim_matches(|c| c == '[' || c == ']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.octets()[0] == 127)
+        || host.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip == std::net::Ipv6Addr::LOCALHOST);
+    anyhow::ensure!(
+        loopback,
+        "server URL {url:?} uses plain http://, which sends tokens in cleartext; use https:// \
+         (or set MEMDUSA_ALLOW_INSECURE_HTTP=1 for a trusted private network)"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -123,6 +147,10 @@ fn load_file() -> anyhow::Result<ConfigFile> {
 pub fn remote() -> anyhow::Result<Option<Remote>> {
     let env_token = std::env::var("MEMDUSA_TOKEN").ok();
     let file = load_file()?;
+    // Applies to logins saved before this check existed too.
+    if let Some(remote) = &file.remote {
+        check_transport_security(&remote.url)?;
+    }
     if let Ok(url) = std::env::var("MEMDUSA_URL")
         && !url.trim().is_empty()
     {
@@ -161,11 +189,21 @@ fn write_private(path: &Path, text: &str) -> anyhow::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
-    std::fs::write(&tmp, text)?;
+    // Create with 0600 in one step: a write-then-chmod window would leave a
+    // world-readable token-bearing file behind if the process died or another
+    // local user read it in between.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = opts.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -266,6 +304,28 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_is_only_allowed_for_loopback() {
+        let _env = super::TEST_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("MEMDUSA_ALLOW_INSECURE_HTTP");
+        unsafe { std::env::remove_var("MEMDUSA_ALLOW_INSECURE_HTTP") };
+        for url in ["http://localhost:7077", "http://127.0.0.2:7077", "http://[::1]:7077"] {
+            assert!(Remote::new(url, None).is_ok(), "{url} is loopback");
+        }
+        for url in ["http://memdusa.example.com", "http://localhost.evil.com", "http://192.168.1.10:7077"] {
+            let err = Remote::new(url, None).unwrap_err().to_string();
+            assert!(err.contains("use https"), "{url}: {err}");
+        }
+        assert!(Remote::new("https://memdusa.example.com", None).is_ok());
+        unsafe { std::env::set_var("MEMDUSA_ALLOW_INSECURE_HTTP", "1") };
+        let r = Remote::new("http://memdusa.example.com", None).unwrap();
+        assert_eq!(r.url, "http://memdusa.example.com");
+        match old {
+            Some(v) => unsafe { std::env::set_var("MEMDUSA_ALLOW_INSECURE_HTTP", v) },
+            None => unsafe { std::env::remove_var("MEMDUSA_ALLOW_INSECURE_HTTP") },
+        }
+    }
+
+    #[test]
     fn oauth_roundtrip() {
         let _env = super::TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("memdusa-config-{}", memdusa_core::model::new_id()));
@@ -284,6 +344,12 @@ mod tests {
             method: "device".into(),
         };
         save_oauth("https://d.example.com", tokens.clone()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("config.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "token-bearing config is private");
+        }
         assert_eq!(super::remote().unwrap().unwrap().oauth, Some(tokens));
         super::save_client_id("https://d.example.com", "mdoc_1").unwrap();
         assert_eq!(super::client_id("https://d.example.com").unwrap().as_deref(), Some("mdoc_1"));

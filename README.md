@@ -325,7 +325,7 @@ most once a day. To run it by hand: `memdusa prune [--dry-run] [--only-project P
 | **Local → hosted** | `memdusa --database-url sqlite://$HOME/.memdusa/memdusa.db export \| memdusa import -` while logged in to a server (needs an admin key) |
 | **Rate limiting** | Per user (or IP for anonymous callers): `--rate-limit 50` req/s with bursts up to 10x, `0` = off. Over the limit you get `429` with `Retry-After`, and hooks queue instead of losing data |
 | **Body limits** | 1 MB per request, 16 MB for hook batches, 64 MB for imports |
-| **Metrics** | Prometheus at `/metrics` (`--no-metrics` to turn it off): requests and latency by route *template*, hook events, rate-limit and auth failures, users, running and stale runs. No ids, projects or users in labels |
+| **Metrics** | Prometheus at `/metrics` (`--no-metrics` to turn it off): requests and latency by route *template*, hook events, rate-limit and auth failures, users, running and stale runs. No ids, projects or users in labels. Once any user exists, scrapes need the same auth as the API (`authorization: Bearer <key>`) |
 | **Logs** | One access-log line per request (method, route template, status, latency, user; never bodies or query strings). `MEMDUSA_LOG_FORMAT=json` for JSON, `RUST_LOG` for levels |
 
 ## Secret redaction
@@ -447,6 +447,9 @@ memdusa login https://memdusa.example.com --token mdk_…      # checks the key,
 memdusa status                                                # local or remote? reachable?
 memdusa install claude-code                                   # same command as local mode
 ```
+
+`http://` is rejected for remote hosts because it sends the token in cleartext; only loopback is allowed, unless
+`MEMDUSA_ALLOW_INSECURE_HTTP=1` opts in for a trusted private network.
 
 After `login`, everything on that machine uses the server:
 
@@ -863,7 +866,7 @@ with `attempt: 2`.
 | POST | `/v1/admin/prune` `{policy?, project?, dry_run?}` |
 | POST | `/v1/embeddings/backfill` `{all?}`: embed memories that lack a vector (admin; the server's embedding config) |
 | GET | `/v1/admin/export?project=` (JSON Lines), POST `/v1/admin/import` (JSON Lines body) |
-| GET | `/metrics` (Prometheus, no auth), `/health` |
+| GET | `/metrics` (Prometheus; bearer auth once users exist — send `authorization: Bearer <key>`), `/health` (public) |
 | POST | `/v1/hooks/{event}` `{project, agent, journal_prompts, stop_guard_mins, input}` |
 | GET | `/v1/resume?project=` |
 | POST/GET | `/v1/memories` (GET: `?query&project&kind&limit`) |
