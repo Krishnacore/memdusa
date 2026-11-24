@@ -32,7 +32,7 @@ fn rule(kind: &'static str, re: &str, secret_group: usize, check_value: bool) ->
 }
 
 /// Names that mark a value as secret in `NAME=value`, `name: value`, JSON keys and CLI flags.
-const SECRET_NAME: &str = r"(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|credentials?|session[_-]?key)";
+const SECRET_NAME: &str = r"(?:password|passwd|pwd|passphrase|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|credentials?|session[_-]?key)";
 
 static BUILTIN: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
@@ -46,6 +46,8 @@ static BUILTIN: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         // scheme://user:PASSWORD@host
         rule("url_password", r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+:([^\s@/]+)@", 1, false),
         rule("bearer", r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})", 1, false),
+        // Authorization: Basic <base64> (including inside `curl -H '...'`)
+        rule("basic_auth", r"(?i)\bAuthorization\s*:\s*Basic\s+([A-Za-z0-9+/=]{6,})", 1, false),
         // provider-specific token formats (high precision)
         rule("anthropic_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}", 0, false),
         rule("openai_key", r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}", 0, false),
@@ -233,6 +235,22 @@ mod tests {
         assert_eq!(r(&format!("cat id: {pem} done")), "cat id: [REDACTED:private_key] done");
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
         assert_eq!(r(&format!("t={jwt}")), "t=[REDACTED:jwt]");
+    }
+
+    #[test]
+    fn redacts_basic_auth_and_passphrase() {
+        let basic = "Authorization: Basic dXNlcjpwYXNz";
+        assert_eq!(r(basic), "Authorization: Basic [REDACTED:basic_auth]");
+        let curl = "curl -H 'Authorization: Basic dXNlcjpwYXNz' https://example.com";
+        assert_eq!(r(curl), "curl -H 'Authorization: Basic [REDACTED:basic_auth]' https://example.com");
+        let lower = "authorization: basic dXNlcjpwYXNz";
+        assert_eq!(r(lower), "authorization: basic [REDACTED:basic_auth]");
+        assert_eq!(r("passphrase=hunter2xyz"), "passphrase=[REDACTED:assignment]");
+        assert_eq!(r(r#"{"passphrase": "hunter2xyz"}"#), r#"{"passphrase": [REDACTED:assignment]}"#);
+        // ordinary text stays verbatim
+        for s in ["Authorization required for this endpoint", "passphrase_count: 12", "Basic auth is deprecated"] {
+            assert_eq!(r(s), s, "false positive on {s:?}");
+        }
     }
 
     #[test]

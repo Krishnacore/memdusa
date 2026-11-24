@@ -324,6 +324,33 @@ impl ServerHandler for Proxy {
     }
 }
 
+/// reqwest transport for the authenticated MCP upstream. `https_only` blocks
+/// http redirects (including https→http downgrades) when the configured URL is
+/// https. The redirect policy otherwise mirrors rmcp's default: only
+/// same-origin 307/308, so headers and session ids are never replayed elsewhere.
+fn upstream_http_client(url: &str) -> anyhow::Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().pool_max_idle_per_host(0).redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let preserves_body = matches!(
+                attempt.status(),
+                reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+            );
+            let same_origin =
+                attempt.previous().first().is_some_and(|original| original.origin() == attempt.url().origin());
+            if !preserves_body || !same_origin {
+                attempt.stop()
+            } else if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }));
+    if url.starts_with("https://") {
+        builder = builder.https_only(true);
+    }
+    Ok(builder.build()?)
+}
+
 pub async fn run(remote: &Remote, project: Option<String>, agent: &str) -> anyhow::Result<()> {
     let mut headers = HashMap::new();
     headers.insert(HeaderName::from_static(AGENT_HEADER), HeaderValue::from_str(agent)?);
@@ -335,17 +362,17 @@ pub async fn run(remote: &Remote, project: Option<String>, agent: &str) -> anyho
     if let Some(t) = &remote.token {
         config = config.auth_header(t.clone());
     }
+    let http = upstream_http_client(&remote.url)?;
     let oauth = remote.oauth.is_some();
     let upstream = if oauth {
         // Static headers can't rotate: the transport asks our client for the
         // current access token on every HTTP request instead.
-        let http = reqwest::Client::builder().build()?;
         let refreshing = RefreshingHttp { inner: http, url: remote.url.clone() };
         ().serve(StreamableHttpClientTransport::with_client(refreshing, config))
             .await
             .with_context(|| format!("connecting to {}/mcp", remote.url))?
     } else {
-        ().serve(StreamableHttpClientTransport::from_config(config))
+        ().serve(StreamableHttpClientTransport::with_client(http, config))
             .await
             .with_context(|| format!("connecting to {}/mcp", remote.url))?
     };

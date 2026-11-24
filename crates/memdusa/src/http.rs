@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{DefaultBodyLimit, Extension, MatchedPath, Path, Query, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header, uri::Authority};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -143,15 +143,19 @@ impl From<Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Driver messages can disclose table/column/constraint names: log the
+        // real error, but never ship it to the client.
+        if let Error::Db(e) = &self.0 {
+            tracing::error!("database error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "internal server error" })))
+                .into_response();
+        }
         let status = match &self.0 {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Invalid(_) => StatusCode::BAD_REQUEST,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
-            Error::Db(e) => {
-                tracing::error!("database error: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Error::Db(_) => unreachable!("handled above"),
         };
         (status, Json(json!({ "error": self.0.to_string() }))).into_response()
     }
@@ -271,7 +275,9 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
 
     let mut public = Router::new().route("/health", get(|| async { "ok" }));
     if serve_metrics {
-        public = public.route("/metrics", get(metrics));
+        // Same auth as the API: open on a local server with no users, but a
+        // bearer credential (API key or OAuth token) once any user exists.
+        public = public.route("/metrics", get(metrics).layer(middleware::from_fn_with_state(state.clone(), auth)));
     }
     let mut all = public.with_state(state.clone()).merge(api);
     if state.oauth.is_some() {
@@ -282,7 +288,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
                 oauth::session_routes().layer(middleware::from_fn_with_state(state.clone(), auth)).with_state(state),
             );
     }
-    all
+    all.layer(middleware::from_fn_with_state(Arc::new(opts.allowed_hosts), allowed_hosts))
 }
 
 /// Who made the request, filled in by `auth` for the access log.
@@ -310,6 +316,43 @@ async fn observe(State(s): State<AppState>, mut req: Request, next: Next) -> Res
         user = user.as_deref().unwrap_or("-")
     );
     resp
+}
+
+/// Mirror rmcp's `/mcp` Host check for the whole router, so DNS rebinding
+/// can't reach the REST/OAuth routes either. An empty list disables the check
+/// (rmcp also allows every Host then); otherwise the configured authorities
+/// replace the default loopback set. Entries may be `host` or `host:port`,
+/// case-insensitive, with IPv6 brackets trimmed.
+async fn allowed_hosts(State(hosts): State<Arc<Vec<String>>>, req: Request, next: Next) -> Response {
+    if hosts.is_empty() {
+        return next.run(req).await;
+    }
+    let raw = match req.headers().get(header::HOST) {
+        Some(v) => match v.to_str().ok() {
+            Some(raw) => raw,
+            None => return (StatusCode::BAD_REQUEST, "Bad Request: Invalid Host header").into_response(),
+        },
+        None => return (StatusCode::BAD_REQUEST, "Bad Request: missing Host header").into_response(),
+    };
+    let authority: Authority = match raw.parse() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Bad Request: Invalid Host header").into_response(),
+    };
+    let host = authority.host().trim_matches(|c| c == '[' || c == ']');
+    let port = authority.port_u16();
+    let matched = hosts.iter().any(|allowed| {
+        allowed.trim().parse::<Authority>().is_ok_and(|a| {
+            a.host().trim_matches(|c| c == '[' || c == ']').eq_ignore_ascii_case(host)
+                && match a.port_u16() {
+                    Some(p) => port == Some(p),
+                    None => true,
+                }
+        })
+    });
+    if !matched {
+        return (StatusCode::FORBIDDEN, "Forbidden: Host header is not allowed").into_response();
+    }
+    next.run(req).await
 }
 
 async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
@@ -1220,6 +1263,10 @@ async fn memory_revisions(
 ) -> ApiResult<Vec<Memory>> {
     if let Some(project) = s.store.memory_project(&mid).await? {
         check(&access, &id, &project, Access::Read, "memory.revisions").await?;
+    } else {
+        // A global's contents are private to its owner (or an admin), just as
+        // for memory_update / memory_forget.
+        s.store.memory_check_as(&mid, &id).await?;
     }
     Ok(Json(s.store.memory_revisions(&mid).await?))
 }
@@ -1236,11 +1283,19 @@ mod tests {
     use crate::hooks::HookConfig;
     use crate::remote::Client;
 
-    async fn spawn_with(token: Option<&str>, default_access: DefaultPolicy) -> (String, Store) {
+    async fn spawn_opts(opts: HttpOptions) -> (String, Store) {
         let dir = std::env::temp_dir().join(format!("memdusa-http-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::connect(&memdusa_core::store::sqlite_url(&dir.join("t.db"))).await.unwrap();
-        let opts = HttpOptions {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = app(store.clone(), opts);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, store)
+    }
+
+    fn opts(token: Option<&str>, default_access: DefaultPolicy) -> HttpOptions {
+        HttpOptions {
             addr: String::new(),
             token: token.map(String::from),
             allowed_hosts: vec![],
@@ -1249,12 +1304,11 @@ mod tests {
             metrics: true,
             default_access,
             oauth: None,
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = app(store.clone(), opts);
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, store)
+        }
+    }
+
+    async fn spawn_with(token: Option<&str>, default_access: DefaultPolicy) -> (String, Store) {
+        spawn_opts(opts(token, default_access)).await
     }
 
     async fn spawn(token: Option<&str>) -> (String, Store) {
@@ -1504,6 +1558,40 @@ mod tests {
         assert_eq!(st, 204);
     }
 
+    async fn user_key(store: &Store, name: &str, admin: bool) -> String {
+        let user = store.user_create(name, admin).await.unwrap();
+        store.key_create(&user.name, "k").await.unwrap().secret
+    }
+
+    #[tokio::test]
+    async fn global_memory_revisions_require_owner_or_admin() {
+        use reqwest::Method as M;
+        let (url, store) = spawn(Some("shared")).await;
+        let u = |p: &str| format!("{url}{p}");
+        let alice = user_key(&store, "alice", false).await;
+        let bob = user_key(&store, "bob", false).await;
+        let carol = user_key(&store, "carol", true).await;
+
+        let (_, saved) = call(
+            M::POST,
+            &u("/v1/memories"),
+            Some(&alice),
+            Some(json!({"content": "alice's private global", "project": null})),
+        )
+        .await;
+        let id = saved["id"].as_str().unwrap();
+        assert_eq!(
+            call(M::PATCH, &u(&format!("/v1/memories/{id}")), Some(&alice), Some(json!({"content": "v2"}))).await.0,
+            200
+        );
+
+        let path = u(&format!("/v1/memories/{id}/revisions"));
+        let (st, body) = call(M::GET, &path, Some(&bob), None).await;
+        assert!(st == 403 || st == 404, "another user cannot read alice's global revisions: {st} {body}");
+        assert_eq!(call(M::GET, &path, Some(&alice), None).await.0, 200, "owner can");
+        assert_eq!(call(M::GET, &path, Some(&carol), None).await.0, 200, "admin can");
+    }
+
     #[tokio::test]
     async fn per_user_keys_end_to_end() {
         use reqwest::Method as M;
@@ -1703,6 +1791,9 @@ mod tests {
         let stored = store2.memory_search(MemoryQuery { limit: Some(5), ..Default::default() }).await.unwrap();
         assert!(stored.is_empty(), "the oversized memory must not be stored");
 
+        // /metrics now goes through `auth` (and its rate limiter) too: wait for
+        // the 1 req/s bucket to refill before scraping.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         let text = reqwest::get(format!("{url}/metrics")).await.unwrap().text().await.unwrap();
         assert!(
             text.contains(r#"memdusa_http_requests_total{method="GET",route="/v1/whoami",status="200"} 10"#),
@@ -1712,6 +1803,73 @@ mod tests {
         assert!(text.contains("memdusa_rate_limited_total 1"), "{text}");
         assert!(text.contains("memdusa_runs_running 0"), "{text}");
         assert!(!text.contains("127.0.0.1"), "no addresses or ids in labels");
+    }
+
+    #[tokio::test]
+    async fn database_errors_are_generic_to_clients() {
+        let resp = ApiError(Error::Db(sqlx::Error::RowNotFound)).into_response();
+        assert_eq!(resp.status(), 500);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"error": "internal server error"}));
+
+        // the actionable messages are unchanged
+        for (err, status, msg) in [
+            (Error::NotFound("memory x".into()), 404, "not found: memory x"),
+            (Error::Invalid("bad input".into()), 400, "invalid request: bad input"),
+            (Error::Forbidden("nope".into()), 403, "forbidden: nope"),
+        ] {
+            let resp = ApiError(err).into_response();
+            assert_eq!(resp.status(), status);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"error": msg}));
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_needs_auth_once_users_exist() {
+        use reqwest::Method as M;
+        let (url, store) = spawn(None).await;
+        let u = |p: &str| format!("{url}{p}");
+        assert_eq!(call(M::GET, &u("/metrics"), None, None).await.0, 200, "open server stays open");
+        let user = store.user_create("alice", true).await.unwrap();
+        let key = store.key_create(&user.name, "k").await.unwrap().secret;
+        assert_eq!(call(M::GET, &u("/metrics"), None, None).await.0, 401);
+        assert_eq!(call(M::GET, &u("/metrics"), Some("mdk_bogus"), None).await.0, 401);
+        assert_eq!(call(M::GET, &u("/metrics"), Some(&key), None).await.0, 200);
+        assert_eq!(call(M::GET, &u("/health"), None, None).await.0, 200, "health stays public");
+
+        // --no-metrics leaves the route absent
+        let mut o = opts(None, DefaultPolicy::Write);
+        o.metrics = false;
+        let (url2, _) = spawn_opts(o).await;
+        assert_eq!(call(M::GET, &format!("{url2}/metrics"), None, None).await.0, 404);
+    }
+
+    async fn get_with_host(url: &str, path: &str, host: &str, key: Option<&str>) -> u16 {
+        let mut req = reqwest::Client::new().get(format!("{url}{path}")).header("host", host);
+        if let Some(k) = key {
+            req = req.bearer_auth(k);
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_middleware_covers_the_whole_router() {
+        let mut o = opts(Some("shared"), DefaultPolicy::Write);
+        o.allowed_hosts = vec!["Memdusa.Example.Com".into()];
+        let (url, store) = spawn_opts(o).await;
+        let key = user_key(&store, "alice", true).await;
+
+        for path in ["/health", "/metrics", "/v1/whoami", "/mcp"] {
+            assert_eq!(get_with_host(&url, path, "evil.example", Some(&key)).await, 403, "{path} with a bad Host");
+        }
+        assert_eq!(get_with_host(&url, "/health", "memdusa.example.com", None).await, 200);
+        assert_eq!(
+            get_with_host(&url, "/metrics", "memdusa.example.com:7077", Some(&key)).await,
+            200,
+            "port-less entry matches any port"
+        );
+        assert_eq!(get_with_host(&url, "/v1/whoami", "MEMDUSA.EXAMPLE.COM", Some(&key)).await, 200, "case-insensitive");
     }
 
     // ---------------------------------------------------------------- access control
