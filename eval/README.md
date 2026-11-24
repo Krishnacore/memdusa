@@ -92,8 +92,8 @@ Check the fixture first: its own tests pass and the hidden tests fail.
 Where the handoff eval moves one task between agents, this one checks the **coordination machinery**: a coordinator
 delegates several tasks as one durable run, workers in different harnesses claim their own steps, one worker crashes,
 and a replacement in a third harness takes over the *stale* step from a brief that still contains the original
-assignment. It is the scripted version of the setup described under "Multi-agent setups" and "Delegating through a
-durable run" in the top-level README.
+assignment. It is the scripted version of the setup described in the docs under
+[Multi-agent work and delegation](../docs/src/guides/multi-agent.md).
 
 ```sh
 uv run eval/multiagent/run.py --dry-run      # stub harnesses: exercises orchestration + grading for free

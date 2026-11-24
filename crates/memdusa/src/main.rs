@@ -72,7 +72,8 @@ enum Cmd {
         /// Require `Authorization: Bearer <token>` on every request.
         #[arg(long, env = "MEMDUSA_TOKEN")]
         token: Option<String>,
-        /// Host header values accepted by /mcp (DNS-rebinding protection). Default: localhost only.
+        /// Host header values the server accepts (DNS-rebinding protection; `/health` and loopback hosts always
+        /// pass). Without it, /mcp accepts localhost only and the rest of the server any host.
         #[arg(long = "allowed-host", env = "MEMDUSA_ALLOWED_HOSTS", value_delimiter = ',')]
         allowed_hosts: Vec<String>,
         /// Don't prune old data automatically (otherwise once a day, see `memdusa prune`).

@@ -107,7 +107,7 @@ impl OAuthConfig {
                 github: GitHubConfig {
                     client_id: env("MEMDUSA_OAUTH_GITHUB_CLIENT_ID"),
                     client_secret: env("MEMDUSA_OAUTH_GITHUB_CLIENT_SECRET"),
-                    // Test-only base-URL overrides (documented in the README).
+                    // Test-only base-URL overrides; never set them on a real server.
                     auth_url: env("MEMDUSA_TEST_GITHUB_AUTH_URL"),
                     token_url: env("MEMDUSA_TEST_GITHUB_TOKEN_URL"),
                     api_url: env("MEMDUSA_TEST_GITHUB_API_URL"),
@@ -116,7 +116,7 @@ impl OAuthConfig {
                 google: GoogleConfig {
                     client_id: env("MEMDUSA_OAUTH_GOOGLE_CLIENT_ID"),
                     client_secret: env("MEMDUSA_OAUTH_GOOGLE_CLIENT_SECRET"),
-                    // Test-only endpoint overrides (documented in the README).
+                    // Test-only endpoint overrides; never set them on a real server.
                     discovery_url: env("MEMDUSA_TEST_GOOGLE_DISCOVERY_URL"),
                     jwks_url: env("MEMDUSA_TEST_GOOGLE_JWKS_URL"),
                     userinfo_url: env("MEMDUSA_TEST_GOOGLE_USERINFO_URL"),
