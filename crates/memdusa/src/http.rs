@@ -366,8 +366,8 @@ async fn allowed_hosts(State(hosts): State<Arc<Vec<String>>>, req: Request, next
         Err(_) => return (StatusCode::BAD_REQUEST, "Bad Request: Invalid Host header").into_response(),
     };
     let host = authority.host().trim_matches(|c| c == '[' || c == ']');
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let loopback =
+        host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if loopback {
         return next.run(req).await;
     }
