@@ -991,7 +991,7 @@ fn render(parts: &Parts) -> String {
         let _ = writeln!(
             o,
             "\n_asked {}{by}; no checkpoint was saved after it, so the work may be only partly done. \
-             Check the files below, then continue._\n",
+             Check what changed, then continue._\n",
             ago(p.created_at)
         );
         let _ = writeln!(o, "{}\n", text.trim().lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n"));
