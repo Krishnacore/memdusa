@@ -55,6 +55,26 @@ pub(crate) struct AccessCache {
 }
 
 impl AccessCache {
+    /// A write that isn't tied to a project (a global memory): only a read-only token is refused.
+    pub(crate) async fn authorize_write(&self, identity: &Identity, action: &str) -> Result<(), Error> {
+        self.deny_read_only(identity, None, action).await
+    }
+
+    async fn deny_read_only(&self, identity: &Identity, project: Option<&str>, action: &str) -> Result<(), Error> {
+        if !self.read_only {
+            return Ok(());
+        }
+        let detail = json!({ "needed": Access::Write.as_str(), "action": action, "reason": "read_only_token" });
+        let mut event = NewAuditEvent::denied(identity.actor(), "denied").detail(detail);
+        if let Some(p) = project {
+            event = event.project(p);
+        }
+        if let Err(e) = self.store.audit(event).await {
+            tracing::error!("could not audit denied request: {e}");
+        }
+        Err(Error::Forbidden("read-only token cannot write".into()))
+    }
+
     /// Filter to readable projects using this request's cached grants.
     pub(crate) async fn readable_projects(&self, store: &Store, identity: &Identity) -> Result<Vec<String>, Error> {
         Ok(self.policy.readable(identity, &store.distinct_projects().await?))
@@ -69,16 +89,8 @@ impl AccessCache {
         needed: Access,
         action: &str,
     ) -> Result<(), Error> {
-        if self.read_only && needed == Access::Write {
-            let detail = json!({ "needed": needed.as_str(), "action": action, "reason": "read_only_token" });
-            if let Err(e) = self
-                .store
-                .audit(NewAuditEvent::denied(identity.actor(), "denied").project(project).detail(detail))
-                .await
-            {
-                tracing::error!("could not audit denied request: {e}");
-            }
-            return Err(Error::Forbidden("read-only token cannot write".into()));
+        if needed == Access::Write {
+            self.deny_read_only(identity, Some(project), action).await?;
         }
         if self.policy.allows(identity, project, needed) {
             return Ok(());
