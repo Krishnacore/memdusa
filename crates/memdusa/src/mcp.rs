@@ -442,6 +442,14 @@ async fn authorize(
     }
 }
 
+/// A write with no project (global memories): a read-only token may not make it.
+async fn authorize_global_write(ctx: &RequestContext<RoleServer>, action: &str) -> Result<(), String> {
+    match cache(ctx) {
+        Some(c) => c.authorize_write(&identity(ctx), action).await.map_err(err),
+        None => Ok(()),
+    }
+}
+
 async fn readable_projects(store: &Store, ctx: &RequestContext<RoleServer>) -> Result<Vec<String>, String> {
     match cache(ctx) {
         Some(c) => c.readable_projects(store, &identity(ctx)).await.map_err(err),
@@ -467,10 +475,10 @@ async fn authorize_memory(
     id: &str,
     action: &str,
 ) -> Result<(), String> {
-    if let Some(project) = store.memory_project(id).await.map_err(err)? {
-        authorize(ctx, &project, Access::Write, action).await?;
+    match store.memory_project(id).await.map_err(err)? {
+        Some(project) => authorize(ctx, &project, Access::Write, action).await,
+        None => authorize_global_write(ctx, action).await,
     }
-    Ok(())
 }
 
 #[tool_router]
@@ -498,8 +506,9 @@ impl MemdusaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> ToolResult {
         let project = if a.global { None } else { Some(self.project(&ctx, a.project)?) };
-        if let Some(project) = &project {
-            authorize(&ctx, project, Access::Write, "memory.save").await?;
+        match &project {
+            Some(project) => authorize(&ctx, project, Access::Write, "memory.save").await?,
+            None => authorize_global_write(&ctx, "memory.save").await?,
         }
         let m = NewMemory {
             project,

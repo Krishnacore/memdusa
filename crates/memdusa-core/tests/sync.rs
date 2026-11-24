@@ -330,6 +330,69 @@ async fn attribution_and_project_mismatch_are_rejected() {
     }
 }
 
+/// Security review: an upsert is applied to the row with its id, so it must be checked against that row.
+#[tokio::test]
+async fn upserts_cannot_overwrite_other_projects_or_users() {
+    for (name, s, _raw_url) in stores().await {
+        let (p, other) = (project(), project());
+        let alice = Identity { user: Some("alice".into()), admin: false };
+        let bob = Identity { user: Some("bob".into()), admin: false };
+
+        // A write grant to `p` must not overwrite a memory in `other` by reusing its id.
+        let victim = new_id();
+        s.sync_apply(Some(&other), &[mem(&victim, &other, "victim", 1)], &SyncActor::Local, None).await.unwrap();
+        let overwrite = mem(&victim, &p, "pwned", now_ms());
+        let e = s.sync_apply(Some(&p), &[overwrite], &SyncActor::Server(bob.clone()), None).await.unwrap_err();
+        assert!(e.to_string().contains("another project"), "{name}: {e}");
+        assert_eq!(content(&s, &other).await, vec!["victim"], "{name}: victim unchanged");
+
+        // The record's own id must be the one that was checked.
+        let mut sneaky = mem(&new_id(), &p, "sneaky", now_ms());
+        sneaky.record.as_mut().unwrap()["id"] = to_value(&victim).unwrap();
+        assert!(s.sync_apply(Some(&p), &[sneaky], &SyncActor::Server(bob.clone()), None).await.is_err(), "{name}");
+        assert_eq!(content(&s, &other).await, vec!["victim"], "{name}: victim unchanged");
+
+        // Another user's global memory can't be taken over by id.
+        let global = new_id();
+        let mut mine = mem(&global, &p, "alice's global", 1);
+        mine.record.as_mut().unwrap()["project"] = serde_json::Value::Null;
+        mine.record.as_mut().unwrap()["user"] = to_value("alice").unwrap();
+        s.sync_apply(None, &[mine.clone()], &SyncActor::Server(alice.clone()), None).await.unwrap();
+        let mut theirs = mine.clone();
+        theirs.record.as_mut().unwrap()["user"] = to_value("bob").unwrap();
+        theirs.record.as_mut().unwrap()["content"] = to_value("bob's now").unwrap();
+        theirs.record.as_mut().unwrap()["updated_at"] = to_value(now_ms()).unwrap();
+        let e = s.sync_apply(None, &[theirs], &SyncActor::Server(bob.clone()), None).await.unwrap_err();
+        assert!(e.to_string().contains("owned by 'alice'"), "{name}: {e}");
+        // ...while the owner can still update it.
+        let mut edit = mine.clone();
+        edit.record.as_mut().unwrap()["content"] = to_value("alice's edit").unwrap();
+        edit.record.as_mut().unwrap()["updated_at"] = to_value(2).unwrap();
+        s.sync_apply(None, &[edit], &SyncActor::Server(alice.clone()), None).await.unwrap();
+    }
+}
+
+/// Security review: a pushed timestamp from the future must not win every later conflict.
+#[tokio::test]
+async fn pushed_timestamps_are_capped_at_the_present() {
+    for (name, s, _raw_url) in stores().await {
+        let p = project();
+        let bob = Identity { user: Some("bob".into()), admin: false };
+        let id = new_id();
+        let year_2100 = 4_102_444_800_000;
+        s.sync_apply(Some(&p), &[mem(&id, &p, "from the future", year_2100)], &SyncActor::Server(bob.clone()), None)
+            .await
+            .unwrap();
+        // An honest edit made a little later wins.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let later = now_ms() + 6 * 60 * 1000; // just past the allowed skew, also capped
+        s.sync_apply(Some(&p), &[mem(&id, &p, "honest edit", later)], &SyncActor::Server(bob.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(content(&s, &p).await, vec!["honest edit"], "{name}");
+    }
+}
+
 /// Regression: a pull used to move the push cursor to the newest local change, so an edit another
 /// process made between the push and the pull of a pass was never pushed. Pulled changes are now
 /// tagged PULLED_ORIGIN and skipped by push instead; every other local change is still pushed.

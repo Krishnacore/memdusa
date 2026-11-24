@@ -1162,8 +1162,15 @@ async fn device_to_token(s: &AppState, b: &TokenRequest) -> Response {
             err(StatusCode::BAD_REQUEST, "authorization_pending", "waiting for the user to approve")
         }
         device_status::DENIED => err(StatusCode::BAD_REQUEST, "access_denied", "the user denied access"),
+        device_status::ISSUED => invalid_grant("device code already used"),
         device_status::APPROVED => {
             let Some(user) = d.user_name.clone() else { return invalid_grant("device code has no signed-in user") };
+            // Single use (RFC 8628): only the first exchange of an approved code gets tokens.
+            match s.store.oauth_device_claim_issue(&d.id).await {
+                Ok(true) => {}
+                Ok(false) => return invalid_grant("device code already used"),
+                Err(e) => return internal(&e),
+            }
             let grant = match s
                 .store
                 .oauth_grant_find_or_create(&user, &d.client_id, &d.scope, d.resource.as_deref(), "device")
@@ -1201,21 +1208,7 @@ async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
     let now = now_ms();
     if token.revoked_at.is_some() {
         // Theft detection: an old, already-rotated refresh token was replayed.
-        if let Err(e) = s.store.oauth_grant_revoke(&token.grant_id, now).await {
-            return internal(&e);
-        }
-        let who = s
-            .store
-            .oauth_grant_get(&token.grant_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|g| g.user_name)
-            .unwrap_or_else(|| "unknown".into());
-        if let Err(e) = s.store.audit(NewAuditEvent::denied(who, "oauth.refresh_reuse").target(&token.grant_id)).await {
-            tracing::warn!("could not audit refresh reuse: {e}");
-        }
-        return invalid_grant("refresh token reuse detected; grant revoked");
+        return refresh_reuse(s, &token.grant_id, now).await;
     }
     if token.expires_at <= now {
         return invalid_grant("refresh token expired");
@@ -1232,11 +1225,27 @@ async fn refresh_to_token(s: &AppState, b: &TokenRequest) -> Response {
     if b.resource.as_deref().is_some() && b.resource != grant.resource {
         return invalid_grant("resource mismatch");
     }
-    // Rotate: the presented token dies, a fresh one takes its place.
-    if let Err(e) = s.store.oauth_token_revoke(&token.id, now).await {
-        return internal(&e);
+    // Rotate: the presented token dies, a fresh one takes its place. The claim is atomic: of two requests
+    // presenting the same token at once, one rotates and the other is reuse (a thief racing the client).
+    match s.store.oauth_token_claim_rotation(&token.id, now).await {
+        Ok(true) => {}
+        Ok(false) => return refresh_reuse(s, &token.grant_id, now).await,
+        Err(e) => return internal(&e),
     }
     issue_tokens(s, &grant, Some(token.id.clone())).await
+}
+
+/// A rotated refresh token was presented again: revoke the whole grant and audit it as theft.
+async fn refresh_reuse(s: &AppState, grant_id: &str, now: Millis) -> Response {
+    if let Err(e) = s.store.oauth_grant_revoke(grant_id, now).await {
+        return internal(&e);
+    }
+    let who =
+        s.store.oauth_grant_get(grant_id).await.ok().flatten().map(|g| g.user_name).unwrap_or_else(|| "unknown".into());
+    if let Err(e) = s.store.audit(NewAuditEvent::denied(who, "oauth.refresh_reuse").target(grant_id)).await {
+        tracing::warn!("could not audit refresh reuse: {e}");
+    }
+    invalid_grant("refresh token reuse detected; grant revoked")
 }
 
 async fn issue_tokens(s: &AppState, grant: &OAuthGrant, rotated_from: Option<String>) -> Response {
@@ -1796,6 +1805,36 @@ mod tests {
 
     // ------------------------------------------------------------------ tests
 
+    /// Security review: two refreshes racing with the same token can't both rotate; the loser is reuse.
+    #[tokio::test]
+    async fn concurrent_refreshes_with_one_token_trip_reuse_detection() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "alice", false).await;
+        let flow =
+            start_flow(&url, &key, "memdusa", Some("http://127.0.0.1:1/mcp"), "http://127.0.0.1:54321/callback").await;
+        let (st, tokens) = flow.token(&url).await;
+        assert_eq!(st, 200, "{tokens}");
+        let refresh = tokens["refresh_token"].as_str().unwrap().to_owned();
+        let one = || {
+            let (url, refresh) = (url.clone(), refresh.clone());
+            async move {
+                client()
+                    .post(format!("{url}/oauth/token"))
+                    .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        let results = futures::future::join_all((0..8).map(|_| tokio::spawn(one()))).await;
+        let ok = results.iter().filter(|r| *r.as_ref().unwrap() == 200).count();
+        assert!(ok <= 1, "at most one concurrent refresh may rotate, got {ok}");
+        let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
+        assert!(audit.iter().any(|e| e.action == "oauth.refresh_reuse"), "the race is reported as reuse");
+    }
+
     #[tokio::test]
     async fn full_flow_refresh_reuse_revoke_and_mcp() {
         let (url, store) = spawn(config(), DefaultPolicy::Write).await;
@@ -2001,6 +2040,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mismatch.status(), 400);
+    }
+
+    /// Call one MCP tool over HTTP with `token`; the JSON-RPC response (SSE `data:` or plain JSON).
+    async fn mcp_tool(url: &str, token: &str, tool: &str, args: Value) -> Value {
+        let post = |body: Value, session: Option<String>| {
+            let mut r = client()
+                .post(format!("{url}/mcp"))
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .json(&body);
+            if let Some(s) = session {
+                r = r.header("mcp-session-id", s);
+            }
+            r.send()
+        };
+        let init = post(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init.headers().get("mcp-session-id").map(|v| v.to_str().unwrap().to_owned());
+        let _ = init.text().await;
+        let _ = post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}), session.clone()).await.unwrap();
+        let r = post(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            session,
+        )
+        .await
+        .unwrap();
+        let text = r.text().await.unwrap();
+        let body = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|l| l.starts_with('{'))
+            .unwrap_or(text.trim())
+            .to_owned();
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("not JSON-RPC: {text}"))
+    }
+
+    /// Security review: a read-only token must not write global memories over MCP either.
+    #[tokio::test]
+    async fn read_only_token_cannot_write_global_memories_over_mcp() {
+        let (url, store) = spawn(config(), DefaultPolicy::Write).await;
+        let key = new_user(&store, "erin", false).await;
+        let flow = start_flow(&url, &key, "memdusa:read", None, "http://127.0.0.1:7779/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let read_only = tokens["access_token"].as_str().unwrap().to_owned();
+        let r = mcp_tool(&url, &read_only, "memory_save", json!({"content":"sneaky global","global":true})).await;
+        let failed = r.get("error").is_some() || r["result"]["isError"].as_bool() == Some(true);
+        assert!(failed, "read-only global save must fail: {r}");
+        assert!(r.to_string().contains("read-only"), "{r}");
+
+        let flow = start_flow(&url, &key, "memdusa", None, "http://127.0.0.1:7780/cb").await;
+        let (_, tokens) = flow.token(&url).await;
+        let full = tokens["access_token"].as_str().unwrap().to_owned();
+        let r = mcp_tool(&url, &full, "memory_save", json!({"content":"allowed global","global":true})).await;
+        assert!(r.get("error").is_none() && r["result"]["isError"].as_bool() != Some(true), "{r}");
     }
 
     #[tokio::test]
@@ -2338,6 +2438,10 @@ mod tests {
             access.starts_with(ACCESS_PREFIX) && body["refresh_token"].as_str().unwrap().starts_with(REFRESH_PREFIX)
         );
         assert_eq!(client().get(format!("{url}/v1/whoami")).bearer_auth(access).send().await.unwrap().status(), 200);
+        // Single use: polling again after the tokens were issued gets nothing new.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (st, again) = poll_device(&url, &client_id, code).await;
+        assert_eq!((st, again["error"].as_str()), (400, Some("invalid_grant")), "{again}");
         let audit = store.audit_query(AuditQuery { limit: Some(100), ..Default::default() }).await.unwrap();
         for action in
             ["oauth.device_authorization", "oauth.device_signin", "oauth.device_approved", "oauth.device_token"]

@@ -46,6 +46,12 @@ pub struct AccessPolicy {
     grants: Vec<ProjectGrant>,
 }
 
+/// `head/*` covers `head` itself and every path below it, on a `/` boundary: `github.com/acme/*` must not
+/// match `github.com/acme-internal/payroll`.
+fn prefix_matches(head: &str, project: &str) -> bool {
+    project.strip_prefix(head).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 impl AccessPolicy {
     pub fn new(default: DefaultPolicy, grants: Vec<ProjectGrant>) -> Self {
         Self { default, grants }
@@ -73,7 +79,7 @@ impl AccessPolicy {
                     exact = Some(g);
                 }
             } else if let Some(head) = g.pattern.strip_suffix("/*")
-                && project.starts_with(head)
+                && prefix_matches(head, project)
             {
                 let len = head.len();
                 if prefix.is_none_or(|(e, n)| (len, g.created_at, g.id.as_str()) > (n, e.created_at, e.id.as_str())) {
@@ -330,6 +336,22 @@ mod tests {
             created_by: "root".into(),
             created_at: at,
         }
+    }
+
+    /// Security review: a `/*` grant stops at a path boundary.
+    #[test]
+    fn prefix_grants_do_not_match_sibling_names() {
+        let alice = Identity { user: Some("alice".into()), admin: false };
+        let p = AccessPolicy::new(DefaultPolicy::None, vec![grant("github.com/acme/*", Role::Write, 1)]);
+        assert_eq!(p.access(&alice, "github.com/acme/shop"), Access::Write);
+        assert_eq!(p.access(&alice, "github.com/acme/shop/sub"), Access::Write);
+        assert_eq!(p.access(&alice, "github.com/acme"), Access::Write, "the prefix itself");
+        for sibling in ["github.com/acme-internal/payroll", "github.com/acme2/x", "github.com/acme.internal/y"] {
+            assert_eq!(p.access(&alice, sibling), Access::None, "{sibling}");
+        }
+        let carve = AccessPolicy::new(DefaultPolicy::Write, vec![grant("github.com/acme/payroll/*", Role::None, 1)]);
+        assert_eq!(carve.access(&alice, "github.com/acme/payroll-archive"), Access::Write, "carve-out stays narrow");
+        assert_eq!(carve.access(&alice, "github.com/acme/payroll/2026"), Access::None);
     }
 
     #[test]
