@@ -474,6 +474,27 @@ pub async fn build_with_budget(
     let message = latest(last_words_candidates(store, project, task, &starts, &recent_events, AGENT_MESSAGE).await?);
     let summary = latest(last_words_candidates(store, project, task, &starts, &recent_events, COMPACT_SUMMARY).await?);
 
+    // A request no checkpoint answered yet: the session that got it ended before saving one (a crash skips even
+    // the fallback checkpoint). Its full text is the best record of the work left, so the brief carries it.
+    let unfinished = if assignment.is_none() {
+        let newest_cp = checkpoints.iter().map(|c| c.created_at).max().unwrap_or(0);
+        let prompt = recent_events
+            .iter()
+            .filter(|e| e.kind == "prompt" && e.created_at > newest_cp)
+            .max_by_key(|e| e.created_at);
+        // A session that ended cleanly without changing files (a question, a look around) left nothing unfinished.
+        prompt.filter(|p| {
+            let after = |kind: &str| recent_events.iter().any(|e| e.kind == kind && e.created_at >= p.created_at);
+            let ended = p.session.is_some()
+                && recent_events
+                    .iter()
+                    .any(|e| e.kind == SESSION_END && e.session == p.session && e.created_at >= p.created_at);
+            after("file_change") || !ended
+        })
+    } else {
+        None
+    };
+
     let markdown = render(&Parts {
         project,
         task,
@@ -490,6 +511,7 @@ pub async fn build_with_budget(
         message: message.as_ref(),
         summary: summary.as_ref(),
         assignment: assignment.as_ref(),
+        unfinished,
     });
     Ok(Brief {
         project: project.into(),
@@ -867,6 +889,8 @@ struct Parts<'a> {
     /// A worker's assignment (stored text or earliest prompt) and its other relevant texts;
     /// `None` for coordinator briefs.
     assignment: Option<&'a Assignment>,
+    /// The latest prompt when no checkpoint was saved after it (not for workers: they have their assignment).
+    unfinished: Option<&'a Event>,
 }
 
 fn render(parts: &Parts) -> String {
@@ -886,6 +910,7 @@ fn render(parts: &Parts) -> String {
         message,
         summary,
         assignment,
+        unfinished,
     } = *parts;
     let mut o = String::new();
     let _ = writeln!(o, "# Resume brief: {project}\n");
@@ -957,6 +982,28 @@ fn render(parts: &Parts) -> String {
             }
         }
         o.push('\n');
+    }
+
+    if let Some(p) = unfinished {
+        let text = p.data.as_ref().and_then(|d| d.get("text")).and_then(|t| t.as_str()).unwrap_or(&p.content);
+        let by = p.source.as_deref().map(|s| format!(" in {s}")).unwrap_or_default();
+        let _ = writeln!(o, "## Unfinished request");
+        let _ = writeln!(
+            o,
+            "\n_asked {}{by}; no checkpoint was saved after it, so the work may be only partly done. \
+             Check what changed, then continue._\n",
+            ago(p.created_at)
+        );
+        let _ = writeln!(o, "{}\n", text.trim().lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n"));
+        let mut files: Vec<&str> = vec![];
+        for e in events.iter().filter(|e| e.kind == "file_change" && e.created_at >= p.created_at) {
+            if !files.contains(&e.content.as_str()) {
+                files.push(&e.content);
+            }
+        }
+        if !files.is_empty() {
+            let _ = writeln!(o, "**Files changed since:** {}\n", files.join(", "));
+        }
     }
 
     if message.is_some() || summary.is_some() {

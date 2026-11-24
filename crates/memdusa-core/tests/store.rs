@@ -233,6 +233,70 @@ async fn brief_contains_everything() {
     }
 }
 
+/// A session that crashes before saving a checkpoint leaves only its prompt and edits: the brief must carry the
+/// request in full (the journal line is cut at 200 characters), with the files changed since.
+#[tokio::test]
+async fn unfinished_request_survives_a_crash() {
+    for (name, s) in stores().await {
+        let p = project();
+        let full = format!("Please add refunds, invoices and a report. {} Part 4: the CLI.", "Details. ".repeat(40));
+        s.event_append(NewEvent {
+            project: p.clone(),
+            session: Some("crashed".into()),
+            source: Some("claude-code".into()),
+            kind: "prompt".into(),
+            content: full.chars().take(200).collect(),
+            data: Some(serde_json::json!({ "text": full })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for f in ["shop/refunds.py", "shop/invoices.py", "shop/refunds.py"] {
+            s.event_append(NewEvent {
+                project: p.clone(),
+                session: Some("crashed".into()),
+                kind: "file_change".into(),
+                content: f.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(b.markdown.contains("## Unfinished request"), "{name}:\n{}", b.markdown);
+        assert!(b.markdown.contains("Part 4: the CLI."), "{name}: the full request, not the 200-character line");
+        assert!(
+            b.markdown.contains("**Files changed since:** shop/refunds.py, shop/invoices.py"),
+            "{name}:\n{}",
+            b.markdown
+        );
+
+        // Once a checkpoint answers it, the request is no longer "unfinished".
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s.checkpoint_save(NewCheckpoint { project: p.clone(), goal: "refunds".into(), ..Default::default() })
+            .await
+            .unwrap();
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(!b.markdown.contains("## Unfinished request"), "{name}");
+
+        // A question in a session that ended cleanly without changes isn't unfinished work.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        for (kind, content) in [("prompt", "what does refunds.py do?"), ("session_end", "session ended")] {
+            s.event_append(NewEvent {
+                project: p.clone(),
+                session: Some("question".into()),
+                kind: kind.into(),
+                content: content.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let b = brief::build(&s, &p, None, None, None).await.unwrap();
+        assert!(!b.markdown.contains("## Unfinished request"), "{name}:\n{}", b.markdown);
+    }
+}
+
 #[tokio::test]
 async fn secrets_are_redacted_before_storage() {
     for (name, s) in stores().await {
