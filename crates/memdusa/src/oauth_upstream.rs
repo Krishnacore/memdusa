@@ -530,9 +530,10 @@ fn sha256_b64(input: &str) -> String {
 
 /// Resolve the upstream identity to a memdusa user.
 ///
-/// Order: existing subject → pending admin link (binds on match) → allowlist
-/// auto-provision →, when the caller is already signed in (self-service
-/// linking from the consent page), a new link to that user.
+/// Order: existing subject → pending admin link (binds on match) → self-service
+/// link from the consent page (when the caller is already signed in) →
+/// allowlist auto-provision. GitHub pending links bind by login only; Google
+/// pending links bind by its verified email.
 pub async fn resolve_identity(
     store: &memdusa_core::Store,
     identity: &Identity,
@@ -549,8 +550,18 @@ pub async fn resolve_identity(
         return Ok(Some(existing.user_name));
     }
 
-    // Pending admin links bind by handle on first successful sign-in.
-    let handles: Vec<&str> = [identity.login.as_deref(), identity.email.as_deref()].into_iter().flatten().collect();
+    // Pending admin links bind by handle on first successful sign-in. GitHub's
+    // email from `/user` is not verified, so GitHub links are bound by login
+    // only. Google's email is verified and may bind its pending links.
+    let mut handles: Vec<&str> = Vec::new();
+    if let Some(login) = identity.login.as_deref() {
+        handles.push(login);
+    }
+    if provider != GITHUB
+        && let Some(email) = identity.email.as_deref()
+    {
+        handles.push(email);
+    }
     for handle in &handles {
         if let Some(pending) = store.identity_pending(provider, handle).await? {
             if let Some(user) = signed_in_user
@@ -561,6 +572,17 @@ pub async fn resolve_identity(
             store.identity_bind_pending(&pending, &identity.subject).await?;
             return Ok(Some(pending.user_name));
         }
+    }
+
+    // Self-service linking from the consent page: the user is already signed
+    // in with an API key and is explicitly linking this upstream identity.
+    // This takes precedence over auto-provisioning: a link-only round trip
+    // must never mint a different user, even with an allowlist configured.
+    if let Some(user) = signed_in_user {
+        store
+            .identity_insert(user, provider, &identity.subject, identity.email.as_deref(), identity.login.as_deref())
+            .await?;
+        return Ok(Some(user.to_owned()));
     }
 
     // Allowlist auto-provisioning creates a non-admin user on first sign-in.
@@ -603,15 +625,6 @@ pub async fn resolve_identity(
         return Ok(Some(user.name));
     }
 
-    // Self-service linking from the consent page: the user is already signed
-    // in with an API key and is explicitly linking this upstream identity.
-    if let Some(user) = signed_in_user {
-        store
-            .identity_insert(user, provider, &identity.subject, identity.email.as_deref(), identity.login.as_deref())
-            .await?;
-        return Ok(Some(user.to_owned()));
-    }
-
     Ok(None)
 }
 
@@ -627,6 +640,9 @@ pub fn parse_link(value: &str) -> anyhow::Result<(String, String)> {
     if handle.is_empty() {
         bail!("identity handle must not be empty");
     }
+    if provider == GITHUB && handle.contains('@') {
+        bail!("link GitHub by login or numeric id, not email");
+    }
     Ok((provider, handle.to_owned()))
 }
 
@@ -637,3 +653,22 @@ pub fn is_stable_subject(handle: &str) -> bool {
 }
 
 pub use memdusa_core::oauth::PENDING_PREFIX;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_link_accepts_github_login_or_numeric_id() {
+        assert_eq!(parse_link("github:octocat").unwrap(), (GITHUB.into(), "octocat".into()));
+        assert_eq!(parse_link("GitHub: 424242 ").unwrap(), (GITHUB.into(), "424242".into()));
+    }
+
+    #[test]
+    fn parse_link_rejects_github_email() {
+        let e = parse_link("github:alice@acme.com").unwrap_err().to_string();
+        assert_eq!(e, "link GitHub by login or numeric id, not email");
+        // Google is linked by its verified email, which stays valid.
+        assert_eq!(parse_link("google:alice@acme.com").unwrap(), (GOOGLE.into(), "alice@acme.com".into()));
+    }
+}

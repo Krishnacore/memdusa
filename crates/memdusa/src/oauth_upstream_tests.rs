@@ -640,6 +640,67 @@ async fn self_service_link_from_consent_page() {
 }
 
 #[tokio::test]
+async fn github_pending_link_is_not_bound_by_unverified_email() {
+    let h = spawn(github_cfg(&[]), None).await;
+    setup_data(&h.mock);
+    h.new_user("alice").await;
+    // An admin mistakenly linked by email. GitHub's `/user` email is not
+    // verified, so it must never bind a pending GitHub link.
+    h.store.identity_insert("alice", "github", "pending:alice@acme.com", Some("alice@acme.com"), None).await.unwrap();
+    {
+        let mut d = h.mock.lock().unwrap();
+        d.gh_email = Some("alice@acme.com".into());
+        d.gh_login = "attacker".into();
+        d.gh_id = "999".into();
+    }
+
+    let client_id = h.register("http://127.0.0.1:54321/cb").await;
+    let verifier = generate_secret("v").unwrap();
+    let (csrf, cookie) = h.authorize(&client_id, &verifier).await;
+    let r = h.upstream_signin("github", &csrf, &cookie, false).await;
+    let html = r.text().await.unwrap();
+    assert!(html.contains("Not linked to a memdusa user"), "{html}");
+
+    let identities = h.store.identity_list("alice").await.unwrap();
+    assert_eq!(identities[0].subject, "pending:alice@acme.com", "the email-based pending link stays unbound");
+    assert!(h.store.identity_by_subject("github", "999").await.unwrap().is_none(), "attacker got no link");
+    assert_eq!(h.store.user_list().await.unwrap().len(), 1, "no new user was provisioned");
+}
+
+#[tokio::test]
+async fn self_service_link_wins_over_auto_provision() {
+    // The org allowlist would auto-provision a new user on first sign-in, but a
+    // signed-in user following "Link GitHub" must be linked instead.
+    let h = spawn(github_cfg(&["acme"]), None).await;
+    setup_data(&h.mock);
+    h.mock.lock().unwrap().gh_orgs = vec!["acme".into()];
+    let key = h.new_user("alice").await;
+
+    let client_id = h.register("http://127.0.0.1:54321/cb").await;
+    let verifier = generate_secret("v").unwrap();
+    let (csrf, cookie) = h.authorize(&client_id, &verifier).await;
+    let r = client()
+        .post(format!("{}/oauth/signin", h.url))
+        .header(header::COOKIE, &cookie)
+        .form(&[("csrf", csrf.as_str()), ("api_key", key.as_str())])
+        .send()
+        .await
+        .unwrap();
+    let html = r.text().await.unwrap();
+    assert!(html.contains("Link GitHub to alice"), "{html}");
+
+    let r = h.upstream_signin("github", &csrf, &cookie, false).await;
+    let html = r.text().await.unwrap();
+    assert!(html.contains("Signed in as") && html.contains("alice"), "{html}");
+
+    let users = h.store.user_list().await.unwrap();
+    assert_eq!(users.len(), 1, "link-only round trip must not auto-provision a user");
+    let identities = h.store.identity_list("alice").await.unwrap();
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].subject, "424242", "the signed-in user owns the linked identity");
+}
+
+#[tokio::test]
 async fn upstream_errors_are_handled_gracefully() {
     let h = spawn(github_cfg(&[]), None).await;
     setup_data(&h.mock);

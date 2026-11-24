@@ -32,6 +32,8 @@ pub(crate) struct AppState {
     pub(crate) store: Store,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) limiter: Option<Arc<RateLimiter>>,
+    /// IP-keyed limiter for every `/oauth/*` route (independent of the API one).
+    pub(crate) oauth_limiter: Arc<RateLimiter>,
     /// Shared break-glass token (`--token`): full admin access.
     pub(crate) token: Option<Arc<str>>,
     /// Latched to true once any user exists (or a token is set). Users can be
@@ -216,6 +218,7 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
         store,
         metrics: Arc::new(Metrics::default()),
         limiter: (opts.rate_limit > 0.0).then(|| Arc::new(RateLimiter::new(opts.rate_limit, opts.rate_limit * 10.0))),
+        oauth_limiter: Arc::new(RateLimiter::new(oauth::OAUTH_RATE_PER_SEC, oauth::OAUTH_RATE_BURST)),
         auth_required: Arc::new(AtomicBool::new(opts.token.is_some())),
         token: opts.token.map(Into::into),
         default_access: opts.default_access,
@@ -277,7 +280,12 @@ pub fn app(store: Store, opts: HttpOptions) -> Router {
     if state.oauth.is_some() {
         all = all
             .merge(oauth::public_routes().with_state(state.clone()))
-            .merge(oauth::routes().with_state(state.clone()))
+            .merge(
+                oauth::routes()
+                    .layer(middleware::from_fn_with_state(state.clone(), oauth::rate_limit))
+                    .layer(middleware::from_fn(oauth::html_security_headers))
+                    .with_state(state.clone()),
+            )
             .merge(
                 oauth::session_routes().layer(middleware::from_fn_with_state(state.clone(), auth)).with_state(state),
             );
