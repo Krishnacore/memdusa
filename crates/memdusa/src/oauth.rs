@@ -51,6 +51,10 @@ const SIGNIN_WINDOW: Duration = Duration::from_secs(300);
 /// per caller, with a burst of 100 (independent of the API rate limit).
 pub(crate) const OAUTH_RATE_PER_SEC: f64 = 10.0;
 pub(crate) const OAUTH_RATE_BURST: f64 = 100.0;
+/// Client registration and device authorization create rows without authentication: 10 at once, then one
+/// every 10 seconds per caller.
+pub(crate) const OAUTH_CREATE_PER_SEC: f64 = 0.1;
+pub(crate) const OAUTH_CREATE_BURST: f64 = 10.0;
 
 /// Server configuration, built from env when `MEMDUSA_PUBLIC_URL` is set.
 #[derive(Clone, Debug)]
@@ -242,7 +246,10 @@ pub async fn rate_limit(State(s): State<AppState>, req: Request, next: Next) -> 
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map_or_else(|| "unknown".to_owned(), |c| format!("ip:{}", c.0.ip()));
-    match s.oauth_limiter.check(&key) {
+    let creates = matches!(req.uri().path(), "/oauth/register" | "/oauth/device_authorization");
+    let checked =
+        s.oauth_limiter.check(&key).and_then(|()| if creates { s.oauth_create_limiter.check(&key) } else { Ok(()) });
+    match checked {
         Ok(()) => next.run(req).await,
         Err(wait) => {
             s.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -2547,6 +2554,26 @@ mod tests {
             assert_eq!(r.status(), 200, "request {i} should still be allowed");
         }
         assert!(limited, "expected a 429 after exhausting the per-IP OAuth burst");
+    }
+
+    #[tokio::test]
+    async fn client_registration_has_a_tighter_limit() {
+        let (url, _) = spawn(config(), DefaultPolicy::Write).await;
+        let mut statuses = vec![];
+        for _ in 0..(OAUTH_CREATE_BURST as usize + 2) {
+            let r = client()
+                .post(format!("{url}/oauth/register"))
+                .json(&json!({"redirect_uris": ["http://127.0.0.1:6040/cb"]}))
+                .send()
+                .await
+                .unwrap();
+            statuses.push(r.status().as_u16());
+        }
+        assert!(statuses[..OAUTH_CREATE_BURST as usize].iter().all(|s| *s == 200), "{statuses:?}");
+        assert_eq!(*statuses.last().unwrap(), 429, "{statuses:?}");
+        // Other OAuth endpoints still answer.
+        let r = client().get(format!("{url}/oauth/device")).send().await.unwrap();
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     fn assert_security_headers(r: &reqwest::Response) {
