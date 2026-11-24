@@ -1,0 +1,21 @@
+[book]
+title = "memdusa"
+description = "Universal memory and durability for AI coding agents"
+authors = ["Krishnacore"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Krishnacore/memdusa"
+edit-url-template = "https://github.com/Krishnacore/memdusa/edit/main/docs/{path}"
+site-url = "/memdusa/"
+default-theme = "light"
+preferred-dark-theme = "ayu"
+no-section-label = true
+
+[output.html.search]
+limit-results = 20
+
+[output.html.fold]
+enable = true
+level = 1
