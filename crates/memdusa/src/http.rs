@@ -323,8 +323,11 @@ async fn observe(State(s): State<AppState>, mut req: Request, next: Next) -> Res
 /// (rmcp also allows every Host then); otherwise the configured authorities
 /// replace the default loopback set. Entries may be `host` or `host:port`,
 /// case-insensitive, with IPv6 brackets trimmed.
+/// DNS-rebinding defence for the whole server: with `--allowed-host` set, a request must name one of those
+/// hosts. `/health` (load-balancer and orchestrator probes, which use the pod or machine address) and loopback
+/// hosts (the admin's own CLI on the server; a rebinding attack always carries the attacker's hostname) pass.
 async fn allowed_hosts(State(hosts): State<Arc<Vec<String>>>, req: Request, next: Next) -> Response {
-    if hosts.is_empty() {
+    if hosts.is_empty() || req.uri().path() == "/health" {
         return next.run(req).await;
     }
     let raw = match req.headers().get(header::HOST) {
@@ -339,6 +342,11 @@ async fn allowed_hosts(State(hosts): State<Arc<Vec<String>>>, req: Request, next
         Err(_) => return (StatusCode::BAD_REQUEST, "Bad Request: Invalid Host header").into_response(),
     };
     let host = authority.host().trim_matches(|c| c == '[' || c == ']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        return next.run(req).await;
+    }
     let port = authority.port_u16();
     let matched = hosts.iter().any(|allowed| {
         allowed.trim().parse::<Authority>().is_ok_and(|a| {
@@ -1860,10 +1868,13 @@ mod tests {
         let (url, store) = spawn_opts(o).await;
         let key = user_key(&store, "alice", true).await;
 
-        for path in ["/health", "/metrics", "/v1/whoami", "/mcp"] {
+        for path in ["/metrics", "/v1/whoami", "/mcp"] {
             assert_eq!(get_with_host(&url, path, "evil.example", Some(&key)).await, 403, "{path} with a bad Host");
         }
         assert_eq!(get_with_host(&url, "/health", "memdusa.example.com", None).await, 200);
+        assert_eq!(get_with_host(&url, "/health", "10.0.3.7:7077", None).await, 200, "probes by pod address pass");
+        assert_eq!(get_with_host(&url, "/v1/whoami", "localhost:7077", Some(&key)).await, 200, "loopback passes");
+        assert_eq!(get_with_host(&url, "/v1/whoami", "127.0.0.1", Some(&key)).await, 200, "loopback passes");
         assert_eq!(
             get_with_host(&url, "/metrics", "memdusa.example.com:7077", Some(&key)).await,
             200,
